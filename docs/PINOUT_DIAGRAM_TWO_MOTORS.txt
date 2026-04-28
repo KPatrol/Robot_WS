@@ -1,0 +1,469 @@
+================================================================================
+  ESP32-S3 PINOUT DIAGRAM - TWO MOTORS (FRONT-RIGHT + FRONT-LEFT)
+  KPatrol Robot - Mecanum Wheel Configuration
+  Hardware: ESP32-S3 WROOM-1 + 2x BTS7960 + 2x JGA25-370 Motors
+================================================================================
+
+Date: January 1, 2026
+Status: Testing Configuration - 2 Motors (FR + FL)
+
+================================================================================
+  1. ESP32-S3 GPIO ALLOCATION - TWO MOTORS
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      ESP32-S3 WROOM-1 DEV BOARD                         │
+│                         (USB-C on top)                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  LEFT SIDE PINS:                  │  RIGHT SIDE PINS:                  │
+│                                   │                                    │
+│  GND     ●                        │                        ● 5V        │
+│  3V3     ●                        │                        ● GND       │
+│  GPIO 43 ●                        │                        ● GPIO 44   │
+│  GPIO 44 ●                        │                        ● GPIO 43   │
+│                                   │                                    │
+│  GPIO 1  ● [TX - Serial]          │                        ● GPIO 3    │
+│  GPIO 2  ● [RX - Serial]          │                        ● GPIO 46   │
+│                                   │                                    │
+│  GPIO 4  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_RPWM (Front-Right Forward)     │
+│  GPIO 5  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_LPWM (Front-Right Backward)    │
+│  GPIO 6  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_R_EN (Front-Right Enable)      │
+│  GPIO 7  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_L_EN (Front-Right Enable)      │
+│                                   │                                    │
+│  GPIO 15 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_RPWM (Front-Left Forward)      │
+│  GPIO 16 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_LPWM (Front-Left Backward)     │
+│  GPIO 17 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_R_EN (Front-Left Enable)       │
+│  GPIO 18 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_L_EN (Front-Left Enable)       │
+│                                   │                                    │
+│  GPIO 8  ●                        │                        ● GPIO 19   │
+│  GPIO 9  ●                        │                        ● GPIO 20   │
+│  GPIO 10 ●                        │                        ● GPIO 21   │
+│  GPIO 11 ●                        │                        ● GPIO 47   │
+│  GPIO 12 ●                        │                        ● GPIO 48   │
+│  GPIO 13 ●                        │                        ● GPIO 45   │
+│  GPIO 14 ●                        │                        ● GPIO 0    │
+│                                   │                                    │
+│  GND     ●                        │                        ● GND       │
+│  5V      ●                        │                        ● 5V        │
+│                                   │                                    │
+│              [USB-C Port - Bottom]                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  2. GPIO PIN ALLOCATION SUMMARY
+================================================================================
+
+FRONT-RIGHT MOTOR (FR) - BTS7960 Driver #1:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 4  → FR_RPWM  (PWM Channel 0 - Forward)
+  GPIO 5  → FR_LPWM  (PWM Channel 1 - Backward)
+  GPIO 6  → FR_R_EN  (Digital Output - Always HIGH)
+  GPIO 7  → FR_L_EN  (Digital Output - Always HIGH)
+
+FRONT-LEFT MOTOR (FL) - BTS7960 Driver #2:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 15 → FL_RPWM  (PWM Channel 2 - Forward)
+  GPIO 16 → FL_LPWM  (PWM Channel 3 - Backward)
+  GPIO 17 → FL_R_EN  (Digital Output - Always HIGH)
+  GPIO 18 → FL_L_EN  (Digital Output - Always HIGH)
+
+PWM CONFIGURATION:
+━━━━━━━━━━━━━━━━━
+  Frequency: 5000 Hz (5 kHz)
+  Resolution: 8-bit (0-255)
+  Library: LEDC (ESP32 built-in)
+  
+  Channel 0: FR_RPWM (GPIO 4)
+  Channel 1: FR_LPWM (GPIO 5)
+  Channel 2: FL_RPWM (GPIO 15)
+  Channel 3: FL_LPWM (GPIO 16)
+
+================================================================================
+  3. BTS7960 DRIVER #1 (FRONT-RIGHT) - PINOUT
+================================================================================
+
+┌───────────────────────────────────────────────────────────────────┐
+│                    BTS7960 / IBT-2 Driver #1 (FR)                 │
+│                           [LOGIC SIDE]                            │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  RPWM ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GPIO 4 (PWM Ch 0)  │
+│  LPWM ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GPIO 5 (PWM Ch 1)  │
+│  R_EN ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GPIO 6 (HIGH)      │
+│  L_EN ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GPIO 7 (HIGH)      │
+│  R_IS ●                             [Current Sense - Optional]    │
+│  L_IS ●                             [Current Sense - Optional]    │
+│  VCC  ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5V (ESP32)         │
+│  GND  ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GND (ESP32)        │
+│                                                                   │
+├───────────────────────────────────────────────────────────────────┤
+│                           [POWER SIDE]                            │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  B+   ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12V+ (Power Supply)│
+│  B-   ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12V- (Power Supply)│
+│  M+   ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Motor FR (RED)     │
+│  M-   ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Motor FR (BLACK)   │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  4. BTS7960 DRIVER #2 (FRONT-LEFT) - PINOUT
+================================================================================
+
+┌───────────────────────────────────────────────────────────────────┐
+│                    BTS7960 / IBT-2 Driver #2 (FL)                 │
+│                           [LOGIC SIDE]                            │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  RPWM ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GPIO 15 (PWM Ch 2) │
+│  LPWM ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GPIO 16 (PWM Ch 3) │
+│  R_EN ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GPIO 17 (HIGH)     │
+│  L_EN ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GPIO 18 (HIGH)     │
+│  R_IS ●                             [Current Sense - Optional]    │
+│  L_IS ●                             [Current Sense - Optional]    │
+│  VCC  ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5V (ESP32)         │
+│  GND  ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ GND (ESP32)        │
+│                                                                   │
+├───────────────────────────────────────────────────────────────────┤
+│                           [POWER SIDE]                            │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  B+   ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12V+ (Power Supply)│
+│  B-   ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12V- (Power Supply)│
+│  M+   ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Motor FL (RED)     │
+│  M-   ● ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Motor FL (BLACK)   │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  5. POWER DISTRIBUTION - CRITICAL CONNECTIONS
+================================================================================
+
+12V POWER SUPPLY (3A minimum recommended, 5A+ preferred):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  12V+ ━━━┳━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (B+)
+          ┗━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (B+)
+          
+  12V- ━━━┳━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (B-)
+          ┗━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (B-)
+
+ESP32-S3 POWER (via USB-C or external 5V):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  5V  ━━━┳━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (VCC)
+         ┗━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (VCC)
+         
+  GND ━━━┳━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (GND)
+         ┗━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (GND)
+
+⚠️ CRITICAL: Common Ground Required
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  12V- (Power Supply) ━━━━━━━━━━━━━ ESP32 GND
+  
+  All grounds must be connected together:
+  - 12V Power Supply Ground (-)
+  - ESP32-S3 GND
+  - BTS7960 #1 GND
+  - BTS7960 #2 GND
+
+================================================================================
+  6. MOTOR CONNECTIONS
+================================================================================
+
+FRONT-RIGHT MOTOR (FR) - 6-Wire JGA25-370:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  POWER WIRES (thick):
+    RED (thick)   ━━━━━━━━━━━━━━━━━━ BTS7960 #1 M+
+    BLACK (thick) ━━━━━━━━━━━━━━━━━━ BTS7960 #1 M-
+    
+  ENCODER WIRES (thin) - Not used in initial test:
+    VCC (thin)    ━━━━━━━━━━━━━━━━━━ [Reserved for encoder]
+    GND (thin)    ━━━━━━━━━━━━━━━━━━ [Reserved for encoder]
+    C1            ━━━━━━━━━━━━━━━━━━ [Reserved for encoder]
+    C2            ━━━━━━━━━━━━━━━━━━ [Reserved for encoder]
+
+FRONT-LEFT MOTOR (FL) - 6-Wire JGA25-370:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  POWER WIRES (thick):
+    RED (thick)   ━━━━━━━━━━━━━━━━━━ BTS7960 #2 M+
+    BLACK (thick) ━━━━━━━━━━━━━━━━━━ BTS7960 #2 M-
+    
+  ENCODER WIRES (thin) - Not used in initial test:
+    VCC (thin)    ━━━━━━━━━━━━━━━━━━ [Reserved for encoder]
+    GND (thin)    ━━━━━━━━━━━━━━━━━━ [Reserved for encoder]
+    C1            ━━━━━━━━━━━━━━━━━━ [Reserved for encoder]
+    C2            ━━━━━━━━━━━━━━━━━━ [Reserved for encoder]
+
+⚠️ CRITICAL WIRING NOTE:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+  Motor M+ and M- connect DIRECTLY to BTS7960 M+/M- pins
+  DO NOT connect motor wires to power supply ground or common ground
+  BTS7960 H-bridge controls motor polarity internally
+
+================================================================================
+  7. CONNECTION TABLE - COMPLETE WIRING
+================================================================================
+
+ESP32-S3 → BTS7960 #1 (FR):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #1 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 4   │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 5   │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 6   │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 7   │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+ESP32-S3 → BTS7960 #2 (FL):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #2 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 15  │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 16  │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 17  │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 18  │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+Power Supply → BTS7960 Drivers:
+┌─────────────┬────────────────────┬───────────────────────┐
+│ Power Supply│ BTS7960 #1 & #2    │ Function              │
+├─────────────┼────────────────────┼───────────────────────┤
+│ 12V+        │ B+ (both drivers)  │ Motor Power (+)       │
+│ 12V-        │ B- (both drivers)  │ Motor Power (-)       │
+│ 12V- (GND)  │ ESP32 GND          │ Common Ground ⚠️      │
+└─────────────┴────────────────────┴───────────────────────┘
+
+BTS7960 #1 → Motor FR:
+┌────────────┬─────────────┬────────────────────────────────┐
+│ BTS7960 #1 │ Motor FR    │ Function                       │
+├────────────┼─────────────┼────────────────────────────────┤
+│ M+         │ RED (thick) │ Motor Positive Terminal        │
+│ M-         │ BLACK(thick)│ Motor Negative Terminal        │
+└────────────┴─────────────┴────────────────────────────────┘
+
+BTS7960 #2 → Motor FL:
+┌────────────┬─────────────┬────────────────────────────────┐
+│ BTS7960 #2 │ Motor FL    │ Function                       │
+├────────────┼─────────────┼────────────────────────────────┤
+│ M+         │ RED (thick) │ Motor Positive Terminal        │
+│ M-         │ BLACK(thick)│ Motor Negative Terminal        │
+└────────────┴─────────────┴────────────────────────────────┘
+
+================================================================================
+  8. ARDUINO IDE CONFIGURATION
+================================================================================
+
+Board Settings:
+━━━━━━━━━━━━━━
+  Tools → Board → ESP32 Arduino → ESP32S3 Dev Module
+  
+  ✓ USB CDC On Boot: "Disabled" (CRITICAL for UART Serial)
+  ✓ Upload Mode: "UART0 / Hardware CDC"
+  ✓ USB Mode: "Hardware CDC and JTAG"
+  ✓ Upload Speed: 921600
+  ✓ CPU Frequency: 240MHz (WiFi/BT)
+  ✓ Flash Size: 4MB (32Mb)
+  ✓ Partition Scheme: Default 4MB with spiffs
+  ✓ PSRAM: Disabled
+  
+Serial Monitor:
+━━━━━━━━━━━━━━
+  Baud Rate: 115200
+  Port: /dev/cu.usbserial-XXXX (check in Tools → Port)
+
+================================================================================
+  9. TEST COMMANDS - TWO MOTORS
+================================================================================
+
+Serial Commands (115200 baud):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+INDIVIDUAL MOTOR CONTROL:
+  FR_F  : Front-Right Forward
+  FR_B  : Front-Right Backward
+  FR_S  : Front-Right Stop
+  
+  FL_F  : Front-Left Forward
+  FL_B  : Front-Left Backward
+  FL_S  : Front-Left Stop
+
+BOTH MOTORS TOGETHER:
+  F     : Both Forward (robot moves forward)
+  B     : Both Backward (robot moves backward)
+  S     : Both Stop
+  
+SPEED CONTROL (0-255):
+  SPD:150   : Set speed to 150 (medium)
+  SPD:255   : Set speed to 255 (max)
+  SPD:100   : Set speed to 100 (slow)
+
+ROTATION TEST:
+  R     : Rotate Right (FR backward, FL forward)
+  L     : Rotate Left (FR forward, FL backward)
+
+DIAGNOSIS:
+  T     : Run automated test sequence
+  I     : Show system info
+
+================================================================================
+  10. EXPECTED BEHAVIOR - MECANUM WHEELS
+================================================================================
+
+Front-Right (FR) Motor Rotation:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  When viewed from above (mecanum wheel installed):
+  - RPWM active (GPIO 4 PWM): Wheel rotates to move robot FORWARD
+  - LPWM active (GPIO 5 PWM): Wheel rotates to move robot BACKWARD
+
+Front-Left (FL) Motor Rotation:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  When viewed from above (mecanum wheel installed):
+  - RPWM active (GPIO 15 PWM): Wheel rotates to move robot FORWARD
+  - LPWM active (GPIO 16 PWM): Wheel rotates to move robot BACKWARD
+
+Robot Movement Validation:
+━━━━━━━━━━━━━━━━━━━━━━━━
+  ✓ Both FR + FL forward → Robot moves forward
+  ✓ Both FR + FL backward → Robot moves backward
+  ✓ FR backward + FL forward → Robot rotates right
+  ✓ FR forward + FL backward → Robot rotates left
+
+================================================================================
+  11. TROUBLESHOOTING - TWO MOTORS
+================================================================================
+
+Issue: Only one motor works
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Check power supply current capacity (need 3A+, prefer 5A)
+  → Verify both BTS7960 drivers have power LED on
+  → Test each motor individually with FR_F, FL_F commands
+  → Check GPIO pin connections for second motor
+
+Issue: Motors work individually but not together
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Insufficient power supply current (upgrade to 5A or higher)
+  → Check for loose B+ or B- connections on BTS7960
+  → Verify common ground connection between 12V- and ESP32 GND
+
+Issue: One motor weaker than the other
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Voltage drop on power lines (use thicker wires for B+/B-)
+  → Different motor conditions (normal, adjust PWM speed individually)
+  → Check BTS7960 driver quality (some clones have variance)
+
+Issue: Serial monitor shows garbage or nothing
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → USB CDC On Boot MUST be "Disabled" in Arduino IDE
+  → Baud rate must be 115200
+  → Try different USB cable (some are power-only)
+  → Check correct port selected in Tools → Port
+
+Issue: Motor direction reversed
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Normal: Just swap M+ and M- wires on that motor
+  → Or: Invert PWM logic in code (swap RPWM/LPWM channels)
+
+================================================================================
+  12. WIRE COLOR RECOMMENDATIONS
+================================================================================
+
+ESP32-S3 → BTS7960 #1 (FR) Logic:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 4  → RPWM  : YELLOW wire
+  GPIO 5  → LPWM  : BLUE wire
+  GPIO 6  → R_EN  : GREEN wire
+  GPIO 7  → L_EN  : WHITE wire
+  5V      → VCC   : RED wire (thick)
+  GND     → GND   : BLACK wire (thick)
+
+ESP32-S3 → BTS7960 #2 (FL) Logic:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 15 → RPWM  : YELLOW wire (with label "FL")
+  GPIO 16 → LPWM  : BLUE wire (with label "FL")
+  GPIO 17 → R_EN  : GREEN wire (with label "FL")
+  GPIO 18 → L_EN  : WHITE wire (with label "FL")
+  5V      → VCC   : RED wire (thick)
+  GND     → GND   : BLACK wire (thick)
+
+Power Wiring:
+━━━━━━━━━━━━━
+  12V+ → BTS7960 B+: RED wire (very thick, 16-18 AWG)
+  12V- → BTS7960 B-: BLACK wire (very thick, 16-18 AWG)
+
+Motor Wiring:
+━━━━━━━━━━━━━
+  BTS7960 M+ → Motor: Use motor's original RED wire
+  BTS7960 M- → Motor: Use motor's original BLACK wire
+
+⚠️ TIP: Use heat-shrink tubing or labels to mark FL vs FR wires
+
+================================================================================
+  13. SAFETY & BEST PRACTICES
+================================================================================
+
+Power Safety:
+━━━━━━━━━━━━━
+  ⚠️ Connect power LAST (after all logic connections verified)
+  ⚠️ Use fuse or circuit breaker on 12V supply (5A rating)
+  ⚠️ Verify polarity before powering on (12V+ to B+, 12V- to B-)
+  ⚠️ Don't reverse motor while at full speed (add delay in code)
+
+Wiring Best Practices:
+━━━━━━━━━━━━━━━━━━━━━
+  ✓ Use proper wire gauge (16-18 AWG for motor power)
+  ✓ Keep logic wires (GPIO) separate from power wires (reduce noise)
+  ✓ Use ferrule terminals for secure screw connections
+  ✓ Test continuity with multimeter before powering on
+  ✓ Add capacitors (100µF-1000µF) near BTS7960 B+/B- for noise reduction
+
+Testing Workflow:
+━━━━━━━━━━━━━━━━━
+  1. Wire all logic connections (GPIO, VCC, GND)
+  2. Upload and test code WITHOUT 12V power (drivers won't spin motors yet)
+  3. Verify Serial communication and command response
+  4. Power off, connect 12V power
+  5. Start with low speed (SPD:50) and test each motor individually
+  6. Gradually increase speed and test combinations
+
+Motor Protection:
+━━━━━━━━━━━━━━━━━
+  ✓ Add 200ms delay when changing motor direction (prevents H-bridge shoot-through)
+  ✓ Implement soft-start (gradually increase PWM) for mechanical wear reduction
+  ✓ Monitor current with R_IS/L_IS pins (optional, for overload detection)
+
+================================================================================
+  14. NEXT STEPS - SCALING TO 4 MOTORS
+================================================================================
+
+After successful 2-motor test:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. Add Rear-Right (RR) Motor:
+     GPIO 8, 9, 10, 11 → BTS7960 #3
+
+  2. Add Rear-Left (RL) Motor:
+     GPIO 12, 13, 14, 21 → BTS7960 #4
+
+  3. Implement Mecanum Wheel Kinematics:
+     - Forward/Backward: All 4 wheels same direction
+     - Strafe Right/Left: Diagonal wheel pairs
+     - Rotate: Left/Right wheels opposite
+     - Diagonal: Individual wheel speed control
+
+  4. Add Encoder Feedback:
+     - GPIO interrupt pins for 4x encoder C1/C2
+     - Closed-loop speed control
+     - Odometry calculation
+
+================================================================================
+  END OF PINOUT DIAGRAM
+================================================================================

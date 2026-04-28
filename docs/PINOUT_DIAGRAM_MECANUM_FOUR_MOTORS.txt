@@ -1,0 +1,520 @@
+================================================================================
+  ESP32-S3 PINOUT DIAGRAM - FOUR MOTORS MECANUM WHEEL SYSTEM
+  KPatrol Robot - Complete Mecanum Configuration
+  Hardware: ESP32-S3 WROOM-1 + 4x BTS7960 + 4x JGA25-370 Motors
+================================================================================
+
+Date: January 1, 2026
+Status: Full Mecanum Configuration - 4 Motors (FR + FL + BR + BL)
+
+================================================================================
+  1. ESP32-S3 GPIO ALLOCATION - FOUR MOTORS
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      ESP32-S3 WROOM-1 DEV BOARD                         │
+│                         (USB-C on top)                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  LEFT SIDE PINS:                  │  RIGHT SIDE PINS:                  │
+│                                   │                                    │
+│  GND     ●                        │                        ● 5V        │
+│  3V3     ●                        │                        ● GND       │
+│                                   │                                    │
+│  GPIO 4  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_RPWM (Front-Right Forward)     │
+│  GPIO 5  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_LPWM (Front-Right Backward)    │
+│  GPIO 6  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_R_EN (Front-Right Enable)      │
+│  GPIO 7  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_L_EN (Front-Right Enable)      │
+│                                   │                                    │
+│  GPIO 8  ● ━━━━━━━━━━━━━━━━━━━━━━┫ BR_RPWM (Back-Right Forward)      │
+│  GPIO 9  ● ━━━━━━━━━━━━━━━━━━━━━━┫ BR_LPWM (Back-Right Backward)     │
+│  GPIO 10 ● ━━━━━━━━━━━━━━━━━━━━━━┫ BR_R_EN (Back-Right Enable)       │
+│  GPIO 11 ● ━━━━━━━━━━━━━━━━━━━━━━┫ BR_L_EN (Back-Right Enable)       │
+│                                   │                                    │
+│  GPIO 12 ● ━━━━━━━━━━━━━━━━━━━━━━┫ BL_RPWM (Back-Left Forward)       │
+│  GPIO 13 ● ━━━━━━━━━━━━━━━━━━━━━━┫ BL_LPWM (Back-Left Backward)      │
+│  GPIO 14 ● ━━━━━━━━━━━━━━━━━━━━━━┫ BL_R_EN (Back-Left Enable)        │
+│                                   │                                    │
+│  GPIO 15 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_RPWM (Front-Left Forward)      │
+│  GPIO 16 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_LPWM (Front-Left Backward)     │
+│  GPIO 17 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_R_EN (Front-Left Enable)       │
+│  GPIO 18 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_L_EN (Front-Left Enable)       │
+│                                   │                                    │
+│  GPIO 21 ● ━━━━━━━━━━━━━━━━━━━━━━┫ BL_L_EN (Back-Left Enable)        │
+│                                   │                                    │
+│  5V      ●                        │                        ● GND       │
+│                                   │                                    │
+│              [USB-C Port - Bottom]                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  2. GPIO PIN ALLOCATION SUMMARY
+================================================================================
+
+FRONT-RIGHT MOTOR (FR) - BTS7960 Driver #1:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 4  → FR_RPWM  (PWM Channel 0 - Forward)
+  GPIO 5  → FR_LPWM  (PWM Channel 1 - Backward)
+  GPIO 6  → FR_R_EN  (Digital Output - Always HIGH)
+  GPIO 7  → FR_L_EN  (Digital Output - Always HIGH)
+
+FRONT-LEFT MOTOR (FL) - BTS7960 Driver #2:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 15 → FL_RPWM  (PWM Channel 2 - Forward)
+  GPIO 16 → FL_LPWM  (PWM Channel 3 - Backward)
+  GPIO 17 → FL_R_EN  (Digital Output - Always HIGH)
+  GPIO 18 → FL_L_EN  (Digital Output - Always HIGH)
+
+BACK-RIGHT MOTOR (BR) - BTS7960 Driver #3:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 8  → BR_RPWM  (PWM Channel 4 - Forward)
+  GPIO 9  → BR_LPWM  (PWM Channel 5 - Backward)
+  GPIO 10 → BR_R_EN  (Digital Output - Always HIGH)
+  GPIO 11 → BR_L_EN  (Digital Output - Always HIGH)
+
+BACK-LEFT MOTOR (BL) - BTS7960 Driver #4:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 12 → BL_RPWM  (PWM Channel 6 - Forward)
+  GPIO 13 → BL_LPWM  (PWM Channel 7 - Backward)
+  GPIO 14 → BL_R_EN  (Digital Output - Always HIGH)
+  GPIO 21 → BL_L_EN  (Digital Output - Always HIGH)
+
+PWM CONFIGURATION:
+━━━━━━━━━━━━━━━━━
+  Frequency: 5000 Hz (5 kHz)
+  Resolution: 8-bit (0-255)
+  Library: LEDC (ESP32 built-in)
+  
+  Total PWM Channels Used: 8 (0-7)
+  Channel 0: FR_RPWM (GPIO 4)
+  Channel 1: FR_LPWM (GPIO 5)
+  Channel 2: FL_RPWM (GPIO 15)
+  Channel 3: FL_LPWM (GPIO 16)
+  Channel 4: BR_RPWM (GPIO 8)
+  Channel 5: BR_LPWM (GPIO 9)
+  Channel 6: BL_RPWM (GPIO 12)
+  Channel 7: BL_LPWM (GPIO 13)
+
+================================================================================
+  3. POWER DISTRIBUTION - FOUR MOTORS
+================================================================================
+
+12V POWER SUPPLY (7A minimum, 10A+ recommended):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  12V+ ━━━┳━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (B+)
+          ┣━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (B+)
+          ┣━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #3 (B+)
+          ┗━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #4 (B+)
+          
+  12V- ━━━┳━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (B-)
+          ┣━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (B-)
+          ┣━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #3 (B-)
+          ┣━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #4 (B-)
+          ┗━━━━━━━━━━━━━━━━━━━━━━━ ESP32 GND (COMMON GROUND!)
+
+ESP32-S3 POWER (via USB-C or external 5V):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  5V  ━━━┳━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (VCC)
+         ┣━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (VCC)
+         ┣━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #3 (VCC)
+         ┗━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #4 (VCC)
+         
+  GND ━━━┳━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (GND)
+         ┣━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (GND)
+         ┣━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #3 (GND)
+         ┣━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #4 (GND)
+         ┗━━━━━━━━━━━━━━━━━━━━━━━━ 12V- (COMMON GROUND!)
+
+⚠️ CRITICAL: Common Ground Required
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  All grounds MUST be connected together:
+  - 12V Power Supply Ground (-)
+  - ESP32-S3 GND
+  - All 4x BTS7960 GND
+
+Power Supply Specifications:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Voltage: 12V DC (±10%)
+  Current: 7A minimum, 10A recommended
+  Peak current (all motors stall): ~10A
+  Typical running: 2-5A
+  Add fuse: 10A slow-blow recommended
+
+================================================================================
+  4. CONNECTION TABLE - COMPLETE WIRING
+================================================================================
+
+ESP32-S3 → BTS7960 #1 (FR):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #1 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 4   │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 5   │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 6   │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 7   │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+ESP32-S3 → BTS7960 #2 (FL):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #2 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 15  │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 16  │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 17  │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 18  │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+ESP32-S3 → BTS7960 #3 (BR):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #3 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 8   │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 9   │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 10  │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 11  │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+ESP32-S3 → BTS7960 #4 (BL):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #4 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 12  │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 13  │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 14  │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 21  │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+BTS7960 → Motors:
+┌────────────┬─────────────┬────────────────────────────────┐
+│ BTS7960    │ Motor       │ Function                       │
+├────────────┼─────────────┼────────────────────────────────┤
+│ #1 M+/M-   │ FR RED/BLK  │ Front-Right Motor              │
+│ #2 M+/M-   │ FL RED/BLK  │ Front-Left Motor               │
+│ #3 M+/M-   │ BR RED/BLK  │ Back-Right Motor               │
+│ #4 M+/M-   │ BL RED/BLK  │ Back-Left Motor                │
+└────────────┴─────────────┴────────────────────────────────┘
+
+================================================================================
+  5. MECANUM WHEEL MOVEMENT COMMANDS
+================================================================================
+
+Serial Commands (115200 baud):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+INDIVIDUAL MOTOR CONTROL:
+  FR_F, FR_B, FR_S  : Front-Right Forward/Backward/Stop
+  FL_F, FL_B, FL_S  : Front-Left Forward/Backward/Stop
+  BR_F, BR_B, BR_S  : Back-Right Forward/Backward/Stop
+  BL_F, BL_B, BL_S  : Back-Left Forward/Backward/Stop
+
+MECANUM MOVEMENTS:
+  F       : Forward (all wheels forward)
+  B       : Backward (all wheels backward)
+  SR      : Strafe Right (sideways right)
+  SL      : Strafe Left (sideways left)
+  R       : Rotate Right (clockwise, in-place)
+  L       : Rotate Left (counter-clockwise, in-place)
+  DR      : Diagonal Forward-Right
+  DL      : Diagonal Forward-Left
+  S       : Stop all motors
+
+SPEED & SYSTEM:
+  SPD:xxx : Set speed (0-255), e.g. SPD:150
+  T       : Run automated test sequence (12 tests)
+  I       : Show system information
+  H       : Show help menu
+
+================================================================================
+  6. MECANUM WHEEL KINEMATICS
+================================================================================
+
+Movement Pattern Reference:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FORWARD (F):
+  FR: Forward  ↑
+  FL: Forward  ↑
+  BR: Forward  ↑
+  BL: Forward  ↑
+  Result: Robot moves straight forward
+
+BACKWARD (B):
+  FR: Backward ↓
+  FL: Backward ↓
+  BR: Backward ↓
+  BL: Backward ↓
+  Result: Robot moves straight backward
+
+STRAFE RIGHT (SR):
+  FR: Backward ↓
+  FL: Forward  ↑
+  BR: Forward  ↑
+  BL: Backward ↓
+  Result: Robot moves sideways to the right
+
+STRAFE LEFT (SL):
+  FR: Forward  ↑
+  FL: Backward ↓
+  BR: Backward ↓
+  BL: Forward  ↑
+  Result: Robot moves sideways to the left
+
+ROTATE RIGHT (R):
+  FR: Backward ↓
+  FL: Forward  ↑
+  BR: Backward ↓
+  BL: Forward  ↑
+  Result: Robot rotates clockwise (in-place)
+
+ROTATE LEFT (L):
+  FR: Forward  ↑
+  FL: Backward ↓
+  BR: Forward  ↑
+  BL: Backward ↓
+  Result: Robot rotates counter-clockwise (in-place)
+
+DIAGONAL FORWARD-RIGHT (DR):
+  FR: Stop     —
+  FL: Forward  ↑
+  BR: Forward  ↑
+  BL: Stop     —
+  Result: Robot moves diagonally forward-right (45°)
+
+DIAGONAL FORWARD-LEFT (DL):
+  FR: Forward  ↑
+  FL: Stop     —
+  BR: Stop     —
+  BL: Forward  ↑
+  Result: Robot moves diagonally forward-left (45°)
+
+================================================================================
+  7. MOTOR DIRECTION INVERSION
+================================================================================
+
+In the code, adjust these flags if motors rotate opposite:
+
+#define FR_INVERTED false  // Set true if FR rotates opposite
+#define FL_INVERTED true   // Set true if FL rotates opposite (đã đúng)
+#define BR_INVERTED false  // Set true if BR rotates opposite
+#define BL_INVERTED true   // Set true if BL rotates opposite (assume same as FL)
+
+Testing Process:
+━━━━━━━━━━━━━━━━
+1. Test BL motor individually: BL_F, BL_B
+2. If BL rotates opposite of expected, change BL_INVERTED to opposite value
+3. Test F command - all 4 wheels should rotate to move robot forward
+4. Adjust individual motor inversion flags until F command works correctly
+
+================================================================================
+  8. POWER SUPPLY REQUIREMENTS
+================================================================================
+
+Current Draw Estimates:
+━━━━━━━━━━━━━━━━━━━━━━━
+  - 4 motors no-load: ~800mA
+  - 4 motors typical running: 2-5A
+  - 4 motors peak/stall: ~10A
+  - ESP32-S3: ~200mA
+  - Total system: 3-10A depending on load
+
+Recommended Power Supply:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+  Voltage: 12V DC
+  Current: 10A or 12A (120W or 144W)
+  Connector: Barrel jack or screw terminals
+  Protection: 10A slow-blow fuse recommended
+
+Capacitors (strongly recommended):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - 1000µF 16V+ electrolytic near EACH BTS7960 B+/B-
+  - 0.1µF ceramic near EACH BTS7960
+  - Purpose: Filter voltage spikes, reduce motor noise, prevent voltage sag
+
+Wire Gauge:
+━━━━━━━━━━━
+  - Motor power (B+/B-): 16 AWG or thicker
+  - Motor wires (M+/M-): Use motor's original thick wires
+  - Logic wires: 22-24 AWG acceptable
+
+================================================================================
+  9. TESTING PROCEDURE - MECANUM SYSTEM
+================================================================================
+
+Step 1: Individual Motor Test
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Upload code and test each motor individually:
+
+  SPD:100
+  FR_F    → Front-Right should spin (note direction)
+  FR_S
+  FL_F    → Front-Left should spin (note direction)
+  FL_S
+  BR_F    → Back-Right should spin (note direction)
+  BR_S
+  BL_F    → Back-Left should spin (note direction)
+  BL_S
+
+All 4 motors should spin when commanded. If not, check wiring and power.
+
+Step 2: Forward Movement Test
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Test if all 4 wheels rotate correctly for forward motion:
+
+  F       → All 4 wheels should rotate to move robot FORWARD
+
+If robot doesn't move forward:
+  - Check which motors are rotating wrong direction
+  - Adjust INVERTED flags in code for those motors
+  - Re-upload and test again
+
+Step 3: Mecanum Movement Tests
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Once forward works, test other movements:
+
+  B       → Robot moves backward
+  SR      → Robot strafes right (sideways)
+  SL      → Robot strafes left (sideways)
+  R       → Robot rotates right (in-place)
+  L       → Robot rotates left (in-place)
+  DR      → Robot moves diagonally forward-right
+  DL      → Robot moves diagonally forward-left
+
+Step 4: Speed Control Test
+━━━━━━━━━━━━━━━━━━━━━━━━
+Test different speeds:
+
+  SPD:50   → Set low speed
+  F        → Robot should move slowly forward
+  S
+  SPD:200  → Set high speed
+  F        → Robot should move fast forward
+  S
+
+Step 5: Automated Test Sequence
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run full test sequence:
+
+  T        → Runs 12 automated tests (~2 minutes)
+
+Observe all movements and verify robot behaves as expected.
+
+================================================================================
+  10. TROUBLESHOOTING - 4 MOTOR SYSTEM
+================================================================================
+
+Issue: One or more motors don't work
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Check power supply capacity (need 10A for 4 motors)
+  → Verify BTS7960 power LEDs are ON for all drivers
+  → Test motors individually (FR_F, FL_F, BR_F, BL_F)
+  → Check GPIO connections for non-working motor
+  → Measure 12V at each BTS7960 B+/B- terminals
+
+Issue: Robot moves forward when commanded but not straight
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → One or more motors rotating wrong direction
+  → Adjust INVERTED flags in code for specific motors
+  → Or swap M+ and M- wires on that motor's BTS7960
+
+Issue: Strafe doesn't work correctly
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Mecanum wheels must be installed in correct orientation
+  → Rollers should form "X" pattern when viewed from top
+  → Check motor wiring polarity for diagonal pairs
+
+Issue: Motors work individually but not all together
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Insufficient power supply current (upgrade to 10A+)
+  → Add bulk capacitors (1000µF) near each BTS7960
+  → Check for voltage drop on power lines (use thicker wires)
+  → Reduce speed: SPD:100 to test
+
+Issue: System resets when all motors start
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Voltage drop causes ESP32 brownout
+  → Upgrade power supply to 10A or higher
+  → Add large capacitor (2200µF+) at power supply output
+  → Power ESP32 from separate 5V source (USB)
+
+Issue: Mecanum movements don't match expected behavior
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Verify mecanum wheels installed with correct orientation
+  → FL and BR should mirror each other (left-hand rollers)
+  → FR and BL should mirror each other (right-hand rollers)
+  → Test with 'I' command to see INVERTED flags
+
+================================================================================
+  11. MECANUM WHEEL INSTALLATION
+================================================================================
+
+Correct Wheel Orientation:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Top view of robot:
+
+        FRONT
+         ↑
+    FL ╱   ╲ FR
+       ╲   ╱
+       ╱   ╲
+    BL ╲   ╱ BR
+         ↓
+        BACK
+
+Roller Pattern (viewed from top):
+  FL: Rollers at 45° (╱ direction)
+  FR: Rollers at 45° (╲ direction)
+  BL: Rollers at 45° (╲ direction)
+  BR: Rollers at 45° (╱ direction)
+
+This forms an "X" pattern when all 4 wheels viewed together.
+
+⚠️ Critical: Incorrect wheel orientation will prevent proper mecanum movement!
+
+================================================================================
+  12. NEXT STEPS - ADVANCED FEATURES
+================================================================================
+
+After successful 4-motor test:
+
+1. Add Encoder Feedback:
+━━━━━━━━━━━━━━━━━━━━━━
+   - Connect encoder C1, C2 pins to GPIO with interrupts
+   - Implement encoder counting for speed measurement
+   - Calculate odometry (position tracking)
+   - Implement PID speed control for accurate movement
+
+2. Add IMU Sensor:
+━━━━━━━━━━━━━━━━
+   - MPU6050 or BNO055 for orientation tracking
+   - Measure yaw angle for accurate rotation
+   - Compensate for drift during movement
+   - Implement heading hold during forward/strafe
+
+3. WiFi Control:
+━━━━━━━━━━━━━━━
+   - Connect to backend NestJS server
+   - WebSocket real-time control
+   - Receive movement commands from mobile app
+   - Send telemetry data (position, speed, battery)
+
+4. Autonomous Navigation:
+━━━━━━━━━━━━━━━━━━━━━━━
+   - Implement A* pathfinding
+   - Obstacle avoidance with ultrasonic sensors
+   - SLAM (Simultaneous Localization and Mapping)
+   - Patrol route execution
+
+================================================================================
+  END OF PINOUT DIAGRAM - MECANUM SYSTEM
+================================================================================

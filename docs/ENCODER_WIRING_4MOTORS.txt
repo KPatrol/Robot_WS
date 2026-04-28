@@ -1,0 +1,349 @@
+================================================================================
+  ESP32 ENCODER READER - 4 MOTORS WIRING DIAGRAM
+  KPatrol Robot - Encoder Feedback System
+  Hardware: ESP32 Dev Module + 4x JGA25-370 Motor Encoders
+================================================================================
+
+Date: January 1, 2026
+Purpose: Read encoder signals from all 4 motors for speed/position feedback
+
+================================================================================
+  1. MOTOR ENCODER PINOUT (JGA25-370)
+================================================================================
+
+Dựa trên hình ảnh của connector 6 chân:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    MOTOR ENCODER CONNECTOR                      │
+│                    (6 pins - White connector)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Pin Order (từ trên xuống dưới khi nhìn từ sau motor):        │
+│                                                                 │
+│   Pin 1: M1 Motor -      │ BLACK (thick) │ → BTS7960 M-        │
+│   Pin 2: GND Encoder     │ BLACK (thin)  │ → ESP32 GND         │
+│   Pin 3: Fase A Encoder  │ YELLOW        │ → ESP32 GPIO (INT)  │
+│   Pin 4: Fase B Encoder  │ GREEN         │ → ESP32 GPIO (INT)  │
+│   Pin 5: 3.3V/5V Encoder │ RED (thin)    │ → ESP32 3.3V        │
+│   Pin 6: M1 Motor +      │ RED (thick)   │ → BTS7960 M+        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+Wire Colors:
+━━━━━━━━━━━━
+  BLACK (thick) = Motor negative (M-)
+  BLACK (thin)  = Encoder GND
+  YELLOW        = Encoder Fase A (Phase A)
+  GREEN         = Encoder Fase B (Phase B)
+  RED (thin)    = Encoder VCC (3.3V or 5V)
+  RED (thick)   = Motor positive (M+)
+
+⚠️ QUAN TRỌNG: Phân biệt dây THICK (dày) và THIN (mảnh)!
+   - Dây THICK là dây nguồn motor (dòng cao)
+   - Dây THIN là dây tín hiệu encoder (dòng thấp)
+
+================================================================================
+  2. ESP32 DEV MODULE GPIO ALLOCATION
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      ESP32 DEV MODULE (30/38 pins)                      │
+│                         (USB on bottom)                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  LEFT SIDE:                       │  RIGHT SIDE:                       │
+│                                   │                                    │
+│  3V3    ● ━━━━━━━━━━━━━━━━━━━━━━━┫ Encoder VCC (all 4 motors)        │
+│  GND    ● ━━━━━━━━━━━━━━━━━━━━━━━┫ Encoder GND (all 4 motors)        │
+│                                   │                                    │
+│  GPIO 34● ━━━━━━━━━━━━━━━━━━━━━━━┫ FR Encoder A (YELLOW)             │
+│  GPIO 35● ━━━━━━━━━━━━━━━━━━━━━━━┫ FR Encoder B (GREEN)              │
+│                                   │                                    │
+│  GPIO 32● ━━━━━━━━━━━━━━━━━━━━━━━┫ FL Encoder A (YELLOW)             │
+│  GPIO 33● ━━━━━━━━━━━━━━━━━━━━━━━┫ FL Encoder B (GREEN)              │
+│                                   │                                    │
+│  GPIO 25● ━━━━━━━━━━━━━━━━━━━━━━━┫ BR Encoder A (YELLOW)             │
+│  GPIO 26● ━━━━━━━━━━━━━━━━━━━━━━━┫ BR Encoder B (GREEN)              │
+│                                   │                                    │
+│  GPIO 27● ━━━━━━━━━━━━━━━━━━━━━━━┫ BL Encoder A (YELLOW)             │
+│  GPIO 14● ━━━━━━━━━━━━━━━━━━━━━━━┫ BL Encoder B (GREEN)              │
+│                                   │                                    │
+│              [USB Port - Bottom]                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  3. COMPLETE WIRING TABLE
+================================================================================
+
+FRONT-RIGHT (FR) MOTOR ENCODER:
+┌─────────────────┬─────────────┬──────────────────────┐
+│ Encoder Pin     │ Wire Color  │ ESP32 Connection     │
+├─────────────────┼─────────────┼──────────────────────┤
+│ GND Encoder     │ BLACK thin  │ GND                  │
+│ Fase A          │ YELLOW      │ GPIO 34              │
+│ Fase B          │ GREEN       │ GPIO 35              │
+│ VCC Encoder     │ RED thin    │ 3.3V                 │
+└─────────────────┴─────────────┴──────────────────────┘
+
+FRONT-LEFT (FL) MOTOR ENCODER:
+┌─────────────────┬─────────────┬──────────────────────┐
+│ Encoder Pin     │ Wire Color  │ ESP32 Connection     │
+├─────────────────┼─────────────┼──────────────────────┤
+│ GND Encoder     │ BLACK thin  │ GND                  │
+│ Fase A          │ YELLOW      │ GPIO 32              │
+│ Fase B          │ GREEN       │ GPIO 33              │
+│ VCC Encoder     │ RED thin    │ 3.3V                 │
+└─────────────────┴─────────────┴──────────────────────┘
+
+BACK-RIGHT (BR) MOTOR ENCODER:
+┌─────────────────┬─────────────┬──────────────────────┐
+│ Encoder Pin     │ Wire Color  │ ESP32 Connection     │
+├─────────────────┼─────────────┼──────────────────────┤
+│ GND Encoder     │ BLACK thin  │ GND                  │
+│ Fase A          │ YELLOW      │ GPIO 25              │
+│ Fase B          │ GREEN       │ GPIO 26              │
+│ VCC Encoder     │ RED thin    │ 3.3V                 │
+└─────────────────┴─────────────┴──────────────────────┘
+
+BACK-LEFT (BL) MOTOR ENCODER:
+┌─────────────────┬─────────────┬──────────────────────┐
+│ Encoder Pin     │ Wire Color  │ ESP32 Connection     │
+├─────────────────┼─────────────┼──────────────────────┤
+│ GND Encoder     │ BLACK thin  │ GND                  │
+│ Fase A          │ YELLOW      │ GPIO 27              │
+│ Fase B          │ GREEN       │ GPIO 14              │
+│ VCC Encoder     │ RED thin    │ 3.3V                 │
+└─────────────────┴─────────────┴──────────────────────┘
+
+================================================================================
+  4. WIRING SUMMARY BY COLOR
+================================================================================
+
+YELLOW WIRES (Fase A - Phase A):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FR Motor YELLOW → GPIO 34
+  FL Motor YELLOW → GPIO 32
+  BR Motor YELLOW → GPIO 25
+  BL Motor YELLOW → GPIO 27
+
+GREEN WIRES (Fase B - Phase B):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FR Motor GREEN → GPIO 35
+  FL Motor GREEN → GPIO 33
+  BR Motor GREEN → GPIO 26
+  BL Motor GREEN → GPIO 14
+
+RED WIRES (thin - VCC Encoder):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  All 4 motors RED (thin) → ESP32 3.3V (shared)
+
+BLACK WIRES (thin - GND Encoder):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  All 4 motors BLACK (thin) → ESP32 GND (shared)
+
+⚠️ Motor power wires (BLACK thick, RED thick) go to BTS7960, NOT ESP32!
+
+================================================================================
+  5. GPIO SUMMARY TABLE
+================================================================================
+
+┌─────────┬──────────────┬──────────────┬─────────────────────┐
+│ Motor   │ Fase A GPIO  │ Fase B GPIO  │ Wire Colors         │
+├─────────┼──────────────┼──────────────┼─────────────────────┤
+│ FR      │ GPIO 34      │ GPIO 35      │ YELLOW, GREEN       │
+│ FL      │ GPIO 32      │ GPIO 33      │ YELLOW, GREEN       │
+│ BR      │ GPIO 25      │ GPIO 26      │ YELLOW, GREEN       │
+│ BL      │ GPIO 27      │ GPIO 14      │ YELLOW, GREEN       │
+├─────────┼──────────────┼──────────────┼─────────────────────┤
+│ ALL VCC │ 3.3V         │ ---          │ RED (thin) x4       │
+│ ALL GND │ GND          │ ---          │ BLACK (thin) x4     │
+└─────────┴──────────────┴──────────────┴─────────────────────┘
+
+Total wires to ESP32: 12 wires
+  - 8 signal wires (4x YELLOW + 4x GREEN)
+  - 4 VCC wires → all to 3.3V
+  - 4 GND wires → all to GND
+
+================================================================================
+  6. ENCODER SPECIFICATIONS
+================================================================================
+
+JGA25-370 Motor Encoder:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+  - Type: Hall Effect / Magnetic Encoder
+  - PPR (Pulses Per Revolution): 11 PPR (at encoder disk)
+  - Gear Ratio: 1:34
+  - Output shaft PPR: 11 × 34 = 374 PPR
+  - With Quadrature Decoding (×4): 374 × 4 = 1496 counts/revolution
+  - Operating Voltage: 3.3V - 5V (use 3.3V with ESP32)
+  - Output: Digital square wave (Phase A, Phase B)
+
+Resolution at output shaft:
+  - 1496 counts per revolution
+  - 360° / 1496 = 0.24° per count
+  - Very high resolution for position control
+
+================================================================================
+  7. POWER CONNECTIONS
+================================================================================
+
+ESP32 Power (separate from motor power):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - Power ESP32 via USB-C or 5V pin
+  - ESP32 3.3V pin → All encoder VCC (shared)
+  - ESP32 GND → All encoder GND (shared)
+
+⚠️ Important: ESP32 3.3V can provide ~50mA safely
+   4 encoders × ~10mA each = ~40mA total (OK)
+
+Motor Power (via BTS7960):
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - Motor wires (thick) connect to BTS7960 M+/M-
+  - Do NOT connect motor power wires to ESP32
+  - 12V power supply → BTS7960 drivers
+
+================================================================================
+  8. ARDUINO IDE CONFIGURATION
+================================================================================
+
+Board Selection:
+━━━━━━━━━━━━━━━━
+  Tools → Board → ESP32 Arduino → "ESP32 Dev Module"
+  
+  Note: This is standard ESP32, NOT ESP32-S3!
+
+Upload Settings:
+━━━━━━━━━━━━━━━━
+  Upload Speed: 921600
+  Flash Frequency: 80MHz
+  Flash Mode: QIO
+  Partition Scheme: Default 4MB with spiffs
+
+Serial Monitor:
+━━━━━━━━━━━━━━━━
+  Baud Rate: 115200
+  Line Ending: Both NL & CR
+
+================================================================================
+  9. SERIAL OUTPUT FORMAT
+================================================================================
+
+Program prints every 500ms:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────
+Time: 5.5 sec
+
+FR: Count=1234  Rev=0.82  RPM=45.3
+FL: Count=1245  Rev=0.83  RPM=46.1
+BR: Count=1230  Rev=0.82  RPM=44.8
+BL: Count=1240  Rev=0.83  RPM=45.9
+
+Explanation:
+  - Count: Raw encoder pulse count (positive = forward, negative = backward)
+  - Rev: Number of output shaft revolutions (Count / 1496)
+  - RPM: Current speed in revolutions per minute
+
+Serial Commands:
+━━━━━━━━━━━━━━━━
+  R - Reset all encoder counts to 0
+  W - Show wiring guide
+  H - Show help
+
+================================================================================
+  10. TROUBLESHOOTING
+================================================================================
+
+Issue: No encoder counts (always 0)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Check encoder VCC connected to 3.3V
+  → Check encoder GND connected to ESP32 GND
+  → Verify motor is actually spinning
+  → Check Phase A wire connected to correct GPIO
+  → Measure encoder output with multimeter (should toggle 0-3.3V)
+
+Issue: Counts increase even when motor stopped
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Noise on signal lines - add 0.1µF capacitor between signal and GND
+  → Use shorter wires for encoder signals
+  → Separate encoder wires from motor power wires
+
+Issue: Counts are wrong direction (negative when forward)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Swap Phase A and Phase B wires for that motor
+  → Or change sign in code: FR_count-- instead of FR_count++
+
+Issue: One encoder not working, others OK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Check GPIO pin for that specific motor
+  → Verify both Phase A and Phase B wires connected
+  → Test encoder with multimeter
+  → Try swapping with known-working encoder
+
+Issue: GPIO 34/35 not responding
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → GPIO 34, 35 are input-only and have no internal pullup
+  → Make sure encoder has proper output drive
+  → Add external 10K pullup resistor if needed
+
+================================================================================
+  11. SYSTEM ARCHITECTURE
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        KPATROL ROBOT SYSTEM                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────┐          ┌─────────────────┐                      │
+│  │  ESP32-S3       │          │  ESP32 Dev      │                      │
+│  │  (Motor Control)│          │  (Encoder Read) │   ◄── This module    │
+│  │                 │          │                 │                      │
+│  │  Controls 4x    │          │  Reads 4x       │                      │
+│  │  BTS7960 drivers│          │  Encoder signals│                      │
+│  │                 │          │                 │                      │
+│  │  PWM outputs    │          │  Interrupt ISR  │                      │
+│  │  to motors      │          │  for counting   │                      │
+│  └────────┬────────┘          └────────┬────────┘                      │
+│           │                            │                               │
+│           │  Motor Power               │  Encoder Signals              │
+│           ▼                            ▼                               │
+│  ┌─────────────────────────────────────────────────────────┐          │
+│  │                    4x JGA25-370 Motors                   │          │
+│  │  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐                     │          │
+│  │  │ FR  │  │ FL  │  │ BR  │  │ BL  │                     │          │
+│  │  │Motor│  │Motor│  │Motor│  │Motor│                     │          │
+│  │  └─────┘  └─────┘  └─────┘  └─────┘                     │          │
+│  └─────────────────────────────────────────────────────────┘          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Future: ESP32-S3 and ESP32 Dev can communicate via:
+  - UART (Serial)
+  - I2C (ESP32 Dev as slave)
+  - ESP-NOW (wireless)
+  - Shared GPIO pins (simple signals)
+
+================================================================================
+  12. QUICK REFERENCE CARD
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────┐
+│  ENCODER WIRING QUICK REFERENCE                                        │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  YELLOW wires (Phase A):                                               │
+│    FR → GPIO 34    FL → GPIO 32    BR → GPIO 25    BL → GPIO 27       │
+│                                                                        │
+│  GREEN wires (Phase B):                                                │
+│    FR → GPIO 35    FL → GPIO 33    BR → GPIO 26    BL → GPIO 14       │
+│                                                                        │
+│  RED wires (thin - VCC):   All 4 → ESP32 3.3V                         │
+│  BLACK wires (thin - GND): All 4 → ESP32 GND                          │
+│                                                                        │
+│  THICK wires (RED, BLACK): → BTS7960 M+, M- (NOT to ESP32!)           │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  END OF ENCODER WIRING DIAGRAM
+================================================================================
