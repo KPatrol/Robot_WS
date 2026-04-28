@@ -1,0 +1,317 @@
+================================================================================
+  ESP32-S3 PINOUT DIAGRAM - THREE MOTORS (FR + FL + BR)
+  KPatrol Robot - 3-Wheel Configuration
+  Hardware: ESP32-S3 WROOM-1 + 3x BTS7960 + 3x JGA25-370 Motors
+================================================================================
+
+Date: January 1, 2026
+Status: Testing Configuration - 3 Motors (Front-Right + Front-Left + Back-Right)
+
+================================================================================
+  1. ESP32-S3 GPIO ALLOCATION - THREE MOTORS
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      ESP32-S3 WROOM-1 DEV BOARD                         │
+│                         (USB-C on top)                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  LEFT SIDE PINS:                  │  RIGHT SIDE PINS:                  │
+│                                   │                                    │
+│  GND     ●                        │                        ● 5V        │
+│  3V3     ●                        │                        ● GND       │
+│                                   │                                    │
+│  GPIO 4  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_RPWM (Front-Right Forward)     │
+│  GPIO 5  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_LPWM (Front-Right Backward)    │
+│  GPIO 6  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_R_EN (Front-Right Enable)      │
+│  GPIO 7  ● ━━━━━━━━━━━━━━━━━━━━━━┫ FR_L_EN (Front-Right Enable)      │
+│                                   │                                    │
+│  GPIO 8  ● ━━━━━━━━━━━━━━━━━━━━━━┫ BR_RPWM (Back-Right Forward)      │
+│  GPIO 9  ● ━━━━━━━━━━━━━━━━━━━━━━┫ BR_LPWM (Back-Right Backward)     │
+│  GPIO 10 ● ━━━━━━━━━━━━━━━━━━━━━━┫ BR_R_EN (Back-Right Enable)       │
+│  GPIO 11 ● ━━━━━━━━━━━━━━━━━━━━━━┫ BR_L_EN (Back-Right Enable)       │
+│                                   │                                    │
+│  GPIO 15 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_RPWM (Front-Left Forward)      │
+│  GPIO 16 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_LPWM (Front-Left Backward)     │
+│  GPIO 17 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_R_EN (Front-Left Enable)       │
+│  GPIO 18 ● ━━━━━━━━━━━━━━━━━━━━━━┫ FL_L_EN (Front-Left Enable)       │
+│                                   │                                    │
+│  5V      ●                        │                        ● GND       │
+│                                   │                                    │
+│              [USB-C Port - Bottom]                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  2. GPIO PIN ALLOCATION SUMMARY
+================================================================================
+
+FRONT-RIGHT MOTOR (FR) - BTS7960 Driver #1:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 4  → FR_RPWM  (PWM Channel 0 - Forward)
+  GPIO 5  → FR_LPWM  (PWM Channel 1 - Backward)
+  GPIO 6  → FR_R_EN  (Digital Output - Always HIGH)
+  GPIO 7  → FR_L_EN  (Digital Output - Always HIGH)
+
+FRONT-LEFT MOTOR (FL) - BTS7960 Driver #2:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 15 → FL_RPWM  (PWM Channel 2 - Forward)
+  GPIO 16 → FL_LPWM  (PWM Channel 3 - Backward)
+  GPIO 17 → FL_R_EN  (Digital Output - Always HIGH)
+  GPIO 18 → FL_L_EN  (Digital Output - Always HIGH)
+
+BACK-RIGHT MOTOR (BR) - BTS7960 Driver #3:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 8  → BR_RPWM  (PWM Channel 4 - Forward)
+  GPIO 9  → BR_LPWM  (PWM Channel 5 - Backward)
+  GPIO 10 → BR_R_EN  (Digital Output - Always HIGH)
+  GPIO 11 → BR_L_EN  (Digital Output - Always HIGH)
+
+PWM CONFIGURATION:
+━━━━━━━━━━━━━━━━━
+  Frequency: 5000 Hz (5 kHz)
+  Resolution: 8-bit (0-255)
+  Library: LEDC (ESP32 built-in)
+  
+  Channel 0: FR_RPWM (GPIO 4)
+  Channel 1: FR_LPWM (GPIO 5)
+  Channel 2: FL_RPWM (GPIO 15)
+  Channel 3: FL_LPWM (GPIO 16)
+  Channel 4: BR_RPWM (GPIO 8)
+  Channel 5: BR_LPWM (GPIO 9)
+
+================================================================================
+  3. POWER DISTRIBUTION - THREE MOTORS
+================================================================================
+
+12V POWER SUPPLY (5A minimum recommended, 7A+ preferred):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  12V+ ━━━┳━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (B+)
+          ┣━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (B+)
+          ┗━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #3 (B+)
+          
+  12V- ━━━┳━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (B-)
+          ┣━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (B-)
+          ┣━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #3 (B-)
+          ┗━━━━━━━━━━━━━━━━━━━━━━━ ESP32 GND (COMMON GROUND!)
+
+ESP32-S3 POWER (via USB-C or external 5V):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  5V  ━━━┳━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (VCC)
+         ┣━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (VCC)
+         ┗━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #3 (VCC)
+         
+  GND ━━━┳━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #1 (GND)
+         ┣━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #2 (GND)
+         ┣━━━━━━━━━━━━━━━━━━━━━━━━ BTS7960 #3 (GND)
+         ┗━━━━━━━━━━━━━━━━━━━━━━━━ 12V- (COMMON GROUND!)
+
+⚠️ CRITICAL: Common Ground Required
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  All grounds MUST be connected together:
+  - 12V Power Supply Ground (-)
+  - ESP32-S3 GND
+  - BTS7960 #1 GND
+  - BTS7960 #2 GND
+  - BTS7960 #3 GND
+
+================================================================================
+  4. CONNECTION TABLE - COMPLETE WIRING
+================================================================================
+
+ESP32-S3 → BTS7960 #1 (FR):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #1 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 4   │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 5   │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 6   │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 7   │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+ESP32-S3 → BTS7960 #2 (FL):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #2 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 15  │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 16  │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 17  │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 18  │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+ESP32-S3 → BTS7960 #3 (BR):
+┌──────────┬────────────┬─────────────────────────────────────┐
+│ ESP Pin  │ BTS7960 #3 │ Function                            │
+├──────────┼────────────┼─────────────────────────────────────┤
+│ GPIO 8   │ RPWM       │ Forward PWM (5kHz, 8-bit)           │
+│ GPIO 9   │ LPWM       │ Backward PWM (5kHz, 8-bit)          │
+│ GPIO 10  │ R_EN       │ Enable Forward (HIGH)               │
+│ GPIO 11  │ L_EN       │ Enable Backward (HIGH)              │
+│ 5V       │ VCC        │ Logic Power (5V)                    │
+│ GND      │ GND        │ Logic Ground                        │
+└──────────┴────────────┴─────────────────────────────────────┘
+
+Power Supply → BTS7960 Drivers (All 3):
+┌─────────────┬────────────────────┬───────────────────────┐
+│ Power Supply│ BTS7960 (all 3)    │ Function              │
+├─────────────┼────────────────────┼───────────────────────┤
+│ 12V+        │ B+ (all drivers)   │ Motor Power (+)       │
+│ 12V-        │ B- (all drivers)   │ Motor Power (-)       │
+│ 12V- (GND)  │ ESP32 GND          │ Common Ground ⚠️      │
+└─────────────┴────────────────────┴───────────────────────┘
+
+BTS7960 → Motors:
+┌────────────┬─────────────┬────────────────────────────────┐
+│ BTS7960    │ Motor       │ Function                       │
+├────────────┼─────────────┼────────────────────────────────┤
+│ #1 M+      │ FR RED      │ Front-Right Motor +            │
+│ #1 M-      │ FR BLACK    │ Front-Right Motor -            │
+│ #2 M+      │ FL RED      │ Front-Left Motor +             │
+│ #2 M-      │ FL BLACK    │ Front-Left Motor -             │
+│ #3 M+      │ BR RED      │ Back-Right Motor +             │
+│ #3 M-      │ BR BLACK    │ Back-Right Motor -             │
+└────────────┴─────────────┴────────────────────────────────┘
+
+================================================================================
+  5. SERIAL COMMANDS - THREE MOTORS
+================================================================================
+
+Serial Commands (115200 baud):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+INDIVIDUAL MOTOR CONTROL:
+  FR_F  : Front-Right Forward
+  FR_B  : Front-Right Backward
+  FR_S  : Front-Right Stop
+  
+  FL_F  : Front-Left Forward
+  FL_B  : Front-Left Backward
+  FL_S  : Front-Left Stop
+  
+  BR_F  : Back-Right Forward
+  BR_B  : Back-Right Backward
+  BR_S  : Back-Right Stop
+
+ALL MOTORS TOGETHER:
+  F     : All Forward (robot moves forward)
+  B     : All Backward (robot moves backward)
+  S     : All Stop
+
+ROTATION:
+  R     : Rotate Right (FR+BR backward, FL forward)
+  L     : Rotate Left (FR+BR forward, FL backward)
+
+SPEED CONTROL (0-255):
+  SPD:150   : Set speed to 150 (medium)
+  SPD:255   : Set speed to 255 (max)
+  SPD:100   : Set speed to 100 (slow)
+
+SYSTEM:
+  T     : Run automated test sequence
+  I     : Show system info
+  H     : Show help menu
+
+================================================================================
+  6. MOTOR DIRECTION INVERSION FLAGS
+================================================================================
+
+In the code, adjust these if motors rotate opposite:
+
+#define FR_INVERTED false  // Set true if FR rotates opposite
+#define FL_INVERTED true   // Set true if FL rotates opposite (già đúng)
+#define BR_INVERTED false  // Set true if BR rotates opposite
+
+If BR motor quay ngược khi test, đổi BR_INVERTED từ false → true
+
+================================================================================
+  7. EXPECTED BEHAVIOR - 3-WHEEL CONFIGURATION
+================================================================================
+
+Robot Movement Validation:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Command F: All 3 motors forward → Robot di tiến
+  Command B: All 3 motors backward → Robot lùi
+  Command R: FR+BR backward, FL forward → Robot xoay phải
+  Command L: FR+BR forward, FL backward → Robot xoay trái
+
+Individual Test:
+━━━━━━━━━━━━━━━
+  FR_F: Front-Right bánh phải trước quay
+  FL_F: Front-Left bánh trái trước quay
+  BR_F: Back-Right bánh phải sau quay
+
+⚠️ CHÚ Ý: Khi test lệnh F, cả 3 bánh phải quay cùng chiều!
+
+================================================================================
+  8. POWER SUPPLY REQUIREMENTS - 3 MOTORS
+================================================================================
+
+Current Draw (estimated):
+━━━━━━━━━━━━━━━━━━━━━━━━
+  - 3 motors no-load: ~600mA
+  - 3 motors typical: 1.5A - 3A
+  - 3 motors peak/stall: 7.5A
+  - ESP32-S3: ~200mA
+  
+Recommended Power Supply:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+  Voltage: 12V DC
+  Current: 5A minimum, 7A or 10A preferred
+  Add fuse: 7A slow-blow recommended
+
+Capacitors (recommended):
+━━━━━━━━━━━━━━━━━━━━━━━━━
+  - 1000µF 16V+ electrolytic near each BTS7960 B+/B-
+  - 0.1µF ceramic near each BTS7960
+
+================================================================================
+  9. TROUBLESHOOTING - 3 MOTORS
+================================================================================
+
+Issue: Only 2 motors work, BR motor silent
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Check BTS7960 #3 power LED is ON
+  → Verify GPIO 8, 9, 10, 11 connections
+  → Test BR individually with BR_F, BR_B commands
+  → Check 12V power supply has enough current (5A+)
+  → Swap BR motor with FR motor to test if motor faulty
+
+Issue: All 3 motors don't run together (only 1-2 at a time)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Insufficient power supply current (upgrade to 7A+)
+  → Check for voltage drop on B+ wires (use thicker wires)
+  → Add bulk capacitors (1000µF) near each driver
+  → Reduce speed: SPD:100 to test
+
+Issue: BR motor rotates opposite direction
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  → Change BR_INVERTED from false to true in code
+  → Or swap BR motor M+ and M- wires
+
+================================================================================
+  10. NEXT STEP - 4TH MOTOR (BACK-LEFT)
+================================================================================
+
+To complete full mecanum system, add BL motor:
+
+GPIO Allocation for BL (Back-Left):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GPIO 12 → BL_RPWM (PWM Ch 6)
+  GPIO 13 → BL_LPWM (PWM Ch 7)
+  GPIO 14 → BL_R_EN
+  GPIO 21 → BL_L_EN
+
+Power Supply for 4 motors:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+  Minimum: 7A
+  Recommended: 10A or 12A
+  Peak draw: 10A (all 4 motors under load)
+
+================================================================================
+  END OF PINOUT DIAGRAM - 3 MOTORS
+================================================================================
