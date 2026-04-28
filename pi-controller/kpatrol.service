@@ -1,0 +1,21 @@
+[Unit]
+Description=K-Patrol MQTT Robot Controller V3.0 - Centralized Control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=khoavd
+Group=dialout
+WorkingDirectory=/home/khoavd/kpatrol
+ExecStart=/usr/bin/python3 -u /home/khoavd/kpatrol/kpatrol_mqtt_v3.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
