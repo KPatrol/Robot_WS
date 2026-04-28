@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Build / dist
+build/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Arduino / PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Local-only env / state
+.env
+.env.local
+*.local
+.deploy-stash-marker
+
+# Generated artifacts
+*.log
+*.pid
+runtime/
+
+# ROS / colcon
+build/
+install/
+log/
+
+# Datasets and large media we don't want to commit by default
+pi-controller/detection/datasets/*.zip
+pi-controller/detection/datasets/raw/
+
+# Screenshots from the simulator (regenerated on every run)
+pi-controller/tools/screenshots/
