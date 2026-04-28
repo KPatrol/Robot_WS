@@ -1,0 +1,10 @@
+relpath,label_person,label_fire,note
+person/positive/0001.jpg,1,0,full body 2m
+person/positive/0002.jpg,1,0,half body corridor
+person/negative/0001.jpg,0,0,empty hallway
+person/negative/0002.jpg,0,0,chair cluster no person
+fire/positive/0001.jpg,0,1,trash can fire
+fire/positive/0002.jpg,0,1,candle close range
+fire/negative/0001.jpg,0,0,red jacket under LED
+fire/negative/0002.jpg,0,0,sunset through window
+fire/hard_negative/0001.jpg,0,0,emergency exit sign red LED
