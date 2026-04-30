@@ -20,6 +20,7 @@ Usage:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -74,6 +75,14 @@ class DetectionConfig:
     snapshot_jpeg_quality: int = 85
     snapshot_max_keep: int = 500  # rolling buffer
 
+    # Inline snapshot (base64-encoded JPEG embedded in MQTT alert payload).
+    # Frame is resized so the longest side ≤ snapshot_b64_max_dim and re-
+    # encoded at snapshot_b64_jpeg_quality. With 320×240 @ q60 a typical
+    # JPEG is ~15–30 KB, ~25–40 KB after base64 — well under the EMQX
+    # 256 KB default limit. Set max_dim=0 to disable inline snapshots.
+    snapshot_b64_max_dim: int = 320
+    snapshot_b64_jpeg_quality: int = 60
+
     # MQTT topic (prefix only, serial appended at runtime)
     mqtt_topic_prefix: str = "kpatrol"
     robot_serial: str = "KPATROL-001"
@@ -102,6 +111,9 @@ class DetectionEvent:
     frame_width: int
     frame_height: int
     extra: dict = field(default_factory=dict)
+    # Inline snapshot: small JPEG re-encoded then base64 ascii. Empty string
+    # when cv2 is unavailable or inline snapshots are disabled.
+    snapshot_b64: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -372,8 +384,9 @@ class AnomalyDetector:
     # ------------------------------------------------------------------
 
     def _emit_event(self, kind, confidence, bbox, frame, ts):
-        snapshot_rel = self._save_snapshot(frame, bbox, kind, ts)
+        snapshot_rel, annotated = self._save_snapshot(frame, bbox, kind, ts)
         h, w = frame.shape[:2] if frame is not None else (0, 0)
+        snapshot_b64 = self._encode_snapshot_b64(annotated)
         event = DetectionEvent(
             kind=kind,
             confidence=float(confidence),
@@ -382,10 +395,11 @@ class AnomalyDetector:
             snapshot_path=snapshot_rel,
             frame_width=w,
             frame_height=h,
+            snapshot_b64=snapshot_b64,
         )
         log.info(
-            "[detector] %s conf=%.2f bbox=%s -> %s",
-            kind, confidence, bbox, snapshot_rel,
+            "[detector] %s conf=%.2f bbox=%s -> %s (b64=%d B)",
+            kind, confidence, bbox, snapshot_rel, len(snapshot_b64),
         )
         if self.on_event:
             try:
@@ -393,12 +407,17 @@ class AnomalyDetector:
             except Exception as exc:
                 log.exception("[detector] on_event callback error: %s", exc)
 
-    def _save_snapshot(self, frame, bbox, kind, ts) -> str:
+    def _save_snapshot(self, frame, bbox, kind, ts):
+        """Write annotated JPEG to disk and return (path, annotated_frame).
+
+        The annotated frame is reused by `_encode_snapshot_b64` so we don't
+        re-draw the bbox twice. Returns (path, None) in dry-run mode.
+        """
         if frame is None or self._cv2 is None:
             # dry_run: synthesize a path
             path = Path(self.config.snapshot_dir) / f"{int(ts)}_{kind}.jpg"
             path.write_bytes(b"")  # empty placeholder
-            return str(path)
+            return str(path), None
 
         cv2 = self._cv2
         annotated = frame.copy()
@@ -417,7 +436,44 @@ class AnomalyDetector:
             [cv2.IMWRITE_JPEG_QUALITY, self.config.snapshot_jpeg_quality],
         )
         self._rotate_snapshots()
-        return str(path)
+        return str(path), annotated
+
+    def _encode_snapshot_b64(self, annotated) -> str:
+        """Resize + JPEG-encode + base64 the annotated frame for inline MQTT.
+
+        Returns "" in dry-run / when cv2 is unavailable / when disabled via
+        snapshot_b64_max_dim <= 0. Aspect ratio is preserved; the longest
+        side is clamped to snapshot_b64_max_dim.
+        """
+        if annotated is None or self._cv2 is None:
+            return ""
+        max_dim = int(self.config.snapshot_b64_max_dim)
+        if max_dim <= 0:
+            return ""
+        cv2 = self._cv2
+        try:
+            h, w = annotated.shape[:2]
+            longest = max(h, w)
+            if longest > max_dim:
+                scale = max_dim / float(longest)
+                new_w = max(1, int(round(w * scale)))
+                new_h = max(1, int(round(h * scale)))
+                small = cv2.resize(annotated, (new_w, new_h),
+                                    interpolation=cv2.INTER_AREA)
+            else:
+                small = annotated
+            ok, buf = cv2.imencode(
+                ".jpg",
+                small,
+                [cv2.IMWRITE_JPEG_QUALITY,
+                 int(self.config.snapshot_b64_jpeg_quality)],
+            )
+            if not ok:
+                return ""
+            return base64.b64encode(buf.tobytes()).decode("ascii")
+        except Exception as exc:
+            log.warning("[detector] snapshot b64 encode failed: %s", exc)
+            return ""
 
     def _rotate_snapshots(self) -> None:
         """Keep the snapshot dir below `snapshot_max_keep` files (oldest first)."""
