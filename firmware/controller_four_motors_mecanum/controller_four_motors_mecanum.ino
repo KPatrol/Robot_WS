@@ -613,6 +613,18 @@ void mecanum_stop() {
   BL_stop();
 }
 
+// Active brake: both PWM channels HIGH simultaneously → BTS7960 short-brake.
+// Stops in ~50 ms instead of ~200 ms coast.  brake_pwm 60–100 is a safe range.
+void mecanum_active_brake(int brake_pwm = 80) {
+  ledcWrite(FR_PWM_CH_R, brake_pwm); ledcWrite(FR_PWM_CH_L, brake_pwm);
+  ledcWrite(FL_PWM_CH_R, brake_pwm); ledcWrite(FL_PWM_CH_L, brake_pwm);
+  ledcWrite(BR_PWM_CH_R, brake_pwm); ledcWrite(BR_PWM_CH_L, brake_pwm);
+  ledcWrite(BL_PWM_CH_R, brake_pwm); ledcWrite(BL_PWM_CH_L, brake_pwm);
+  delay(40);
+  FR_stop(); FL_stop(); BR_stop(); BL_stop();
+  Serial.println(">>> MECANUM: ACTIVE BRAKE <<<");
+}
+
 // ============================================================================
 // LIGHT RELAY CONTROL FUNCTIONS
 // ============================================================================
@@ -1123,6 +1135,9 @@ void loop() {
     else if (command == "S") {
       mecanum_stop();
     }
+    else if (command == "BRAKE") {
+      mecanum_active_brake(80);
+    }
     
     // Light control commands - Warning Light (Đèn cảnh báo)
     else if (command == "LIGHT_ON") {
@@ -1221,6 +1236,37 @@ void loop() {
         else                 BR_stop();
       } else {
         Serial.println("✗ Invalid MEC! Use MEC:vx,vy,wz,spd");
+      }
+    }
+
+    // Per-motor signed PWM: "MOT:fr,fl,br,bl"
+    // Each value in [-255, 255]; positive = forward, negative = backward, 0 = stop.
+    // Used by Pi-side velocity PID for closed-loop wheel speed control.
+    else if (command.startsWith("MOT:")) {
+      int fr = 0, fl = 0, br = 0, bl = 0;
+      if (sscanf(command.c_str(), "MOT:%d,%d,%d,%d", &fr, &fl, &br, &bl) == 4) {
+        fr = constrain(fr, -255, 255);
+        fl = constrain(fl, -255, 255);
+        br = constrain(br, -255, 255);
+        bl = constrain(bl, -255, 255);
+
+        if (fr > 0)      FR_forward(fr);
+        else if (fr < 0) FR_backward(-fr);
+        else             FR_stop();
+
+        if (fl > 0)      FL_forward(fl);
+        else if (fl < 0) FL_backward(-fl);
+        else             FL_stop();
+
+        if (br > 0)      BR_forward(br);
+        else if (br < 0) BR_backward(-br);
+        else             BR_stop();
+
+        if (bl > 0)      BL_forward(bl);
+        else if (bl < 0) BL_backward(-bl);
+        else             BL_stop();
+      } else {
+        Serial.println("✗ Invalid MOT! Use MOT:fr,fl,br,bl");
       }
     }
 
