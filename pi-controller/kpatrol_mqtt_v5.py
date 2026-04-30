@@ -9,6 +9,8 @@ Navigation modes (NavController):
   • SCRIPT_PATROL — executes a declarative patrol script (rotate, forward_time,
                     strafe_time, pause, …) with IMU-closed-loop rotation and
                     ToF emergency reflex
+  • LINE_FOLLOW   — camera floor-line PD following (BEV homography + HSV)
+  • FREE_COVERAGE — autonomous random-walk coverage with ToF wall-bounce
   • EMERGENCY     — motors stopped, waiting for operator clear
 
 MQTT topics (scoped to kpatrol/{serial}/…):
@@ -54,7 +56,18 @@ except ImportError:
 # Add parent directory to path so navigation package resolves
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from navigation import NavController, Mode
+from navigation import (
+    NavController, Mode, LineFollowerConfig, HSVRange, CoverageConfig,
+    Odometry, VelocityController, VelocityPIDConfig,
+)
+
+# Optional OpenCV — required for LINE_FOLLOW mode
+try:
+    import cv2 as _cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _cv2 = None  # type: ignore
+    _CV2_AVAILABLE = False
 
 # V5.2: NEO-6M GPS reader (optional — falls back gracefully if module missing)
 try:
@@ -65,6 +78,23 @@ except ImportError as _gps_err:
     GPSReader = None  # type: ignore
     GPSData = None    # type: ignore
     _GPS_AVAILABLE = False
+
+# V5.3: Edge-AI anomaly detector (optional — graceful no-op if cv2/ultralytics
+# missing on dev box). When present, the detector runs inline in this process
+# so safety reactions (fire→EMERGENCY, person→pause) avoid an MQTT round-trip.
+try:
+    from detection.anomaly_detector import (
+        AnomalyDetector, DetectionConfig, DetectionEvent,
+    )
+    from detection.alert_db import AlertStore
+    _DETECTION_AVAILABLE = True
+except ImportError as _det_err:
+    print(f"[DETECT] Module unavailable: {_det_err} — anomaly detection disabled")
+    AnomalyDetector = None    # type: ignore
+    DetectionConfig = None    # type: ignore
+    DetectionEvent = None     # type: ignore
+    AlertStore = None         # type: ignore
+    _DETECTION_AVAILABLE = False
 
 
 # ==================== CONFIGURATION ====================
@@ -168,6 +198,13 @@ class Topics:
         self.METRICS       = f"{p}/metrics"
         # V5.2: Outdoor GPS (NEO-6M) — absolute geo-position
         self.GPS           = f"{p}/gps"
+        # LINE_FOLLOW: JPEG overlay frames for dashboard live view
+        self.CAMERA        = f"{p}/camera"
+        # Edge-AI anomaly detection (person + fire) — published by inline detector
+        self.ALERT         = f"{p}/alert"
+        # V5.3: Mecanum odometry (encoder + IMU complementary filter) at 20Hz
+        self.ODOM          = f"{p}/odom"
+        self.ODOM_RESET    = f"{p}/odom_reset"
         # Wildcard for subscribing all topics of this robot
         self.WILDCARD      = f"{p}/#"
 
@@ -700,10 +737,92 @@ class KPatrolMQTTV5:
         # Connect ToF callback
         self.encoder_reader.set_tof_callback(self.safety_controller.update_tof)
 
-        # Navigation: scripted patrol only
-        self._nav = NavController(script_dir="data/scripts")
+        # Navigation: scripted patrol + LINE_FOLLOW + FREE_COVERAGE.
+        # Map persistence is opt-in: set KPATROL_MAP_PERSIST_DIR=/path/to/dir
+        # and the FREE_COVERAGE occupancy grid is loaded on start + auto-saved
+        # every 30 s. Filename = map_<robot_serial>.npz so multiple robots can
+        # share the same dir without clobbering each other.
+        _map_dir = os.environ.get("KPATROL_MAP_PERSIST_DIR", "").strip()
+        _fc_cfg: Optional[CoverageConfig] = None
+        if _map_dir:
+            try:
+                os.makedirs(_map_dir, exist_ok=True)
+                _map_path = os.path.join(_map_dir, f"map_{mqtt_config.robot_serial}.npz")
+                _fc_cfg = CoverageConfig(save_path=_map_path)
+                print(f"[FC] map persistence enabled → {_map_path}")
+            except OSError as exc:
+                print(f"[FC] map persistence init failed: {exc} — running without persistence")
+                _fc_cfg = None
+        self._nav = NavController(script_dir="data/scripts", fc_config=_fc_cfg)
         self._last_nav_cmd = ""
         self._nav_lock = threading.Lock()
+
+        # LINE_FOLLOW camera: index via env var KPATROL_CAMERA (default 0)
+        # Set KPATROL_CAMERA=-1 to disable camera / LINE_FOLLOW.
+        _cam_idx = int(os.environ.get("KPATROL_CAMERA", "0"))
+        self._camera_enabled: bool = _CV2_AVAILABLE and _cam_idx >= 0
+        self._camera_index:   int  = _cam_idx
+        self._lf_last_twist: Optional[Tuple[int, int, int, int]] = None
+
+        # FREE_COVERAGE dedup cache — avoids resending identical MEC: commands
+        self._fc_last_twist: Optional[Tuple[int, int, int, int]] = None
+
+        # V5.3: Inline anomaly detector (env-gated, default OFF to avoid camera conflict).
+        # Set KPATROL_DETECTION_ENABLED=1 plus KPATROL_DETECTION_CAMERA=<idx>
+        # (must differ from KPATROL_CAMERA used by LINE_FOLLOW).
+        self._det_enabled: bool = (
+            _DETECTION_AVAILABLE
+            and os.environ.get("KPATROL_DETECTION_ENABLED", "0") not in ("0", "false", "False")
+        )
+        self._detector: Optional["AnomalyDetector"]   = None
+        self._alert_store: Optional["AlertStore"]     = None
+        self._alert_drain_thread: Optional[threading.Thread] = None
+        self._alert_drain_stop = threading.Event()
+        if self._det_enabled:
+            try:
+                _det_cam_idx = int(os.environ.get("KPATROL_DETECTION_CAMERA", "1"))
+                if _det_cam_idx == self._camera_index and self._camera_enabled:
+                    print(f"[DETECT] WARNING: detector camera idx ({_det_cam_idx}) "
+                          f"clashes with LINE_FOLLOW camera — disabling detection")
+                    self._det_enabled = False
+                else:
+                    os.makedirs("data/snapshots", exist_ok=True)
+                    det_cfg = DetectionConfig(
+                        camera_index=_det_cam_idx,
+                        snapshot_dir="data/snapshots",
+                        robot_serial=mqtt_config.robot_serial,
+                        log_level="INFO",
+                    )
+                    self._alert_store = AlertStore("data/alerts.db")
+                    self._detector = AnomalyDetector(det_cfg, on_event=self._on_detection_event)
+                    print(f"[DETECT] AnomalyDetector ready (camera idx {_det_cam_idx})")
+            except Exception as exc:
+                print(f"[DETECT] init failed: {exc} — detection disabled")
+                self._det_enabled = False
+                self._detector = None
+                self._alert_store = None
+
+        # V5.3: Mecanum odometry (encoder + IMU complementary filter) — fuses
+        # 4-wheel cumulative counts with BNO08x yaw to estimate (x, y, θ) in
+        # world frame at 20 Hz. Published on T.ODOM; reset via T.ODOM_RESET.
+        self._odom = Odometry()
+        self._last_odom_pub = 0.0
+
+        # V5.3: Pi-side closed-loop velocity PID. When KPATROL_VELOCITY_PID=1 and
+        # an AUTO mode is active, the nav loop converts (vx,vy,wz,spd) MEC twist
+        # to physical body twist (m/s, rad/s), runs per-wheel PI against measured
+        # RPM, and dispatches MOT:fr,fl,br,bl. Falls back to MEC: when disabled.
+        self._vpid_enabled: bool = (
+            os.environ.get("KPATROL_VELOCITY_PID", "0") not in ("0", "false", "False")
+        )
+        self._vpid: Optional[VelocityController] = None
+        self._vpid_max_mps: float = float(os.environ.get("KPATROL_VPID_MAX_MPS", "1.0"))
+        self._vpid_max_wz:  float = float(os.environ.get("KPATROL_VPID_MAX_WZ",  "3.0"))
+        if self._vpid_enabled:
+            self._vpid = VelocityController()
+            print(f"[VPID] enabled — max {self._vpid_max_mps:.2f} m/s, "
+                  f"{self._vpid_max_wz:.2f} rad/s")
+        self._last_mot: Optional[Tuple[int, int, int, int]] = None
 
         # V5.1: Link telemetry (MQTT payload metrics).
         # Accumulates across _pub() calls; publish_metrics() snapshots them
@@ -828,6 +947,8 @@ class KPatrolMQTTV5:
                 self.handle_nav_command(payload)
             elif topic == T.SCRIPT_CMD:
                 self.handle_script_command(payload)
+            elif topic == T.ODOM_RESET:
+                self.handle_odom_reset(payload)
         except json.JSONDecodeError:
             print(f"[MQTT] Invalid JSON: {msg.payload}")
         except Exception as e:
@@ -944,10 +1065,32 @@ class KPatrolMQTTV5:
             # Always stop motors FIRST before any mode switch
             self.motor_controller.send_command("S")
             self._last_nav_cmd = "S"
+            self._lf_last_twist = None   # reset dedup cache for LINE_FOLLOW
+            self._fc_last_twist = None   # reset dedup cache for FREE_COVERAGE
 
-            if not self._nav.set_mode(mode_str):
-                self.publish_log(f"Unknown mode: {mode_str}")
-                return
+            if mode_str == "LINE_FOLLOW":
+                # Ensure any running script is stopped before entering LINE_FOLLOW
+                self._nav.script_stop()
+                # Use dedicated start path that resets PID state
+                result = self._nav.line_follow_start()
+                if not result.get("ok"):
+                    self.publish_log(f"LINE_FOLLOW start failed: {result.get('error','?')}")
+                    return
+                if not self._camera_enabled:
+                    self.publish_log("WARN: camera disabled — LINE_FOLLOW mode is active but robot will not move")
+
+            elif mode_str == "FREE_COVERAGE":
+                # Stop any running script before entering FREE_COVERAGE
+                self._nav.script_stop()
+                result = self._nav.free_coverage_start()
+                if not result.get("ok"):
+                    self.publish_log(f"FREE_COVERAGE start failed: {result.get('error','?')}")
+                    return
+
+            else:
+                if not self._nav.set_mode(mode_str):
+                    self.publish_log(f"Unknown mode: {mode_str}")
+                    return
             print(f"[Nav] Mode → {mode_str}")
 
             # Set ESP32 speed to match nav _speed for autonomous modes
@@ -1063,6 +1206,24 @@ class KPatrolMQTTV5:
             "timestamp": int(time.time() * 1000),
         })
 
+    # ── Odometry handlers ──────────────────────────────────────────
+
+    def handle_odom_reset(self, payload: Dict[str, Any]) -> None:
+        """Force-reset world pose to a known waypoint.
+
+        Payload: {"x": float, "y": float, "theta_deg": float}
+        Used after entering a waypoint in line-follow mode or when
+        the dashboard issues a "set as origin" command.
+        """
+        try:
+            x = float(payload.get("x", 0.0))
+            y = float(payload.get("y", 0.0))
+            theta_deg = float(payload.get("theta_deg", 0.0))
+            self._odom.reset(x=x, y=y, theta_deg=theta_deg)
+            self.publish_log(f"Odom reset → x={x:.2f} y={y:.2f} θ={theta_deg:.1f}°")
+        except (TypeError, ValueError) as exc:
+            print(f"[ODOM] reset payload error: {exc}")
+
     # ── Publishers ─────────────────────────────────────────────────
 
     def _pub(self, topic: str, payload: dict, qos: int = 0, retain: bool = False):
@@ -1075,6 +1236,19 @@ class KPatrolMQTTV5:
                 # Short topic label: strip the kpatrol/{serial}/ prefix.
                 label = topic.rsplit("/", 1)[-1]
                 self._per_topic_bytes[label] = self._per_topic_bytes.get(label, 0) + len(data)
+        else:
+            with self._metrics_lock:
+                self._msg_out_drops += 1
+
+    def _pub_raw(self, topic: str, payload: bytes, qos: int = 0) -> None:
+        """Publish raw binary payload (e.g. JPEG bytes for camera topic)."""
+        if self.client and self.client.is_connected():
+            self.client.publish(topic, payload, qos=qos)
+            with self._metrics_lock:
+                self._msg_out_count += 1
+                self._msg_out_bytes += len(payload)
+                label = topic.rsplit("/", 1)[-1]
+                self._per_topic_bytes[label] = self._per_topic_bytes.get(label, 0) + len(payload)
         else:
             with self._metrics_lock:
                 self._msg_out_drops += 1
@@ -1136,6 +1310,131 @@ class KPatrolMQTTV5:
             "timestamp": int(time.time() * 1000),
         }, qos=1, retain=True)
 
+    # ----- V5.3: Detection → Navigation safety bridge -----------------
+
+    def _on_detection_event(self, event: "DetectionEvent") -> None:
+        """Inline callback fired by AnomalyDetector when a person/fire is confirmed.
+
+        Order matters: react FIRST (lowest latency for fire emergency-stop),
+        persist SECOND (durable record), publish THIRD (best-effort to broker).
+        """
+        kind = str(event.kind).lower().strip()
+        try:
+            nav_result = self._nav.on_alert(kind, float(event.confidence), tuple(event.bbox))
+            print(f"[DETECT→NAV] {kind} conf={event.confidence:.2f} → {nav_result.get('action')}")
+        except Exception as exc:
+            print(f"[DETECT→NAV] on_alert error: {exc}")
+
+        alert_id: Optional[int] = None
+        if self._alert_store is not None:
+            try:
+                alert_id = self._alert_store.insert(
+                    kind=kind,
+                    confidence=float(event.confidence),
+                    bbox=tuple(event.bbox),
+                    snapshot=event.snapshot_path,
+                    robot=self.mqtt_config.robot_serial,
+                    frame_w=event.frame_width,
+                    frame_h=event.frame_height,
+                    ts=event.timestamp,
+                )
+            except Exception as exc:
+                print(f"[DETECT] persist failed: {exc}")
+
+        if self._publish_alert_row(
+            alert_id=alert_id if alert_id is not None else -1,
+            kind=kind,
+            confidence=float(event.confidence),
+            bbox=tuple(event.bbox),
+            ts=float(event.timestamp),
+            snapshot=str(event.snapshot_path),
+            frame_w=int(event.frame_width),
+            frame_h=int(event.frame_height),
+            snapshot_b64=str(getattr(event, "snapshot_b64", "") or ""),
+        ) and alert_id is not None and self._alert_store is not None:
+            try:
+                self._alert_store.mark_synced(alert_id)
+            except Exception as exc:
+                print(f"[DETECT] mark_synced failed: {exc}")
+
+    def _publish_alert_row(
+        self,
+        alert_id: int,
+        kind: str,
+        confidence: float,
+        bbox: tuple,
+        ts: float,
+        snapshot: str,
+        frame_w: int,
+        frame_h: int,
+        snapshot_b64: str = "",
+    ) -> bool:
+        payload = {
+            "id": alert_id,
+            "kind": kind,
+            "confidence": round(confidence, 3),
+            "bbox": list(bbox),
+            "ts": ts,
+            "snapshot": snapshot,
+            "robot": self.mqtt_config.robot_serial,
+            "frame_size": [frame_w, frame_h],
+        }
+        # Only attach b64 when present so AlertStore drain replays (which
+        # don't carry the image) stay light, and EMQX retained-message size
+        # stays low.
+        if snapshot_b64:
+            payload["snapshot_b64"] = snapshot_b64
+        body = json.dumps(payload, separators=(",", ":"))
+        if self.client is None or not self.client.is_connected():
+            with self._metrics_lock:
+                self._msg_out_drops += 1
+            return False
+        try:
+            info = self.client.publish(self.T.ALERT, body, qos=1, retain=False)
+            with self._metrics_lock:
+                self._msg_out_count += 1
+                self._msg_out_bytes += len(body)
+                label = self.T.ALERT.rsplit("/", 1)[-1]
+                self._per_topic_bytes[label] = self._per_topic_bytes.get(label, 0) + len(body)
+            return getattr(info, "rc", 0) == 0
+        except Exception as exc:
+            print(f"[DETECT] publish failed: {exc}")
+            return False
+
+    def _alert_drain_loop(self, interval_sec: float = 5.0) -> None:
+        """Retries unsynced alert rows when broker reconnects."""
+        if self._alert_store is None:
+            return
+        while not self._alert_drain_stop.wait(interval_sec):
+            if self.client is None or not self.client.is_connected():
+                continue
+            try:
+                rows = self._alert_store.unsynced(limit=50)
+            except Exception as exc:
+                print(f"[DETECT] drain read failed: {exc}")
+                continue
+            for row in rows:
+                try:
+                    bbox = tuple(json.loads(row["bbox_json"]))
+                except Exception:
+                    bbox = (0, 0, 0, 0)
+                if self._publish_alert_row(
+                    alert_id=row["id"],
+                    kind=row["kind"],
+                    confidence=float(row["confidence"]),
+                    bbox=bbox,
+                    ts=float(row["ts"]),
+                    snapshot=row.get("snapshot") or "",
+                    frame_w=int(row["frame_w"]),
+                    frame_h=int(row["frame_h"]),
+                ):
+                    try:
+                        self._alert_store.mark_synced(row["id"])
+                    except Exception as exc:
+                        print(f"[DETECT] mark_synced (drain) failed: {exc}")
+                else:
+                    break
+
     def publish_safety(self):
         self._pub(self.T.SAFETY, self.safety_controller.get_status())
 
@@ -1146,6 +1445,31 @@ class KPatrolMQTTV5:
         data = self.encoder_reader.get_encoder_status()
         data["timestamp"] = int(time.time() * 1000)
         self._pub(self.T.ENCODERS, data)
+
+    def publish_odom(self):
+        """V5.3: fuse 4-wheel encoder counts + BNO08x yaw → world pose.
+
+        Pulls cumulative counts from EncoderReader, current yaw from the
+        IMU mirror on MotorController, and publishes the fused (x, y, θ)
+        pose to T.ODOM at 20 Hz. Pose is the foundation for waypoint
+        navigation, return-to-start, and coverage maps.
+        """
+        try:
+            counts_raw = self.encoder_reader.get_encoder_counts()
+            counts = {
+                "FR": int(counts_raw.get("FR_count", 0)),
+                "FL": int(counts_raw.get("FL_count", 0)),
+                "BR": int(counts_raw.get("BR_count", 0)),
+                "BL": int(counts_raw.get("BL_count", 0)),
+            }
+            imu_yaw = self.motor_controller.imu_data.yaw
+            # Skip IMU when stale/uninitialized (timestamp 0 → encoder-only fallback)
+            yaw_arg = float(imu_yaw) if self.motor_controller.imu_data.timestamp else None
+            pose = self._odom.update(counts, imu_yaw_deg=yaw_arg)
+            self._pub(self.T.ODOM, pose.to_dict())
+        except Exception as exc:
+            # Never let odometry kill the publish loop — log and continue.
+            print(f"[ODOM] publish error: {exc}")
 
     def publish_motors(self):
         data = self.motor_controller.get_motor_status()
@@ -1187,19 +1511,93 @@ class KPatrolMQTTV5:
         payload["connected"] = self.gps_reader.connected
         self._pub(self.T.GPS, payload, qos=0)
 
+    # ── LINE_FOLLOW camera loop (separate thread) ─────────────────
+
+    def _line_follow_loop(self):
+        """Camera capture + line-follower tick at ~20 Hz.
+
+        Only active when KPATROL_CAMERA env var ≥ 0 and cv2 is installed.
+        Sends MEC: commands only while NavController is in LINE_FOLLOW mode.
+        Safety veto applies: if front distance is DANGER the robot stops.
+        Publishes JPEG overlay to kpatrol/{serial}/camera for dashboard view.
+        """
+        if not _CV2_AVAILABLE:
+            print("[LF] cv2 not available — LINE_FOLLOW camera disabled")
+            return
+
+        cap = _cv2.VideoCapture(self._camera_index)
+        cap.set(_cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(_cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(_cv2.CAP_PROP_FPS, 30)
+
+        if not cap.isOpened():
+            print(f"[LF] Camera {self._camera_index} failed to open — LINE_FOLLOW disabled")
+            return
+
+        print(f"[LF] Camera {self._camera_index} opened (640×480)")
+        interval      = 0.05  # 20 Hz control loop
+        cam_pub_interval = 0.20  # 5 Hz JPEG stream (MQTT bandwidth friendly)
+        last_cam_pub  = 0.0
+
+        while self.running:
+            t0 = time.time()
+
+            # Only process when in LINE_FOLLOW mode
+            if self._nav.get_mode() != "LINE_FOLLOW":
+                self._lf_last_twist = None
+                time.sleep(interval)
+                continue
+
+            ret, frame = cap.read()
+            if not ret:
+                print("[LF] Frame capture failed")
+                time.sleep(0.1)
+                continue
+
+            result = self._nav.line_follow_tick(frame, produce_overlay=True)
+
+            vx, vy, wz, spd = result.vx, result.vy, result.wz, result.spd
+            twist = (vx, vy, wz, spd)
+
+            # Safety veto: stop forward motion if obstacle in danger zone
+            fwd_dist = self.safety_controller.direction_distances.get("forward", 9999)
+            if self.safety_controller.config.enabled and vx > 0:
+                if fwd_dist < self.safety_controller.config.danger_distance:
+                    twist = (0, 0, 0, spd)
+
+            # Send deduplicated MEC: command
+            if twist != self._lf_last_twist:
+                vx2, vy2, wz2, spd2 = twist
+                self.motor_controller.send_command(f"MEC:{vx2},{vy2},{wz2},{spd2}")
+                self._lf_last_twist = twist
+
+            # Publish JPEG overlay at ≤5 Hz for dashboard live view
+            if result.overlay is not None and t0 - last_cam_pub >= cam_pub_interval:
+                _, jpg = _cv2.imencode(".jpg", result.overlay, [_cv2.IMWRITE_JPEG_QUALITY, 70])
+                self._pub_raw(self.T.CAMERA, jpg.tobytes())
+                last_cam_pub = t0
+
+            elapsed = time.time() - t0
+            time.sleep(max(0.0, interval - elapsed))
+
+        cap.release()
+        print("[LF] Camera released")
+
     # ── V5: Navigation Loop (separate thread) ─────────────────────
 
     def _nav_loop(self):
         """Navigation tick loop — runs at 20 Hz (50 ms).
 
-        Drives SCRIPT_PATROL mode by polling NavController.tick() with
-        fresh ToF + IMU readings. MANUAL is a no-op (operator drives via
-        /motor). EMERGENCY forces a STOP.
+        Drives SCRIPT_PATROL and FREE_COVERAGE modes by polling
+        NavController.tick() with fresh ToF + IMU readings.
+        MANUAL is a no-op (operator drives via /motor).
+        EMERGENCY forces a STOP.
+        LINE_FOLLOW is handled by _line_follow_loop() instead.
 
-        Transport: when the executor emits a twist (vx, vy, wz, spd) we
-        send a `MEC:` command for per-wheel Mecanum control with yaw-hold
-        correction. Otherwise we fall back to the legacy single-letter
-        command + SPD channel. Both paths are deduplicated.
+        Transport: when NavController emits a twist (vx, vy, wz, spd) we
+        send a `MEC:` command for per-wheel Mecanum control. Otherwise we
+        fall back to the legacy single-letter command + SPD channel. Both
+        paths are deduplicated to avoid flooding the ESP32 UART.
         """
         interval = 0.05  # 20 Hz
         last_status_pub = time.time()
@@ -1215,6 +1613,7 @@ class KPatrolMQTTV5:
             # Encoder closed-loop feedback for move_distance steps. The
             # encoder reader uses "FR_count"/"FL_count"/... keys; executor
             # expects bare wheel keys. Translate once here.
+            enc_raw: Optional[Dict[str, float]] = None
             try:
                 enc_raw = self.encoder_reader.get_encoder_counts()
                 enc_counts: Optional[Dict[str, int]] = {
@@ -1225,9 +1624,17 @@ class KPatrolMQTTV5:
                 }
             except Exception:
                 enc_counts = None
+                enc_raw = None
+
+            # Snapshot the latest fused pose so FREE_COVERAGE can run
+            # map-aware navigation (occupancy grid + frontier exploration).
+            try:
+                nav_pose = self._odom.get_pose()
+            except Exception:
+                nav_pose = None
 
             cmd, speed_pwm, twist, status = self._nav.tick(
-                tof_dict, imu_yaw, encoder_counts=enc_counts
+                tof_dict, imu_yaw, encoder_counts=enc_counts, pose=nav_pose
             )
             current_mode = self._nav.get_mode()
 
@@ -1241,6 +1648,37 @@ class KPatrolMQTTV5:
                     self.motor_controller.send_command("S")
                     last_twist = (0, 0, 0, 0)
                     self._last_nav_cmd = "S"
+                    if self._vpid is not None:
+                        self._vpid.reset()
+                        self._last_mot = (0, 0, 0, 0)
+                elif self._vpid is not None and self._vpid_enabled:
+                    # Closed-loop velocity PID: convert MEC normalized
+                    # twist → physical body twist → per-wheel PWM via PI.
+                    vx_n, vy_n, wz_n, spd = twist
+                    scale = (spd / 255.0) if spd else 0.0
+                    vx_mps = (vx_n / 127.0) * scale * self._vpid_max_mps
+                    vy_mps = (vy_n / 127.0) * scale * self._vpid_max_mps
+                    wz_rps = (wz_n / 127.0) * scale * self._vpid_max_wz
+                    enc = enc_raw if enc_raw else self.encoder_reader.get_encoder_counts()
+                    measured = {
+                        "FR": float(enc.get("FR_rpm", 0.0)),
+                        "FL": float(enc.get("FL_rpm", 0.0)),
+                        "BR": float(enc.get("BR_rpm", 0.0)),
+                        "BL": float(enc.get("BL_rpm", 0.0)),
+                    }
+                    fr, fl, br, bl, _dbg = self._vpid.update(
+                        vx_mps, vy_mps, wz_rps, measured,
+                    )
+                    new_mot = (fr, fl, br, bl)
+                    if new_mot != self._last_mot:
+                        self.motor_controller.send_command(
+                            f"MOT:{fr},{fl},{br},{bl}"
+                        )
+                        self._last_mot = new_mot
+                    last_twist = twist
+                    self._last_nav_cmd = cmd or ""
+                    if spd:
+                        last_speed_pwm = int(spd)
                 elif twist != last_twist:
                     vx, vy, wz, spd = twist
                     self.motor_controller.send_command(f"MEC:{vx},{vy},{wz},{spd}")
@@ -1282,6 +1720,28 @@ class KPatrolMQTTV5:
         nav_thread = threading.Thread(target=self._nav_loop, name="nav_loop", daemon=True)
         nav_thread.start()
 
+        # Start LINE_FOLLOW camera thread (no-op if cv2 absent or KPATROL_CAMERA=-1)
+        if self._camera_enabled:
+            lf_thread = threading.Thread(target=self._line_follow_loop, name="lf_loop", daemon=True)
+            lf_thread.start()
+            print(f"[LF] Camera thread started (device {self._camera_index})")
+        else:
+            print("[LF] Camera disabled — LINE_FOLLOW mode will not move motors")
+
+        # V5.3: Start AnomalyDetector + alert backlog drainer (env-gated)
+        if self._det_enabled and self._detector is not None:
+            try:
+                self._detector.start(blocking=False)
+                self._alert_drain_thread = threading.Thread(
+                    target=self._alert_drain_loop, name="alert_drain", daemon=True,
+                )
+                self._alert_drain_thread.start()
+                print("[DETECT] anomaly detector + drainer started")
+            except Exception as exc:
+                print(f"[DETECT] start failed: {exc}")
+        else:
+            print("[DETECT] disabled (set KPATROL_DETECTION_ENABLED=1 to enable)")
+
         heartbeat_interval = 5
         status_interval = 2
         encoder_interval = 0.5
@@ -1290,6 +1750,7 @@ class KPatrolMQTTV5:
         imu_interval = 0.5
         metrics_interval = 10     # V5.1 link telemetry at 0.1Hz
         gps_interval = self.gps_config.publish_interval   # V5.2 default 1Hz
+        odom_interval = 0.05      # V5.3 odometry at 20Hz
 
         last_heartbeat = 0
         last_status = 0
@@ -1300,6 +1761,7 @@ class KPatrolMQTTV5:
         last_imu_request = 0
         last_metrics = 0
         last_gps = 0
+        last_odom = 0.0
 
         print("\n" + "=" * 60)
         print("    K-PATROL MQTT CLIENT V5.0")
@@ -1362,6 +1824,11 @@ class KPatrolMQTTV5:
                     self.publish_gps()
                     last_gps = current_time
 
+                # V5.3: 20Hz odometry — encoder + IMU complementary fusion
+                if current_time - last_odom >= odom_interval:
+                    self.publish_odom()
+                    last_odom = current_time
+
                 response = self.motor_controller.read_response()
                 if response and not response.startswith("IMU:"):
                     print(f"[Motor] {response}")
@@ -1378,6 +1845,14 @@ class KPatrolMQTTV5:
         self.motor_controller.send_command("S")
         time.sleep(0.3)
 
+        # V5.3: stop detector + drainer before tearing down MQTT
+        self._alert_drain_stop.set()
+        if self._detector is not None:
+            try:
+                self._detector.stop()
+            except Exception as exc:
+                print(f"[DETECT] stop error: {exc}")
+
         if self.client and self.client.is_connected():
             self.send_heartbeat("offline")
             time.sleep(0.5)
@@ -1388,6 +1863,11 @@ class KPatrolMQTTV5:
         self.encoder_reader.disconnect()
         if self.gps_reader is not None:
             self.gps_reader.disconnect()
+        if self._alert_store is not None:
+            try:
+                self._alert_store.close()
+            except Exception as exc:
+                print(f"[DETECT] alert_store close error: {exc}")
         print("[Main] V5 shutdown complete")
 
 
