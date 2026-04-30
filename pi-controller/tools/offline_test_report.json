@@ -1,0 +1,89 @@
+{
+  "total_scenarios": 8,
+  "found_rate": 0.625,
+  "iou_mean": 0.9999,
+  "iou_median": 1.0,
+  "iou_min": 0.9996,
+  "scenarios": [
+    {
+      "name": "straight",
+      "description": "Vertical white line, centred",
+      "line_found": false,
+      "iou": 1.0,
+      "lateral_err": 0.0,
+      "heading_err_deg": 0.0,
+      "det_px": 10560,
+      "gt_px": 10560
+    },
+    {
+      "name": "angled_left",
+      "description": "Line angled 15\u00b0 left",
+      "line_found": true,
+      "iou": 0.9996,
+      "lateral_err": -128.93,
+      "heading_err_deg": 9.74,
+      "det_px": 10560,
+      "gt_px": 10560
+    },
+    {
+      "name": "angled_right",
+      "description": "Line angled 15\u00b0 right",
+      "line_found": true,
+      "iou": 0.9996,
+      "lateral_err": -121.92,
+      "heading_err_deg": -9.7,
+      "det_px": 10560,
+      "gt_px": 10560
+    },
+    {
+      "name": "offset_right",
+      "description": "Line 60px right of centre",
+      "line_found": true,
+      "iou": 1.0,
+      "lateral_err": -88.57,
+      "heading_err_deg": -5.73,
+      "det_px": 10560,
+      "gt_px": 10560
+    },
+    {
+      "name": "offset_left",
+      "description": "Line 60px left of centre",
+      "line_found": true,
+      "iou": 1.0,
+      "lateral_err": -162.27,
+      "heading_err_deg": 5.76,
+      "det_px": 10560,
+      "gt_px": 10560
+    },
+    {
+      "name": "noisy_bg",
+      "description": "3% salt-pepper noise + low contrast",
+      "line_found": false,
+      "iou": 1.0,
+      "lateral_err": 0.0,
+      "heading_err_deg": 0.0,
+      "det_px": 10560,
+      "gt_px": 10560
+    },
+    {
+      "name": "double_line",
+      "description": "Two parallel lines",
+      "line_found": true,
+      "iou": 1.0,
+      "lateral_err": -125.51,
+      "heading_err_deg": -0.0,
+      "det_px": 17280,
+      "gt_px": 17280
+    },
+    {
+      "name": "dim_line",
+      "description": "Dim line (brightness=165, threshold edge)",
+      "line_found": false,
+      "iou": 1.0,
+      "lateral_err": 0.0,
+      "heading_err_deg": 0.0,
+      "det_px": 10560,
+      "gt_px": 10560
+    }
+  ]
+}
