@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
 """
-kpatrol_mqtt_v5.py — K-Patrol MQTT Controller V5
-=================================================
-Directional safety + scripted autonomous patrol.
+kpatrol_mqtt_v5.py — K-Patrol MQTT Controller V5.3
+===================================================
+Directional safety + 3 autonomous navigation modes + safety hardware.
 
-Navigation modes (NavController):
-  • MANUAL        — operator drives via kpatrol/{serial}/motor
-  • SCRIPT_PATROL — executes a declarative patrol script (rotate, forward_time,
-                    strafe_time, pause, …) with IMU-closed-loop rotation and
-                    ToF emergency reflex
-  • LINE_FOLLOW   — camera floor-line PD following (BEV homography + HSV)
-  • FREE_COVERAGE — autonomous random-walk coverage with ToF wall-bounce
-  • EMERGENCY     — motors stopped, waiting for operator clear
+Navigation modes (NavController, 5 total):
+  • MANUAL              — operator drives via kpatrol/{serial}/motor
+  • AUTO_FREE_COVERAGE  — indoor random-walk + frontier exploration
+  • AUTO_LINE_FOLLOW    — camera floor-line PD follower (BEV + HSV)
+  • AUTO_GPS_WAYPOINT   — outdoor GPS route (Haversine + IMU + ToF safety)
+  • EMERGENCY           — motors stopped, waiting for operator clear
 
 MQTT topics (scoped to kpatrol/{serial}/…):
   Subscribe:
-    nav_command    {"mode": "MANUAL|SCRIPT_PATROL|EMERGENCY",
-                    "speed": 60,
-                    "action": "clear_emergency"}
-    script_command {"action": "list|save|delete|load|start|stop",
-                    "name":   "<script_name>",
-                    "script": { ...PatrolScript dict... }}
+    nav_command       {"mode":"MANUAL|AUTO_FREE_COVERAGE|AUTO_LINE_FOLLOW|"
+                       "AUTO_GPS_WAYPOINT|EMERGENCY",
+                       "speed":60, "action":"clear_emergency"}
+    gps_route         {"action":"set|start|stop",
+                       "waypoints":[{"lat":..., "lon":..., "radius_m":3}],
+                       "loop":false}
+    buzzer            {"pattern":"OFF|ON|BEEP|ALARM|SOS"}
+    light_pattern     {"pattern":"OFF|WARN_BLINK|WARN_STROBE|"
+                       "BOTH_BLINK|SOS"}
   Publish:
-    nav_status     Executor state, current step, progress, errors
-    script_list    Available scripts with metadata
-    script_status  Result of last script_command action
+    nav_status     FSM state, current waypoint, progress, errors
+    gps_status     GPS route progress + nav state
 
-Hardware:
-  ESP32-S3  → /dev/ttyKPATROL_MOTOR   (motors + BNO08x IMU)
+Hardware (V5.3):
+  ESP32-S3  → /dev/ttyKPATROL_MOTOR   (motors + BNO08x IMU + GPS UART2 +
+                                       buzzer + e-stop button + remote relay)
   ESP32     → /dev/ttyKPATROL_ENCODER (4 encoders + 6x VL53L0X ToF)
 """
 
@@ -187,13 +188,15 @@ class Topics:
         self.ERROR         = f"{p}/error"
         self.SAFETY        = f"{p}/safety"
         self.IMU           = f"{p}/imu"
-        # V5: Navigation (MANUAL / SCRIPT_PATROL / EMERGENCY)
+        # V5.3: Navigation FSM (5 modes — see header docstring)
         self.NAV_CMD       = f"{p}/nav_command"
         self.NAV_STATUS    = f"{p}/nav_status"
-        # Scripted patrol management
-        self.SCRIPT_CMD    = f"{p}/script_command"
-        self.SCRIPT_LIST   = f"{p}/script_list"
-        self.SCRIPT_STATUS = f"{p}/script_status"
+        # V5.3: GPS waypoint route management (AUTO_GPS_WAYPOINT mode)
+        self.GPS_ROUTE     = f"{p}/gps_route"
+        self.GPS_STATUS    = f"{p}/gps_status"
+        # V5.3: Safety hardware (firmware-side state machines)
+        self.BUZZ          = f"{p}/buzzer"
+        self.LIGHT_PATTERN = f"{p}/light_pattern"
         # V5.1: MQTT link telemetry (bytes in/out, msg counts, drop rate)
         self.METRICS       = f"{p}/metrics"
         # V5.2: Outdoor GPS (NEO-6M) — absolute geo-position
@@ -945,8 +948,12 @@ class KPatrolMQTTV5:
                 self.handle_safety_config(payload)
             elif topic == T.NAV_CMD:
                 self.handle_nav_command(payload)
-            elif topic == T.SCRIPT_CMD:
-                self.handle_script_command(payload)
+            elif topic == T.GPS_ROUTE:
+                self.handle_gps_route(payload)
+            elif topic == T.BUZZ:
+                self.handle_buzzer(payload)
+            elif topic == T.LIGHT_PATTERN:
+                self.handle_light_pattern(payload)
             elif topic == T.ODOM_RESET:
                 self.handle_odom_reset(payload)
         except json.JSONDecodeError:
@@ -989,8 +996,10 @@ class KPatrolMQTTV5:
         )
 
     def handle_motor_command(self, payload: Dict[str, Any]):
-        # Refuse manual control while autonomous script is running
-        if self._nav.get_mode() == "SCRIPT_PATROL":
+        # Refuse manual control while any autonomous mode is active.
+        mode = self._nav.get_mode()
+        if mode in ("AUTO_FREE_COVERAGE", "AUTO_LINE_FOLLOW",
+                    "AUTO_GPS_WAYPOINT", "EMERGENCY"):
             return
         cmd_type = payload.get("type", "")
         speed = payload.get("speed")
@@ -1047,9 +1056,13 @@ class KPatrolMQTTV5:
     def handle_nav_command(self, payload: Dict[str, Any]):
         """Process nav_command payload.
 
-        {"mode": "MANUAL|SCRIPT_PATROL|EMERGENCY",
-         "speed": 60,
-         "action": "clear_emergency"}
+        {"mode":"MANUAL|AUTO_FREE_COVERAGE|AUTO_LINE_FOLLOW|"
+                "AUTO_GPS_WAYPOINT|EMERGENCY",
+         "speed":60,
+         "action":"clear_emergency"}
+
+        Legacy aliases LINE_FOLLOW / FREE_COVERAGE / SCRIPT_PATROL are
+        accepted for backwards compat with older dashboards.
         """
         if "speed" in payload:
             self._nav.set_speed(int(payload["speed"]))
@@ -1061,30 +1074,38 @@ class KPatrolMQTTV5:
 
         if "mode" in payload:
             mode_str = str(payload["mode"]).upper()
+            # Backwards-compat aliases for older dashboards
+            mode_str = {
+                "LINE_FOLLOW":   "AUTO_LINE_FOLLOW",
+                "FREE_COVERAGE": "AUTO_FREE_COVERAGE",
+                "SCRIPT_PATROL": "AUTO_FREE_COVERAGE",
+                "GPS_WAYPOINT":  "AUTO_GPS_WAYPOINT",
+            }.get(mode_str, mode_str)
 
             # Always stop motors FIRST before any mode switch
             self.motor_controller.send_command("S")
             self._last_nav_cmd = "S"
-            self._lf_last_twist = None   # reset dedup cache for LINE_FOLLOW
-            self._fc_last_twist = None   # reset dedup cache for FREE_COVERAGE
+            self._lf_last_twist = None   # reset dedup cache for AUTO_LINE_FOLLOW
+            self._fc_last_twist = None   # reset dedup cache for AUTO_FREE_COVERAGE
 
-            if mode_str == "LINE_FOLLOW":
-                # Ensure any running script is stopped before entering LINE_FOLLOW
-                self._nav.script_stop()
-                # Use dedicated start path that resets PID state
-                result = self._nav.line_follow_start()
+            if mode_str == "AUTO_LINE_FOLLOW":
+                result = self._nav.auto_line_follow_start()
                 if not result.get("ok"):
-                    self.publish_log(f"LINE_FOLLOW start failed: {result.get('error','?')}")
+                    self.publish_log(f"AUTO_LINE_FOLLOW start failed: {result.get('error','?')}")
                     return
                 if not self._camera_enabled:
-                    self.publish_log("WARN: camera disabled — LINE_FOLLOW mode is active but robot will not move")
+                    self.publish_log("WARN: camera disabled — AUTO_LINE_FOLLOW active but robot will not move")
 
-            elif mode_str == "FREE_COVERAGE":
-                # Stop any running script before entering FREE_COVERAGE
-                self._nav.script_stop()
-                result = self._nav.free_coverage_start()
+            elif mode_str == "AUTO_FREE_COVERAGE":
+                result = self._nav.auto_free_coverage_start()
                 if not result.get("ok"):
-                    self.publish_log(f"FREE_COVERAGE start failed: {result.get('error','?')}")
+                    self.publish_log(f"AUTO_FREE_COVERAGE start failed: {result.get('error','?')}")
+                    return
+
+            elif mode_str == "AUTO_GPS_WAYPOINT":
+                result = self._nav.auto_gps_waypoint_start()
+                if not result.get("ok"):
+                    self.publish_log(f"AUTO_GPS_WAYPOINT start failed: {result.get('error','?')}")
                     return
 
             else:
@@ -1100,111 +1121,69 @@ class KPatrolMQTTV5:
             else:
                 print("[Nav] MANUAL — motors stopped")
 
-    # ── Script command handler ─────────────────────────────────────
+    # ── GPS route command handler (AUTO_GPS_WAYPOINT) ──────────────
 
-    def handle_script_command(self, payload: Dict[str, Any]):
-        """Process script_command payload.
+    def handle_gps_route(self, payload: Dict[str, Any]):
+        """Process gps_route payload.
 
-        {"action": "list|save|delete|load|start|stop",
-         "name":   "<script_name>",
-         "script": { ...PatrolScript dict... } }
+        {"action":"set|start|stop",
+         "waypoints":[{"lat":21.028,"lon":105.804,"radius_m":3,"label":"Gate"}],
+         "loop":false}
         """
-        action = payload.get("action", "")
+        action = str(payload.get("action", "")).lower()
 
-        if action == "list":
-            self._publish_script_list()
-            return
-
-        if action == "save":
-            script_data = payload.get("script") or {}
-            result = self._nav.script_save(script_data)
-            print(f"[Script] Save → {result}")
+        if action == "set":
+            wps = payload.get("waypoints") or []
+            loop = bool(payload.get("loop", False))
+            result = self._nav.auto_gps_waypoint_set_route(wps, loop=loop)
+            print(f"[GPS_ROUTE] Set {len(wps)} waypoint(s) → {result}")
             if result.get("ok"):
-                self.publish_log(f"Script saved: {result['name']}")
-                self._publish_script_list()
+                self.publish_log(f"GPS route loaded: {result['count']} waypoints (loop={result['loop']})")
             else:
-                self.publish_log(f"Script save failed: {result.get('error','?')}")
-            self._pub(self.T.SCRIPT_STATUS, result)
-            return
-
-        if action == "delete":
-            name = payload.get("name", "")
-            ok = self._nav.script_delete(name)
-            print(f"[Script] Delete {name} → {ok}")
-            self._publish_script_list()
-            self._pub(self.T.SCRIPT_STATUS, {"ok": ok, "action": "delete", "name": name})
-            return
-
-        if action == "load":
-            name = payload.get("name", "")
-            result = self._nav.script_load(name)
-            print(f"[Script] Load {name} → {result}")
-            self._pub(self.T.SCRIPT_STATUS, result)
+                self.publish_log(f"GPS route set failed: {result.get('error','?')}")
+            self._pub(self.T.GPS_STATUS, {**result, "action": "set"})
             return
 
         if action == "start":
-            name = payload.get("name")  # optional — use already-loaded otherwise
-            # Ensure stop before starting
+            wps = payload.get("waypoints")  # optional
+            loop = bool(payload.get("loop", False))
             self.motor_controller.send_command("S")
             self._last_nav_cmd = "S"
-            result = self._nav.script_start(name)
-            print(f"[Script] Start → {result}")
-            self.publish_log(f"Script start: {result}")
-            self._pub(self.T.SCRIPT_STATUS, result)
+            result = self._nav.auto_gps_waypoint_start(waypoints=wps, loop=loop)
+            print(f"[GPS_ROUTE] Start → {result}")
+            self.publish_log(f"GPS waypoint nav: {result}")
+            self._pub(self.T.GPS_STATUS, {**result, "action": "start"})
             return
 
         if action == "stop":
-            self._nav.script_stop()
+            result = self._nav.auto_gps_waypoint_stop()
             self.motor_controller.send_command("S")
             self._last_nav_cmd = "S"
-            print("[Script] Stop")
-            self.publish_log("Script stopped")
-            self._pub(self.T.SCRIPT_STATUS, {"ok": True, "action": "stop"})
+            print("[GPS_ROUTE] Stop")
+            self.publish_log("GPS waypoint nav stopped")
+            self._pub(self.T.GPS_STATUS, {**result, "action": "stop"})
             return
 
-        if action == "record_start":
-            name = payload.get("name", "")
-            result = self._nav.record_start(name)
-            result["action"] = "record_start"
-            print(f"[Recorder] Start {name} → {result}")
-            if result.get("ok"):
-                self.publish_log(f"Recording started: {name}")
-            self._pub(self.T.SCRIPT_STATUS, result)
-            return
+        self._pub(self.T.GPS_STATUS, {"ok": False, "error": f"unknown action {action}"})
 
-        if action == "record_stop":
-            imu_yaw = self.motor_controller.imu_data.yaw
-            result = self._nav.record_stop(imu_yaw)
-            result["action"] = "record_stop"
-            print(f"[Recorder] Stop → {result}")
-            if result.get("ok"):
-                self.publish_log(f"Recording saved: {result['name']} ({result['steps']} steps)")
-                self._publish_script_list()
-            else:
-                self.publish_log(f"Recording failed: {result.get('error','?')}")
-            self._pub(self.T.SCRIPT_STATUS, result)
-            return
+    # ── Buzzer / Light pattern (firmware-side state machines) ──────
 
-        if action == "record_cancel":
-            result = self._nav.record_cancel()
-            result["action"] = "record_cancel"
-            print("[Recorder] Cancel")
-            self.publish_log("Recording cancelled")
-            self._pub(self.T.SCRIPT_STATUS, result)
+    def handle_buzzer(self, payload: Dict[str, Any]):
+        """Forward buzzer command to firmware. {"pattern":"OFF|ON|BEEP|ALARM|SOS"}."""
+        pattern = str(payload.get("pattern", "")).upper().strip()
+        if pattern not in ("OFF", "ON", "BEEP", "ALARM", "SOS"):
+            self.publish_log(f"Buzzer: invalid pattern '{pattern}'")
             return
+        self.motor_controller.send_command(f"BUZZ:{pattern}")
 
-        if action == "record_status":
-            status = self._nav.record_status()
-            status["action"] = "record_status"
-            self._pub(self.T.SCRIPT_STATUS, status)
+    def handle_light_pattern(self, payload: Dict[str, Any]):
+        """Forward warning-light pattern to firmware."""
+        pattern = str(payload.get("pattern", "")).upper().strip()
+        valid = ("OFF", "WARN_BLINK", "WARN_STROBE", "BOTH_BLINK", "SOS")
+        if pattern not in valid:
+            self.publish_log(f"LightPattern: invalid '{pattern}'")
             return
-
-    def _publish_script_list(self):
-        scripts = self._nav.script_list()
-        self._pub(self.T.SCRIPT_LIST, {
-            "scripts":   scripts,
-            "timestamp": int(time.time() * 1000),
-        })
+        self.motor_controller.send_command(f"LP:{pattern}")
 
     # ── Odometry handlers ──────────────────────────────────────────
 
@@ -1517,7 +1496,7 @@ class KPatrolMQTTV5:
         """Camera capture + line-follower tick at ~20 Hz.
 
         Only active when KPATROL_CAMERA env var ≥ 0 and cv2 is installed.
-        Sends MEC: commands only while NavController is in LINE_FOLLOW mode.
+        Sends MEC: commands only while NavController is in AUTO_LINE_FOLLOW mode.
         Safety veto applies: if front distance is DANGER the robot stops.
         Publishes JPEG overlay to kpatrol/{serial}/camera for dashboard view.
         """
@@ -1542,8 +1521,8 @@ class KPatrolMQTTV5:
         while self.running:
             t0 = time.time()
 
-            # Only process when in LINE_FOLLOW mode
-            if self._nav.get_mode() != "LINE_FOLLOW":
+            # Only process when in AUTO_LINE_FOLLOW mode
+            if self._nav.get_mode() != "AUTO_LINE_FOLLOW":
                 self._lf_last_twist = None
                 time.sleep(interval)
                 continue
@@ -1588,11 +1567,11 @@ class KPatrolMQTTV5:
     def _nav_loop(self):
         """Navigation tick loop — runs at 20 Hz (50 ms).
 
-        Drives SCRIPT_PATROL and FREE_COVERAGE modes by polling
-        NavController.tick() with fresh ToF + IMU readings.
+        Drives AUTO_FREE_COVERAGE and AUTO_GPS_WAYPOINT modes by polling
+        NavController.tick() with fresh ToF + IMU + GPS readings.
         MANUAL is a no-op (operator drives via /motor).
         EMERGENCY forces a STOP.
-        LINE_FOLLOW is handled by _line_follow_loop() instead.
+        AUTO_LINE_FOLLOW is handled by _line_follow_loop() instead.
 
         Transport: when NavController emits a twist (vx, vy, wz, spd) we
         send a `MEC:` command for per-wheel Mecanum control. Otherwise we
@@ -1633,8 +1612,14 @@ class KPatrolMQTTV5:
             except Exception:
                 nav_pose = None
 
+            # GPS sample for AUTO_GPS_WAYPOINT mode (None when disabled).
+            gps_sample = self.gps_reader.get_data() if self.gps_reader else None
+
             cmd, speed_pwm, twist, status = self._nav.tick(
-                tof_dict, imu_yaw, encoder_counts=enc_counts, pose=nav_pose
+                tof_dict, imu_yaw,
+                encoder_counts=enc_counts,
+                pose=nav_pose,
+                gps_data=gps_sample,
             )
             current_mode = self._nav.get_mode()
 

@@ -3,53 +3,63 @@ K-Patrol Navigation Package
 ============================
 Autonomous navigation for the K-Patrol Mecanum robot.
 
-Modules:
-    script_patrol   — declarative script executor (IMU-closed-loop rotation +
-                      timed translation + ToF emergency reflex)
-    nav_controller  — controller wrapping ScriptExecutor + LineFollower with
-                      MANUAL / SCRIPT_PATROL / LINE_FOLLOW / EMERGENCY modes
-    line_follower   — camera floor-line PD follower with BEV overlay
-    script_recorder — record manual drives as patrol scripts
+Modes (NavController FSM, 5 total):
+    MANUAL              — operator pass-through
+    AUTO_FREE_COVERAGE  — indoor random-walk + frontier exploration
+    AUTO_LINE_FOLLOW    — camera floor-line PD follower
+    AUTO_GPS_WAYPOINT   — outdoor GPS route (Haversine + IMU + ToF safety)
+    EMERGENCY           — motors stopped, waiting for operator clear
 
 Quick Start:
     from navigation import NavController
 
-    nav = NavController(script_dir="data/scripts")
-    nav.script_start("rectangle")           # scripted patrol
-    nav.line_follow_start()                 # camera line following
+    nav = NavController()
+    nav.auto_free_coverage_start()
+    nav.auto_line_follow_start()
+    nav.auto_gps_waypoint_start([{"lat": 21.028, "lon": 105.804, "radius_m": 3}])
 
     # In main loop (~20 Hz):
-    cmd, speed_pwm, twist, status = nav.tick(tof_dict, imu_yaw_deg)
+    cmd, speed_pwm, twist, status = nav.tick(
+        tof_dict, imu_yaw_deg,
+        pose=pose,
+        gps_data=gps_reader.get_data(),
+    )
 """
 
-from .nav_controller import NavController, Mode, LineFollowerConfig
-from .line_follower import LineFollower, LineResult, HSVRange
+from .nav_controller import NavController, Mode
+from .line_follower import LineFollower, LineFollowerConfig, LineResult, HSVRange
 from .free_coverage import FreeCoverage, CoverageConfig
+from .gps_navigator import (
+    GPSNavigator,
+    GPSNavigatorConfig,
+    GPSNavResult,
+    GPSState,
+    Waypoint,
+    haversine_m,
+    initial_bearing_deg,
+    shortest_angle_deg,
+)
 from .occupancy_grid import OccupancyGrid, GridConfig, CELL_VISITED, CELL_OBSTACLE
 from .odometry import Odometry, Pose
 from .velocity_pid import VelocityController, VelocityPIDConfig
-from .script_patrol import (
-    ExecutorState,
-    PatrolScript,
-    ScriptConfig,
-    ScriptExecutor,
-    ScriptLibrary,
-    ScriptStep,
-    example_rectangle,
-    validate_script,
-    validate_step,
-)
-from .script_recorder import ScriptRecorder
 
 __all__ = [
     "NavController",
     "Mode",
-    "LineFollowerConfig",
     "LineFollower",
+    "LineFollowerConfig",
     "LineResult",
     "HSVRange",
     "FreeCoverage",
     "CoverageConfig",
+    "GPSNavigator",
+    "GPSNavigatorConfig",
+    "GPSNavResult",
+    "GPSState",
+    "Waypoint",
+    "haversine_m",
+    "initial_bearing_deg",
+    "shortest_angle_deg",
     "OccupancyGrid",
     "GridConfig",
     "CELL_VISITED",
@@ -58,14 +68,4 @@ __all__ = [
     "Pose",
     "VelocityController",
     "VelocityPIDConfig",
-    "ScriptExecutor",
-    "ScriptLibrary",
-    "ScriptConfig",
-    "ScriptStep",
-    "PatrolScript",
-    "ExecutorState",
-    "ScriptRecorder",
-    "example_rectangle",
-    "validate_script",
-    "validate_step",
 ]
