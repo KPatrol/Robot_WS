@@ -109,6 +109,16 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 
+// ----------------------------------------------------------------------------
+// Forward declarations (Arduino IDE auto-prototyping fix — must come before
+// any function that takes these enum types as parameters)
+// ----------------------------------------------------------------------------
+enum BuzzerPattern : uint8_t;
+enum LightPattern  : uint8_t;
+void buzzer_start_pattern(BuzzerPattern p);
+void light_pattern_set(LightPattern p);
+void IRAM_ATTR estopISR();
+
 // ============================================================================
 // FRONT-RIGHT MOTOR (FR) - BTS7960 #1
 // ============================================================================
@@ -213,6 +223,21 @@
 #define GPS_TASK_CORE    0         // motor PID lives on Core 1 — keep apart
 
 // ============================================================================
+// SAFETY HARDWARE (V10.1) — Buzzer, Physical E-Stop, Remote-Control Relay
+// Pinout chosen from free ESP32-S3-WROOM-1 GPIOs after motors/IMU/GPS/relays.
+//   BUZZER_PIN       — drives an active 5V piezo buzzer (HIGH=tone)
+//   ESTOP_PIN        — physical NC button to GND with INPUT_PULLUP + FALLING ISR
+//   REMOTE_RELAY_PIN — placeholder for a remote-toggle relay that physically
+//                      cuts motor power; controlled by command REMOTE:1 / REMOTE:0
+// ============================================================================
+#define BUZZER_PIN                  40   // free GPIO, no PWM needed for active buzzer
+#define ESTOP_PIN                    1   // free GPIO, supports interrupts
+#define REMOTE_RELAY_PIN             2   // free GPIO, drives relay coil/input
+#define BUZZER_ACTIVE_HIGH        true   // set false if your buzzer is active-low
+#define REMOTE_RELAY_ACTIVE_HIGH  true   // mirrors RELAY_ACTIVE_HIGH convention
+#define ESTOP_DEBOUNCE_MS           30   // ignore re-triggers within this window
+
+// ============================================================================
 // MOTOR DIRECTION INVERSION
 // Set to true to invert motor direction if wired backward
 // ============================================================================
@@ -241,6 +266,31 @@ bool otaEnabled         = false;
 char otaSsid[33]        = {0};
 char otaPass[65]        = {0};
 char otaHost[32]        = "kpatrol-esp32";
+
+// ============================================================================
+// SAFETY HARDWARE GLOBAL STATE (V10.1)
+// E-stop is set by physical-button ISR; cleared by ESTOP_CLEAR command.
+// While estopTriggered OR remoteRelayCutoff is true, motion commands are
+// rejected at the parser top so a runaway Pi cannot bypass the safety lock.
+// ============================================================================
+volatile bool estopTriggered = false;
+volatile uint32_t estopLastIsrMs = 0;
+bool buzzerState = false;
+bool remoteRelayCutoff = false;
+
+enum BuzzerPattern : uint8_t { BUZZ_OFF, BUZZ_BEEP, BUZZ_ALARM, BUZZ_SOS };
+BuzzerPattern buzzerPattern = BUZZ_OFF;
+uint32_t buzzerPatternStartMs = 0;
+
+enum LightPattern : uint8_t {
+  LIGHTP_OFF,           // no pattern; manual control
+  LIGHTP_WARN_BLINK,    // warning light slow blink (1Hz)
+  LIGHTP_WARN_STROBE,   // warning light fast strobe (5Hz)
+  LIGHTP_BOTH_BLINK,    // warning + main alternating (1Hz)
+  LIGHTP_SOS            // SOS Morse on warning light (3s cycle)
+};
+LightPattern lightPattern = LIGHTP_OFF;
+uint32_t lightPatternStartMs = 0;
 
 // ============================================================================
 // BNO08x IMU GLOBAL VARIABLES
@@ -382,6 +432,16 @@ void setup() {
   main_light_off();     // Start with main light OFF
   Serial.println("✓ Warning Light relay configured (GPIO 38)");
   Serial.println("✓ Main Light relay configured (GPIO 39)");
+
+  // ===== SAFETY HARDWARE SETUP (V10.1) =====
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzer_set(false);
+  pinMode(REMOTE_RELAY_PIN, OUTPUT);
+  remote_relay_cutoff_set(false);
+  pinMode(ESTOP_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), estopISR, FALLING);
+  Serial.printf("✓ Buzzer GPIO%d, Remote-relay GPIO%d, E-Stop GPIO%d (FALLING ISR)\n",
+                BUZZER_PIN, REMOTE_RELAY_PIN, ESTOP_PIN);
   
   // ===== BNO08x IMU SETUP (UART Mode) =====
   Serial.println("\nInitializing BNO08x IMU...");
@@ -701,6 +761,153 @@ void light_off() { warning_light_off(); }
 void light_toggle() { warning_light_toggle(); }
 
 // ============================================================================
+// BUZZER CONTROL (V10.1) — active 5V piezo on BUZZER_PIN
+// Patterns are non-blocking; tickBuzzerPattern() is called every loop().
+// ============================================================================
+void buzzer_set(bool on) {
+  buzzerState = on;
+  bool level = BUZZER_ACTIVE_HIGH ? on : !on;
+  digitalWrite(BUZZER_PIN, level ? HIGH : LOW);
+}
+void buzzer_on()  { buzzer_set(true);  buzzerPattern = BUZZ_OFF; }
+void buzzer_off() { buzzer_set(false); buzzerPattern = BUZZ_OFF; }
+void buzzer_start_pattern(BuzzerPattern p) {
+  buzzerPattern = p;
+  buzzerPatternStartMs = millis();
+}
+
+void tickBuzzerPattern() {
+  if (buzzerPattern == BUZZ_OFF) return;
+  uint32_t t = millis() - buzzerPatternStartMs;
+  switch (buzzerPattern) {
+    case BUZZ_BEEP: {                    // single 200 ms beep then auto-off
+      if (t < 200) buzzer_set(true);
+      else { buzzer_set(false); buzzerPattern = BUZZ_OFF; }
+      break;
+    }
+    case BUZZ_ALARM: {                   // 250 on / 250 off, continuous
+      buzzer_set(((t / 250) % 2) == 0);
+      break;
+    }
+    case BUZZ_SOS: {                     // ... --- ... over 3 s, repeating
+      uint32_t pos = t % 3000;
+      bool on = false;
+      if      (pos <  200) on = true;
+      else if (pos <  300) on = false;
+      else if (pos <  500) on = true;
+      else if (pos <  600) on = false;
+      else if (pos <  800) on = true;
+      else if (pos < 1000) on = false;
+      else if (pos < 1400) on = true;
+      else if (pos < 1500) on = false;
+      else if (pos < 1900) on = true;
+      else if (pos < 2000) on = false;
+      else if (pos < 2400) on = true;
+      else if (pos < 2500) on = false;
+      else                 on = false;
+      buzzer_set(on);
+      break;
+    }
+    default: break;
+  }
+}
+
+// ============================================================================
+// LIGHT PATTERN STATE MACHINE (V10.1) — non-blocking, drives existing relays
+// Called every loop(); writes only on transitions to avoid relay chatter.
+// ============================================================================
+void light_pattern_set(LightPattern p) {
+  lightPattern = p;
+  lightPatternStartMs = millis();
+}
+
+void tickLightPattern() {
+  if (lightPattern == LIGHTP_OFF) return;
+  uint32_t t = millis() - lightPatternStartMs;
+  switch (lightPattern) {
+    case LIGHTP_WARN_BLINK: {            // 1 Hz blink on warning light
+      bool on = ((t / 500) % 2) == 0;
+      if (on != warningLightState) on ? warning_light_on() : warning_light_off();
+      break;
+    }
+    case LIGHTP_WARN_STROBE: {           // 5 Hz strobe on warning light
+      bool on = ((t / 100) % 2) == 0;
+      if (on != warningLightState) on ? warning_light_on() : warning_light_off();
+      break;
+    }
+    case LIGHTP_BOTH_BLINK: {            // alternating warning vs main, 1 Hz
+      bool warnOn = ((t / 500) % 2) == 0;
+      if (warnOn  != warningLightState)  warnOn ? warning_light_on()  : warning_light_off();
+      if (!warnOn != mainLightState)     warnOn ? main_light_off()    : main_light_on();
+      break;
+    }
+    case LIGHTP_SOS: {                   // SOS Morse on warning light
+      uint32_t pos = t % 3000;
+      bool on = false;
+      if      (pos <  200) on = true;
+      else if (pos <  300) on = false;
+      else if (pos <  500) on = true;
+      else if (pos <  600) on = false;
+      else if (pos <  800) on = true;
+      else if (pos < 1000) on = false;
+      else if (pos < 1400) on = true;
+      else if (pos < 1500) on = false;
+      else if (pos < 1900) on = true;
+      else if (pos < 2000) on = false;
+      else if (pos < 2400) on = true;
+      else if (pos < 2500) on = false;
+      else                 on = false;
+      if (on != warningLightState) on ? warning_light_on() : warning_light_off();
+      break;
+    }
+    default: break;
+  }
+}
+
+// ============================================================================
+// PHYSICAL E-STOP BUTTON (V10.1) — INPUT_PULLUP + FALLING ISR
+// ISR is short: debounces and sets a flag. Real handling runs from main loop
+// to avoid taking serial/relay locks inside an interrupt context.
+// ============================================================================
+void IRAM_ATTR estopISR() {
+  uint32_t now = millis();
+  if (now - estopLastIsrMs < ESTOP_DEBOUNCE_MS) return;
+  estopLastIsrMs = now;
+  estopTriggered = true;
+}
+
+void handleEstopIfTriggered() {
+  static bool announced = false;
+  if (!estopTriggered) { announced = false; return; }
+  // Hold motors stopped; idempotent — safe to call every loop().
+  FR_stop(); FL_stop(); BR_stop(); BL_stop();
+  if (!announced) {
+    warning_light_on();
+    buzzer_start_pattern(BUZZ_ALARM);
+    Serial.println("ESTOP:TRIGGERED source=physical_button");
+    announced = true;
+  }
+}
+
+// ============================================================================
+// REMOTE-CONTROL RELAY (V10.1) — placeholder for wireless 12V cutoff relay
+// User will install a remote-toggle relay (e.g. 433 MHz / WiFi) that hard-cuts
+// motor power. While cutoff is true, motion commands are refused at parser top.
+// ============================================================================
+void remote_relay_cutoff_set(bool cutoff) {
+  remoteRelayCutoff = cutoff;
+  bool level = REMOTE_RELAY_ACTIVE_HIGH ? cutoff : !cutoff;
+  digitalWrite(REMOTE_RELAY_PIN, level ? HIGH : LOW);
+  if (cutoff) {
+    FR_stop(); FL_stop(); BR_stop(); BL_stop();
+    warning_light_on();
+    Serial.println("REMOTE_RELAY:CUTOFF — motors disabled");
+  } else {
+    Serial.println("REMOTE_RELAY:RELEASED — motors re-enabled");
+  }
+}
+
+// ============================================================================
 // BNO08x IMU FUNCTIONS
 // ============================================================================
 
@@ -845,6 +1052,18 @@ void printHelp() {
   Serial.println("    WIFI_ON:ssid,pw  : join WiFi + start ArduinoOTA");
   Serial.println("    OTA_OFF          : stop OTA and disable WiFi");
   Serial.println("    BENCH            : measure per-command motor-dispatch time");
+  Serial.println("");
+  Serial.println("  Light Patterns (V10.1, non-blocking):");
+  Serial.println("    LP:OFF | LP:WARN_BLINK | LP:WARN_STROBE | LP:BOTH_BLINK | LP:SOS");
+  Serial.println("");
+  Serial.println("  Buzzer (V10.1):");
+  Serial.println("    BUZZ:ON | BUZZ:OFF | BUZZ:BEEP | BUZZ:ALARM | BUZZ:SOS");
+  Serial.println("");
+  Serial.println("  Emergency Stop (V10.1):");
+  Serial.println("    ESTOP         : software-trigger e-stop (mirrors physical button)");
+  Serial.println("    ESTOP_CLEAR   : release e-stop after operator confirms safe");
+  Serial.println("    ESTOP?        : report state (triggered, remote_cutoff, buzzer)");
+  Serial.println("    REMOTE:1 / 0  : remote-relay cutoff (wireless motor power kill)");
   Serial.println("----------------------------------------");
   Serial.print("Current Speed: ");
   Serial.println(currentSpeed);
@@ -1042,17 +1261,40 @@ void runTestSequence() {
 void loop() {
   // Update IMU data continuously
   updateIMU();
-  
+
+  // Safety ticks (V10.1) — non-blocking, run every loop iteration.
+  handleEstopIfTriggered();
+  tickBuzzerPattern();
+  tickLightPattern();
+
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
     command.trim();
     command.toUpperCase();
-    
+
     Serial.print("\n> Command: ");
     Serial.println(command);
-    
+
+    // Safety gate: while e-stop or remote cutoff is active, refuse all motion
+    // commands so a runaway Pi cannot bypass the lock. Telemetry commands
+    // (IMU, status, etc.) are still allowed.
+    bool isMotion = (command == "F" || command == "B" || command == "SR" || command == "SL" ||
+                     command == "R" || command == "L" || command == "DR" || command == "DL" ||
+                     command == "BRAKE" ||
+                     command == "FR_F" || command == "FR_B" ||
+                     command == "FL_F" || command == "FL_B" ||
+                     command == "BR_F" || command == "BR_B" ||
+                     command == "BL_F" || command == "BL_B" ||
+                     command.startsWith("MEC:") || command.startsWith("MOT:"));
+    bool blocked = isMotion && (estopTriggered || remoteRelayCutoff);
+    if (blocked) {
+      Serial.print("✗ Motion BLOCKED — ");
+      if (estopTriggered)     Serial.print("e-stop triggered (issue ESTOP_CLEAR). ");
+      if (remoteRelayCutoff)  Serial.print("remote relay cutoff (issue REMOTE:0). ");
+      Serial.println();
+    }
     // Individual motor commands - FR
-    if (command == "FR_F") {
+    else if (command == "FR_F") {
       FR_forward(currentSpeed);
       Serial.println("FR Forward");
     }
@@ -1337,6 +1579,60 @@ void loop() {
       Serial.print("BENCH:N="); Serial.print(N);
       Serial.print(",total_us="); Serial.print(t1 - t0);
       Serial.print(",avg_us="); Serial.println(avg);
+    }
+
+    // ── Light patterns (V10.1) — non-blocking, drive the existing relays ─
+    else if (command == "LP:OFF" || command == "LP:NONE") {
+      lightPattern = LIGHTP_OFF;
+      Serial.println("LIGHT_PATTERN:OFF");
+    }
+    else if (command == "LP:WARN_BLINK") {
+      light_pattern_set(LIGHTP_WARN_BLINK);
+      Serial.println("LIGHT_PATTERN:WARN_BLINK");
+    }
+    else if (command == "LP:WARN_STROBE") {
+      light_pattern_set(LIGHTP_WARN_STROBE);
+      Serial.println("LIGHT_PATTERN:WARN_STROBE");
+    }
+    else if (command == "LP:BOTH_BLINK") {
+      light_pattern_set(LIGHTP_BOTH_BLINK);
+      Serial.println("LIGHT_PATTERN:BOTH_BLINK");
+    }
+    else if (command == "LP:SOS") {
+      light_pattern_set(LIGHTP_SOS);
+      Serial.println("LIGHT_PATTERN:SOS");
+    }
+
+    // ── Buzzer (V10.1) — placeholder; physical buzzer to be installed later ─
+    else if (command == "BUZZ:ON")    { buzzer_on();  Serial.println("BUZZ:ON"); }
+    else if (command == "BUZZ:OFF")   { buzzer_off(); Serial.println("BUZZ:OFF"); }
+    else if (command == "BUZZ:BEEP")  { buzzer_start_pattern(BUZZ_BEEP);  Serial.println("BUZZ:BEEP"); }
+    else if (command == "BUZZ:ALARM") { buzzer_start_pattern(BUZZ_ALARM); Serial.println("BUZZ:ALARM"); }
+    else if (command == "BUZZ:SOS")   { buzzer_start_pattern(BUZZ_SOS);   Serial.println("BUZZ:SOS"); }
+
+    // ── E-Stop (V10.1) — software-trigger mirrors the physical button ─
+    else if (command == "ESTOP" || command == "ESTOP_TRIGGER") {
+      estopTriggered = true;
+      handleEstopIfTriggered();
+      Serial.println("ESTOP:TRIGGERED source=software");
+    }
+    else if (command == "ESTOP_CLEAR") {
+      estopTriggered = false;
+      buzzer_off();
+      Serial.println("ESTOP:CLEARED");
+    }
+    else if (command == "ESTOP?" || command == "ESTOP_STATUS") {
+      Serial.print("ESTOP:"); Serial.print(estopTriggered ? "TRIGGERED" : "CLEAR");
+      Serial.print(",remote_cutoff="); Serial.print(remoteRelayCutoff ? 1 : 0);
+      Serial.print(",buzzer="); Serial.println(buzzerState ? 1 : 0);
+    }
+
+    // ── Remote-control relay (V10.1) — placeholder for wireless cutoff ─
+    else if (command == "REMOTE:1" || command == "REMOTE_CUTOFF") {
+      remote_relay_cutoff_set(true);
+    }
+    else if (command == "REMOTE:0" || command == "REMOTE_RELEASE") {
+      remote_relay_cutoff_set(false);
     }
 
     // Unknown command
