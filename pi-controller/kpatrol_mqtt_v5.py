@@ -33,6 +33,7 @@ Hardware (V5.3):
 """
 
 import json
+import logging
 import time
 import sys
 import os
@@ -41,6 +42,8 @@ import threading
 from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass, asdict, field
 from enum import Enum
+
+logger = logging.getLogger("kpatrol.mqtt")
 
 try:
     import paho.mqtt.client as mqtt
@@ -75,7 +78,7 @@ try:
     from gps_reader import GPSReader, GPSData
     _GPS_AVAILABLE = True
 except ImportError as _gps_err:
-    print(f"[GPS] Module unavailable: {_gps_err} — outdoor mode disabled")
+    logger.warning(f"[GPS] Module unavailable: {_gps_err} — outdoor mode disabled")
     GPSReader = None  # type: ignore
     GPSData = None    # type: ignore
     _GPS_AVAILABLE = False
@@ -90,28 +93,58 @@ try:
     from detection.alert_db import AlertStore
     _DETECTION_AVAILABLE = True
 except ImportError as _det_err:
-    print(f"[DETECT] Module unavailable: {_det_err} — anomaly detection disabled")
+    logger.warning(f"[DETECT] Module unavailable: {_det_err} — anomaly detection disabled")
     AnomalyDetector = None    # type: ignore
     DetectionConfig = None    # type: ignore
     DetectionEvent = None     # type: ignore
     AlertStore = None         # type: ignore
     _DETECTION_AVAILABLE = False
 
+# V5.4: Safety actuators / watchers — light + buzzer reaction, tip-over guard,
+# battery low/critical hysteresis. Pure-Python, no extra deps; if the package
+# is somehow missing we fall back to no-op stubs so the bridge keeps running.
+try:
+    from safety import (
+        AlertActuator, ActuatorConfig,
+        TipOverWatcher, TipOverConfig,
+        BatteryWatcher, BatteryConfig,
+    )
+    _SAFETY_AVAILABLE = True
+except ImportError as _saf_err:
+    logger.warning(f"[SAFETY] Module unavailable: {_saf_err} — actuator/watchers disabled")
+    AlertActuator = None      # type: ignore
+    ActuatorConfig = None     # type: ignore
+    TipOverWatcher = None     # type: ignore
+    TipOverConfig = None      # type: ignore
+    BatteryWatcher = None     # type: ignore
+    BatteryConfig = None      # type: ignore
+    _SAFETY_AVAILABLE = False
+
 
 # ==================== CONFIGURATION ====================
 
 @dataclass
 class MQTTConfig:
-    host: str = "103.81.84.43"
-    port: int = 1883
-    username: str = "alphaasimov2024"
-    password: str = "gvB3DtGfus6U"
+    host: str = os.environ.get("MQTT_HOST", "")
+    port: int = int(os.environ.get("MQTT_PORT", "1883"))
+    username: str = os.environ.get("MQTT_USERNAME", "")
+    password: str = os.environ.get("MQTT_PASSWORD", "")
     client_id: str = f"kpatrol_pi_{os.uname().nodename}"
     keepalive: int = 60
     qos: int = 1
-    # Robot serial number — used as MQTT topic namespace
-    # Override via env var ROBOT_SERIAL or config.env KPATROL_ROBOT_SERIAL
     robot_serial: str = os.environ.get("ROBOT_SERIAL", "KPATROL-001")
+
+    def validate(self) -> None:
+        missing = [k for k, v in {
+            "MQTT_HOST": self.host,
+            "MQTT_USERNAME": self.username,
+            "MQTT_PASSWORD": self.password,
+        }.items() if not v]
+        if missing:
+            raise RuntimeError(
+                f"MQTT configuration missing: {', '.join(missing)}. "
+                f"Source mqtt.env or export the variables before running."
+            )
 
 
 @dataclass
@@ -424,7 +457,7 @@ class SafetyController:
 
     def set_enabled(self, enabled: bool):
         self.config.enabled = enabled
-        print(f"[Safety] {'Enabled' if enabled else 'Disabled'}")
+        logger.info(f"[Safety] {'Enabled' if enabled else 'Disabled'}")
 
 
 # ==================== SERIAL MANAGERS (from V3) ====================
@@ -451,6 +484,11 @@ class MotorController:
         # V5.2: optional sink for NMEA frames forwarded by ESP32 firmware
         # (lines prefixed with "NMEA:" arrive on the motor UART0).
         self._gps_sink = None
+        # V5.4: latest battery percentage reported by firmware (BAT:<pct>).
+        # None means firmware hasn't sent a reading yet — telemetry uses a
+        # placeholder until the first valid sample arrives.
+        self.battery_pct: Optional[float] = None
+        self.battery_ts: int = 0
 
     def set_gps_sink(self, sink) -> None:
         """Register a callback (e.g. GPSReader.feed_nmea) to receive NMEA
@@ -463,11 +501,11 @@ class MotorController:
                 self.serial.close()
             self.serial = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=1.0)
             self.connected = True
-            print(f"[Motor] Connected to {self.port}")
+            logger.info(f"[Motor] Connected to {self.port}")
             time.sleep(2)
             return True
         except serial.SerialException as e:
-            print(f"[Motor] Connection failed: {e}")
+            logger.error(f"[Motor] Connection failed: {e}")
             self.connected = False
             return False
 
@@ -475,7 +513,7 @@ class MotorController:
         if time.time() - self._last_reconnect_attempt < self._reconnect_interval:
             return False
         self._last_reconnect_attempt = time.time()
-        print(f"[Motor] Attempting reconnection to {self.port}...")
+        logger.info(f"[Motor] Attempting reconnection to {self.port}...")
         return self.connect()
 
     def disconnect(self):
@@ -496,7 +534,7 @@ class MotorController:
                 self._update_motor_states(command)
                 return True
             except (OSError, serial.SerialException) as e:
-                print(f"[Motor] Send error: {e}")
+                logger.error(f"[Motor] Send error: {e}")
                 self.connected = False
                 return False
 
@@ -540,12 +578,13 @@ class MotorController:
                         try:
                             self._gps_sink(line[5:])
                         except Exception as e:
-                            print(f"[Motor] GPS sink error: {e}")
+                            logger.error(f"[Motor] GPS sink error: {e}")
                         return None
                     self._parse_imu_line(line)
+                    self._parse_battery_line(line)
                     return line
             except (OSError, serial.SerialException) as e:
-                print(f"[Motor] Read error: {e}")
+                logger.error(f"[Motor] Read error: {e}")
                 self.connected = False
         return None
 
@@ -567,6 +606,23 @@ class MotorController:
 
     def request_imu(self):
         self.send_command("IMU")
+
+    def _parse_battery_line(self, line: str) -> None:
+        """Parse `BAT:<pct>` (or `BAT:<pct>,<voltage>`) telemetry from firmware."""
+        if not line.startswith("BAT:"):
+            return
+        try:
+            payload = line[4:].split(",", 1)[0]
+            pct = float(payload)
+        except (ValueError, IndexError):
+            return
+        if pct < 0.0 or pct > 100.0:
+            return
+        self.battery_pct = pct
+        self.battery_ts = int(time.time() * 1000)
+
+    def get_battery_pct(self) -> Optional[float]:
+        return self.battery_pct
 
 
 class EncoderReader:
@@ -596,7 +652,7 @@ class EncoderReader:
                 self.serial.close()
             self.serial = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=1.0)
             self.connected = True
-            print(f"[Encoder] Connected to {self.port}")
+            logger.info(f"[Encoder] Connected to {self.port}")
             time.sleep(2)
             if not self.running:
                 self.running = True
@@ -604,7 +660,7 @@ class EncoderReader:
                 self.read_thread.start()
             return True
         except serial.SerialException as e:
-            print(f"[Encoder] Connection failed: {e}")
+            logger.error(f"[Encoder] Connection failed: {e}")
             self.connected = False
             return False
 
@@ -649,7 +705,7 @@ class EncoderReader:
                         self._parse_line(line)
             except (OSError, serial.SerialException) as e:
                 if self.running:
-                    print(f"[Encoder] Read error: {e}")
+                    logger.error(f"[Encoder] Read error: {e}")
                     self.connected = False
             time.sleep(0.05)
 
@@ -709,8 +765,8 @@ class KPatrolMQTTV5:
 
         # Per-robot scoped topics
         self.T = Topics(mqtt_config.robot_serial)
-        print(f"[MQTT] Robot serial: {mqtt_config.robot_serial}")
-        print(f"[MQTT] Topic namespace: kpatrol/{mqtt_config.robot_serial}/#")
+        logger.info(f"[MQTT] Robot serial: {mqtt_config.robot_serial}")
+        logger.info(f"[MQTT] Topic namespace: kpatrol/{mqtt_config.robot_serial}/#")
 
         # Hardware managers (from V3)
         self.motor_controller = MotorController(serial_config.motor_port)
@@ -733,9 +789,9 @@ class KPatrolMQTTV5:
             # hook the parser into MotorController.read_response().
             if self.gps_config.mode == "shared":
                 self.motor_controller.set_gps_sink(self.gps_reader.feed_nmea)
-                print(f"[GPS] Shared mode — NMEA piggybacks on motor UART")
+                logger.info(f"[GPS] Shared mode — NMEA piggybacks on motor UART")
             else:
-                print(f"[GPS] Dedicated mode — port {self.gps_config.port}")
+                logger.info(f"[GPS] Dedicated mode — port {self.gps_config.port}")
 
         # Connect ToF callback
         self.encoder_reader.set_tof_callback(self.safety_controller.update_tof)
@@ -752,13 +808,30 @@ class KPatrolMQTTV5:
                 os.makedirs(_map_dir, exist_ok=True)
                 _map_path = os.path.join(_map_dir, f"map_{mqtt_config.robot_serial}.npz")
                 _fc_cfg = CoverageConfig(save_path=_map_path)
-                print(f"[FC] map persistence enabled → {_map_path}")
+                logger.info(f"[FC] map persistence enabled → {_map_path}")
             except OSError as exc:
-                print(f"[FC] map persistence init failed: {exc} — running without persistence")
+                logger.error(f"[FC] map persistence init failed: {exc} — running without persistence")
                 _fc_cfg = None
         self._nav = NavController(script_dir="data/scripts", fc_config=_fc_cfg)
         self._last_nav_cmd = ""
         self._nav_lock = threading.Lock()
+
+        # V5.4: hook front-facing ToF into the line-follower's emergency
+        # cut-off. The provider is read once per camera frame (~20 Hz); the
+        # snapshot read is lock-free (single-int load) which is fine for our
+        # purposes — the directional gate inside SafetyController remains
+        # authoritative for command-level enforcement.
+        try:
+            self._nav.set_line_follow_front_distance_provider(
+                lambda: float(self.safety_controller.tof_data.front)
+                if self.safety_controller.tof_data.front else None
+            )
+        except AttributeError:
+            # Older NavController without the wiring helper — line_follower
+            # falls back to no ToF cut-off. SafetyController.is_command_safe
+            # still gates the firmware command bus.
+            logger.warning("[LF] NavController has no ToF provider hook — "
+                           "line-follower running without inline emergency stop")
 
         # LINE_FOLLOW camera: index via env var KPATROL_CAMERA (default 0)
         # Set KPATROL_CAMERA=-1 to disable camera / LINE_FOLLOW.
@@ -785,7 +858,7 @@ class KPatrolMQTTV5:
             try:
                 _det_cam_idx = int(os.environ.get("KPATROL_DETECTION_CAMERA", "1"))
                 if _det_cam_idx == self._camera_index and self._camera_enabled:
-                    print(f"[DETECT] WARNING: detector camera idx ({_det_cam_idx}) "
+                    logger.warning(f"[DETECT] WARNING: detector camera idx ({_det_cam_idx}) "
                           f"clashes with LINE_FOLLOW camera — disabling detection")
                     self._det_enabled = False
                 else:
@@ -798,9 +871,9 @@ class KPatrolMQTTV5:
                     )
                     self._alert_store = AlertStore("data/alerts.db")
                     self._detector = AnomalyDetector(det_cfg, on_event=self._on_detection_event)
-                    print(f"[DETECT] AnomalyDetector ready (camera idx {_det_cam_idx})")
+                    logger.info(f"[DETECT] AnomalyDetector ready (camera idx {_det_cam_idx})")
             except Exception as exc:
-                print(f"[DETECT] init failed: {exc} — detection disabled")
+                logger.error(f"[DETECT] init failed: {exc} — detection disabled")
                 self._det_enabled = False
                 self._detector = None
                 self._alert_store = None
@@ -823,7 +896,7 @@ class KPatrolMQTTV5:
         self._vpid_max_wz:  float = float(os.environ.get("KPATROL_VPID_MAX_WZ",  "3.0"))
         if self._vpid_enabled:
             self._vpid = VelocityController()
-            print(f"[VPID] enabled — max {self._vpid_max_mps:.2f} m/s, "
+            logger.info(f"[VPID] enabled — max {self._vpid_max_mps:.2f} m/s, "
                   f"{self._vpid_max_wz:.2f} rad/s")
         self._last_mot: Optional[Tuple[int, int, int, int]] = None
 
@@ -838,6 +911,22 @@ class KPatrolMQTTV5:
         self._msg_in_bytes   = 0
         self._per_topic_bytes: Dict[str, int] = {}
         self._metrics_started_at = time.time()
+
+        # V5.4: Safety actuator + watchers. The actuator turns logical alerts
+        # (person/fire/tipover/battery) into LP:/BUZZ: commands sent to firmware;
+        # the watchers convert raw IMU and battery samples into level changes.
+        # Wire all three to share the same send_command sink so a single UART
+        # outage takes them all down together rather than partial-failing.
+        self._alert_actuator: Optional["AlertActuator"]   = None
+        self._tipover_watcher: Optional["TipOverWatcher"] = None
+        self._battery_watcher: Optional["BatteryWatcher"] = None
+        if _SAFETY_AVAILABLE:
+            self._alert_actuator = AlertActuator(self.motor_controller.send_command)
+            self._tipover_watcher = TipOverWatcher(
+                on_tipover=self._on_tipover,
+                on_recover=self._on_tipover_recover,
+            )
+            self._battery_watcher = BatteryWatcher(on_event=self._on_battery_event)
 
     def setup_mqtt(self):
         try:
@@ -868,20 +957,20 @@ class KPatrolMQTTV5:
         motor_ok = self.motor_controller.connect()
         encoder_ok = self.encoder_reader.connect()
         if not motor_ok and not encoder_ok:
-            print("[MQTT] Warning: No serial devices connected!")
+            logger.warning("[MQTT] Warning: No serial devices connected!")
 
         # GPS is best-effort: a failed connect does not abort the bridge.
         # The reader thread will retry every 3s, so an antenna replug
         # mid-mission recovers automatically.
         if self.gps_reader is not None:
             if not self.gps_reader.connect():
-                print("[GPS] Initial connect failed — will retry in background")
+                logger.warning("[GPS] Initial connect failed — will retry in background")
 
         try:
             self.client.connect(self.mqtt_config.host, self.mqtt_config.port, self.mqtt_config.keepalive)
             return True
         except Exception as e:
-            print(f"[MQTT] Connection failed: {e}")
+            logger.error(f"[MQTT] Connection failed: {e}")
             return False
 
     # ── GPS callbacks ───────────────────────────────────────────────
@@ -892,7 +981,7 @@ class KPatrolMQTTV5:
             f"HDOP={data.hdop:.1f}, "
             f"({data.latitude:.6f}, {data.longitude:.6f})"
         )
-        print(f"[GPS] {msg}")
+        logger.info(f"[GPS] {msg}")
         # Defer publish_log until MQTT is connected — connect() is the path
         # that initialises everything, and the LWT may not be set yet.
         if self.client is not None and self.client.is_connected():
@@ -900,7 +989,7 @@ class KPatrolMQTTV5:
 
     def _on_gps_fix_lost(self) -> None:
         msg = "GPS fix lost — falling back to encoder/IMU dead-reckoning"
-        print(f"[GPS] {msg}")
+        logger.info(f"[GPS] {msg}")
         if self.client is not None and self.client.is_connected():
             self.publish_log(msg)
 
@@ -909,20 +998,20 @@ class KPatrolMQTTV5:
     def on_connect(self, client, userdata, flags, rc, properties=None):
         reason_code = rc.value if hasattr(rc, 'value') else rc
         if reason_code == 0:
-            print("[MQTT] Connected successfully!")
+            logger.info("[MQTT] Connected successfully!")
             T = self.T
             # Subscribe using wildcard: kpatrol/{serial}/#
             # This covers ALL command topics in a single subscription.
             client.subscribe(T.WILDCARD, 1)
-            print(f"[MQTT] Subscribed to {T.WILDCARD}")
+            logger.info(f"[MQTT] Subscribed to {T.WILDCARD}")
             self.send_heartbeat("online")
             self.publish_log(f"K-Patrol V5 connected | serial={T.serial}")
         else:
-            print(f"[MQTT] Connect failed with code: {reason_code}")
+            logger.info(f"[MQTT] Connect failed with code: {reason_code}")
 
     def on_disconnect(self, client, userdata, disconnect_flags=None, rc=None, properties=None):
         reason = rc.value if hasattr(rc, 'value') else (rc if rc is not None else 0)
-        print(f"[MQTT] Disconnected (rc={reason})")
+        logger.info(f"[MQTT] Disconnected (rc={reason})")
 
     def on_message(self, client, userdata, msg):
         try:
@@ -957,9 +1046,9 @@ class KPatrolMQTTV5:
             elif topic == T.ODOM_RESET:
                 self.handle_odom_reset(payload)
         except json.JSONDecodeError:
-            print(f"[MQTT] Invalid JSON: {msg.payload}")
+            logger.info(f"[MQTT] Invalid JSON: {msg.payload}")
         except Exception as e:
-            print(f"[MQTT] Error: {e}")
+            logger.error(f"[MQTT] Error: {e}")
 
     # ── Command Handlers (V3 base + directional safety) ────────────
 
@@ -979,7 +1068,7 @@ class KPatrolMQTTV5:
         if not self.safety_controller.is_command_safe(cmd_type):
             alternatives = self.safety_controller.get_safe_alternatives(cmd_type)
             alt_str = ", ".join(alternatives) if alternatives else "none"
-            print(f"[Safety] Blocking {cmd_type} (safe: {alt_str})")
+            logger.info(f"[Safety] Blocking {cmd_type} (safe: {alt_str})")
             self.publish_log(f"Safety blocked: {cmd_type} (try: {alt_str})")
             self.motor_controller.send_command("S")
             return
@@ -1019,7 +1108,7 @@ class KPatrolMQTTV5:
         self.motor_controller.set_speed(int(speed * multiplier))
 
     def handle_emergency(self, payload: Dict[str, Any]):
-        print("[EMERGENCY] Emergency stop!")
+        logger.info("[EMERGENCY] Emergency stop!")
         self.motor_controller.send_command("S")
         # Also switch nav to MANUAL
         self._nav.set_mode("MANUAL")
@@ -1070,6 +1159,13 @@ class KPatrolMQTTV5:
         action = payload.get("action", "")
         if action == "clear_emergency":
             self._nav.clear_emergency()
+            # V5.4: silence light + buzzer alongside nav-level clear so the
+            # operator doesn't need a second button press to stop the alarm.
+            if self._alert_actuator is not None:
+                try:
+                    self._alert_actuator.clear()
+                except Exception as exc:
+                    logger.error(f"[ALERT→ACT] clear error: {exc}")
             self.publish_log("Emergency cleared")
 
         if "mode" in payload:
@@ -1112,14 +1208,14 @@ class KPatrolMQTTV5:
                 if not self._nav.set_mode(mode_str):
                     self.publish_log(f"Unknown mode: {mode_str}")
                     return
-            print(f"[Nav] Mode → {mode_str}")
+            logger.info(f"[Nav] Mode → {mode_str}")
 
             # Set ESP32 speed to match nav _speed for autonomous modes
             if mode_str != "MANUAL":
                 esp_speed = int(self._nav._speed * 255 / 100)
                 self.motor_controller.set_speed(esp_speed)
             else:
-                print("[Nav] MANUAL — motors stopped")
+                logger.info("[Nav] MANUAL — motors stopped")
 
     # ── GPS route command handler (AUTO_GPS_WAYPOINT) ──────────────
 
@@ -1136,7 +1232,7 @@ class KPatrolMQTTV5:
             wps = payload.get("waypoints") or []
             loop = bool(payload.get("loop", False))
             result = self._nav.auto_gps_waypoint_set_route(wps, loop=loop)
-            print(f"[GPS_ROUTE] Set {len(wps)} waypoint(s) → {result}")
+            logger.info(f"[GPS_ROUTE] Set {len(wps)} waypoint(s) → {result}")
             if result.get("ok"):
                 self.publish_log(f"GPS route loaded: {result['count']} waypoints (loop={result['loop']})")
             else:
@@ -1150,7 +1246,7 @@ class KPatrolMQTTV5:
             self.motor_controller.send_command("S")
             self._last_nav_cmd = "S"
             result = self._nav.auto_gps_waypoint_start(waypoints=wps, loop=loop)
-            print(f"[GPS_ROUTE] Start → {result}")
+            logger.info(f"[GPS_ROUTE] Start → {result}")
             self.publish_log(f"GPS waypoint nav: {result}")
             self._pub(self.T.GPS_STATUS, {**result, "action": "start"})
             return
@@ -1159,7 +1255,7 @@ class KPatrolMQTTV5:
             result = self._nav.auto_gps_waypoint_stop()
             self.motor_controller.send_command("S")
             self._last_nav_cmd = "S"
-            print("[GPS_ROUTE] Stop")
+            logger.info("[GPS_ROUTE] Stop")
             self.publish_log("GPS waypoint nav stopped")
             self._pub(self.T.GPS_STATUS, {**result, "action": "stop"})
             return
@@ -1201,7 +1297,7 @@ class KPatrolMQTTV5:
             self._odom.reset(x=x, y=y, theta_deg=theta_deg)
             self.publish_log(f"Odom reset → x={x:.2f} y={y:.2f} θ={theta_deg:.1f}°")
         except (TypeError, ValueError) as exc:
-            print(f"[ODOM] reset payload error: {exc}")
+            logger.error(f"[ODOM] reset payload error: {exc}")
 
     # ── Publishers ─────────────────────────────────────────────────
 
@@ -1271,11 +1367,25 @@ class KPatrolMQTTV5:
 
     def publish_status(self):
         # Retained: latest full snapshot is always available to new subscribers.
+        # Battery: prefer firmware-reported pct; fall back to 85 only when no
+        # reading has arrived yet (firmware older than V5.4 / sensor offline).
+        battery_pct = self.motor_controller.get_battery_pct()
+        if battery_pct is None:
+            battery_value = 85
+        else:
+            battery_value = round(float(battery_pct), 1)
+            # Drive the watcher off the same value we publish so dashboards and
+            # actuator never disagree about the current level.
+            if self._battery_watcher is not None:
+                try:
+                    self._battery_watcher.tick(battery_pct)
+                except Exception as exc:
+                    logger.error(f"[BATTERY] tick error: {exc}")
         self._pub(self.T.STATUS, {
             "connected": True,
             "esp32_motor": self.motor_controller.connected,
             "esp32_encoder": self.encoder_reader.connected,
-            "battery": 85,
+            "battery": battery_value,
             "speed": self.motor_controller.current_speed,
             "lightState": self.motor_controller.light_state,
             "mainLightState": self.motor_controller.main_light_state,
@@ -1300,9 +1410,18 @@ class KPatrolMQTTV5:
         kind = str(event.kind).lower().strip()
         try:
             nav_result = self._nav.on_alert(kind, float(event.confidence), tuple(event.bbox))
-            print(f"[DETECT→NAV] {kind} conf={event.confidence:.2f} → {nav_result.get('action')}")
+            logger.info(f"[DETECT→NAV] {kind} conf={event.confidence:.2f} → {nav_result.get('action')}")
         except Exception as exc:
-            print(f"[DETECT→NAV] on_alert error: {exc}")
+            logger.error(f"[DETECT→NAV] on_alert error: {exc}")
+
+        # V5.4: physical alert (light + buzzer). Coalescing inside the actuator
+        # prevents UART flooding when the detector fires repeatedly on the same
+        # subject. Failures are non-fatal; nav + persist must still proceed.
+        if self._alert_actuator is not None:
+            try:
+                self._alert_actuator.on_detection(kind, float(event.confidence))
+            except Exception as exc:
+                logger.error(f"[ALERT→ACT] on_detection error: {exc}")
 
         alert_id: Optional[int] = None
         if self._alert_store is not None:
@@ -1318,7 +1437,7 @@ class KPatrolMQTTV5:
                     ts=event.timestamp,
                 )
             except Exception as exc:
-                print(f"[DETECT] persist failed: {exc}")
+                logger.error(f"[DETECT] persist failed: {exc}")
 
         if self._publish_alert_row(
             alert_id=alert_id if alert_id is not None else -1,
@@ -1334,7 +1453,7 @@ class KPatrolMQTTV5:
             try:
                 self._alert_store.mark_synced(alert_id)
             except Exception as exc:
-                print(f"[DETECT] mark_synced failed: {exc}")
+                logger.error(f"[DETECT] mark_synced failed: {exc}")
 
     def _publish_alert_row(
         self,
@@ -1377,7 +1496,7 @@ class KPatrolMQTTV5:
                 self._per_topic_bytes[label] = self._per_topic_bytes.get(label, 0) + len(body)
             return getattr(info, "rc", 0) == 0
         except Exception as exc:
-            print(f"[DETECT] publish failed: {exc}")
+            logger.error(f"[DETECT] publish failed: {exc}")
             return False
 
     def _alert_drain_loop(self, interval_sec: float = 5.0) -> None:
@@ -1390,7 +1509,7 @@ class KPatrolMQTTV5:
             try:
                 rows = self._alert_store.unsynced(limit=50)
             except Exception as exc:
-                print(f"[DETECT] drain read failed: {exc}")
+                logger.error(f"[DETECT] drain read failed: {exc}")
                 continue
             for row in rows:
                 try:
@@ -1410,7 +1529,7 @@ class KPatrolMQTTV5:
                     try:
                         self._alert_store.mark_synced(row["id"])
                     except Exception as exc:
-                        print(f"[DETECT] mark_synced (drain) failed: {exc}")
+                        logger.error(f"[DETECT] mark_synced (drain) failed: {exc}")
                 else:
                     break
 
@@ -1418,7 +1537,62 @@ class KPatrolMQTTV5:
         self._pub(self.T.SAFETY, self.safety_controller.get_status())
 
     def publish_imu(self):
-        self._pub(self.T.IMU, self.motor_controller.get_imu_status())
+        status = self.motor_controller.get_imu_status()
+        self._pub(self.T.IMU, status)
+        # V5.4: feed the tip-over watcher with each fresh IMU sample. The
+        # firmware-stamped timestamp tells us if the data is stale; we only
+        # tick when the IMU has actually been updated since last publish.
+        if self._tipover_watcher is not None and self.motor_controller.imu_data.timestamp:
+            try:
+                self._tipover_watcher.tick(
+                    roll_deg=float(status.get("roll", 0.0)),
+                    pitch_deg=float(status.get("pitch", 0.0)),
+                )
+            except Exception as exc:
+                logger.error(f"[TIPOVER] tick error: {exc}")
+
+    # ── V5.4: Safety watcher callbacks ─────────────────────────────
+
+    def _on_tipover(self, axis: str, angle_deg: float) -> None:
+        """Fired when IMU shows sustained tilt past threshold."""
+        logger.warning(f"[TIPOVER] FIRING axis={axis} angle={angle_deg:.1f}°")
+        try:
+            self._nav.trigger_emergency(f"tipover-{axis}")
+        except AttributeError:
+            # NavController may not expose trigger_emergency; fall back to a
+            # forced motor stop so the wheels at least stop spinning.
+            self.motor_controller.send_command("S")
+        if self._alert_actuator is not None:
+            try:
+                self._alert_actuator.on_tipover(axis, float(angle_deg))
+            except Exception as exc:
+                logger.error(f"[TIPOVER→ACT] on_tipover error: {exc}")
+        self.publish_log(f"Tip-over detected: {axis}={angle_deg:.1f}°")
+
+    def _on_tipover_recover(self) -> None:
+        logger.info("[TIPOVER] Recovered upright")
+        # Note: actuator is intentionally NOT cleared here — operator must
+        # explicitly clear EMERGENCY before lights/buzzer go silent, so the
+        # alert remains visible while crew are inspecting the robot.
+        self.publish_log("Tip-over recovered")
+
+    def _on_battery_event(self, level: str, pct: float) -> None:
+        """Fired when battery crosses LOW or CRITICAL with hysteresis."""
+        logger.info(f"[BATTERY] level={level} pct={pct:.1f}")
+        if self._alert_actuator is not None:
+            try:
+                self._alert_actuator.on_battery(level, float(pct))
+            except Exception as exc:
+                logger.error(f"[BATTERY→ACT] on_battery error: {exc}")
+        # Best-effort publish so the dashboard / mobile-app can pop a banner
+        # in addition to the actuator's local light + buzzer.
+        self._pub(self.T.BATTERY, {
+            "level": level,
+            "pct": round(pct, 1),
+            "robot": self.mqtt_config.robot_serial,
+            "ts": int(time.time() * 1000),
+        }, qos=1, retain=True)
+        self.publish_log(f"Battery {level}: {pct:.1f}%")
 
     def publish_encoders(self):
         data = self.encoder_reader.get_encoder_status()
@@ -1448,7 +1622,7 @@ class KPatrolMQTTV5:
             self._pub(self.T.ODOM, pose.to_dict())
         except Exception as exc:
             # Never let odometry kill the publish loop — log and continue.
-            print(f"[ODOM] publish error: {exc}")
+            logger.error(f"[ODOM] publish error: {exc}")
 
     def publish_motors(self):
         data = self.motor_controller.get_motor_status()
@@ -1501,7 +1675,7 @@ class KPatrolMQTTV5:
         Publishes JPEG overlay to kpatrol/{serial}/camera for dashboard view.
         """
         if not _CV2_AVAILABLE:
-            print("[LF] cv2 not available — LINE_FOLLOW camera disabled")
+            logger.info("[LF] cv2 not available — LINE_FOLLOW camera disabled")
             return
 
         cap = _cv2.VideoCapture(self._camera_index)
@@ -1510,10 +1684,10 @@ class KPatrolMQTTV5:
         cap.set(_cv2.CAP_PROP_FPS, 30)
 
         if not cap.isOpened():
-            print(f"[LF] Camera {self._camera_index} failed to open — LINE_FOLLOW disabled")
+            logger.error(f"[LF] Camera {self._camera_index} failed to open — LINE_FOLLOW disabled")
             return
 
-        print(f"[LF] Camera {self._camera_index} opened (640×480)")
+        logger.info(f"[LF] Camera {self._camera_index} opened (640×480)")
         interval      = 0.05  # 20 Hz control loop
         cam_pub_interval = 0.20  # 5 Hz JPEG stream (MQTT bandwidth friendly)
         last_cam_pub  = 0.0
@@ -1529,7 +1703,7 @@ class KPatrolMQTTV5:
 
             ret, frame = cap.read()
             if not ret:
-                print("[LF] Frame capture failed")
+                logger.info("[LF] Frame capture failed")
                 time.sleep(0.1)
                 continue
 
@@ -1560,7 +1734,7 @@ class KPatrolMQTTV5:
             time.sleep(max(0.0, interval - elapsed))
 
         cap.release()
-        print("[LF] Camera released")
+        logger.info("[LF] Camera released")
 
     # ── V5: Navigation Loop (separate thread) ─────────────────────
 
@@ -1709,9 +1883,9 @@ class KPatrolMQTTV5:
         if self._camera_enabled:
             lf_thread = threading.Thread(target=self._line_follow_loop, name="lf_loop", daemon=True)
             lf_thread.start()
-            print(f"[LF] Camera thread started (device {self._camera_index})")
+            logger.info(f"[LF] Camera thread started (device {self._camera_index})")
         else:
-            print("[LF] Camera disabled — LINE_FOLLOW mode will not move motors")
+            logger.info("[LF] Camera disabled — LINE_FOLLOW mode will not move motors")
 
         # V5.3: Start AnomalyDetector + alert backlog drainer (env-gated)
         if self._det_enabled and self._detector is not None:
@@ -1721,11 +1895,11 @@ class KPatrolMQTTV5:
                     target=self._alert_drain_loop, name="alert_drain", daemon=True,
                 )
                 self._alert_drain_thread.start()
-                print("[DETECT] anomaly detector + drainer started")
+                logger.info("[DETECT] anomaly detector + drainer started")
             except Exception as exc:
-                print(f"[DETECT] start failed: {exc}")
+                logger.error(f"[DETECT] start failed: {exc}")
         else:
-            print("[DETECT] disabled (set KPATROL_DETECTION_ENABLED=1 to enable)")
+            logger.info("[DETECT] disabled (set KPATROL_DETECTION_ENABLED=1 to enable)")
 
         heartbeat_interval = 5
         status_interval = 2
@@ -1748,25 +1922,25 @@ class KPatrolMQTTV5:
         last_gps = 0
         last_odom = 0.0
 
-        print("\n" + "=" * 60)
-        print("    K-PATROL MQTT CLIENT V5.0")
-        print("    Directional Safety + Autonomous Navigation")
-        print("=" * 60)
-        print(f"MQTT Broker: {self.mqtt_config.host}:{self.mqtt_config.port}")
-        print(f"Motor Port:  {self.serial_config.motor_port} ({'OK' if self.motor_controller.connected else 'FAIL'})")
-        print(f"Encoder Port: {self.serial_config.encoder_port} ({'OK' if self.encoder_reader.connected else 'FAIL'})")
+        logger.info("\n" + "=" * 60)
+        logger.info("    K-PATROL MQTT CLIENT V5.0")
+        logger.info("    Directional Safety + Autonomous Navigation")
+        logger.info("=" * 60)
+        logger.info(f"MQTT Broker: {self.mqtt_config.host}:{self.mqtt_config.port}")
+        logger.info(f"Motor Port:  {self.serial_config.motor_port} ({'OK' if self.motor_controller.connected else 'FAIL'})")
+        logger.info(f"Encoder Port: {self.serial_config.encoder_port} ({'OK' if self.encoder_reader.connected else 'FAIL'})")
         if self.gps_reader is not None:
             gps_state = "OK" if self.gps_reader.connected else "FAIL"
             if self.gps_config.mode == "shared":
-                print(f"GPS:         shared via motor UART ({gps_state}) — outdoor mode")
+                logger.info(f"GPS:         shared via motor UART ({gps_state}) — outdoor mode")
             else:
-                print(f"GPS Port:    {self.gps_config.port} ({gps_state}) — outdoor mode")
+                logger.info(f"GPS Port:    {self.gps_config.port} ({gps_state}) — outdoor mode")
         else:
-            print("GPS:         disabled (indoor mode)")
-        print(f"Safety: {'Enabled' if self.safety_controller.config.enabled else 'Disabled'} (Directional)")
-        print(f"Nav Mode: {self._nav.get_mode()}")
-        print("=" * 60)
-        print("Press Ctrl+C to exit\n")
+            logger.info("GPS:         disabled (indoor mode)")
+        logger.info(f"Safety: {'Enabled' if self.safety_controller.config.enabled else 'Disabled'} (Directional)")
+        logger.info(f"Nav Mode: {self._nav.get_mode()}")
+        logger.info("=" * 60)
+        logger.info("Press Ctrl+C to exit\n")
 
         try:
             while self.running:
@@ -1816,12 +1990,12 @@ class KPatrolMQTTV5:
 
                 response = self.motor_controller.read_response()
                 if response and not response.startswith("IMU:"):
-                    print(f"[Motor] {response}")
+                    logger.info(f"[Motor] {response}")
 
                 time.sleep(0.05)
 
         except KeyboardInterrupt:
-            print("\n[Main] Shutting down...")
+            logger.info("\n[Main] Shutting down...")
 
         self.shutdown()
 
@@ -1836,7 +2010,7 @@ class KPatrolMQTTV5:
             try:
                 self._detector.stop()
             except Exception as exc:
-                print(f"[DETECT] stop error: {exc}")
+                logger.error(f"[DETECT] stop error: {exc}")
 
         if self.client and self.client.is_connected():
             self.send_heartbeat("offline")
@@ -1852,8 +2026,8 @@ class KPatrolMQTTV5:
             try:
                 self._alert_store.close()
             except Exception as exc:
-                print(f"[DETECT] alert_store close error: {exc}")
-        print("[Main] V5 shutdown complete")
+                logger.error(f"[DETECT] alert_store close error: {exc}")
+        logger.info("[Main] V5 shutdown complete")
 
 
 # ==================== MAIN ====================
@@ -1901,18 +2075,35 @@ def find_serial_ports():
     return motor_port, encoder_port, gps_port
 
 
+def _configure_logging() -> None:
+    """Init root logger once for daemon mode.
+
+    Honors KPATROL_LOG_LEVEL (default INFO). When run under systemd the output
+    goes to journald; locally it goes to stderr.
+    """
+    level_name = os.environ.get("KPATROL_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
 def main():
-    print("\n" + "=" * 60)
-    print("    K-PATROL MQTT CLIENT V5.0 FOR RASPBERRY PI")
-    print("    Directional Safety + Autonomous Navigation")
-    print("=" * 60 + "\n")
+    _configure_logging()
+    logger.info("=" * 60)
+    logger.info("K-PATROL MQTT CLIENT V5.0 FOR RASPBERRY PI")
+    logger.info("Directional Safety + Autonomous Navigation")
+    logger.info("=" * 60)
 
     os.makedirs("data", exist_ok=True)
     motor_port, encoder_port, gps_port = find_serial_ports()
 
     robot_serial = os.environ.get('ROBOT_SERIAL', 'KPATROL-001')
-    print(f"Robot Serial: {robot_serial}")
+    logger.info(f"Robot Serial: {robot_serial}")
     mqtt_config = MQTTConfig(robot_serial=robot_serial)
+    mqtt_config.validate()
     serial_config = SerialConfig(motor_port=motor_port, encoder_port=encoder_port)
 
     # GPS toggle via env: KPATROL_GPS_ENABLED=0 to skip outdoor mode entirely.
@@ -1921,7 +2112,7 @@ def main():
     # motor serial as `NMEA:...`) or "dedicated" (own USB-TTL adapter).
     gps_mode = os.environ.get("KPATROL_GPS_MODE", "shared").strip().lower()
     if gps_mode not in ("shared", "dedicated"):
-        print(f"[GPS] Unknown KPATROL_GPS_MODE={gps_mode!r}, falling back to 'shared'")
+        logger.warning(f"[GPS] Unknown KPATROL_GPS_MODE={gps_mode!r}, falling back to 'shared'")
         gps_mode = "shared"
     gps_config = GPSConfig(port=gps_port, enabled=gps_enabled, mode=gps_mode)
 
@@ -1931,7 +2122,7 @@ def main():
     if client.connect():
         client.run()
     else:
-        print("[Main] Failed to connect, exiting...")
+        logger.error("[Main] Failed to connect, exiting...")
         sys.exit(1)
 
 
