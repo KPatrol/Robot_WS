@@ -51,6 +51,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, NamedTuple, Optional
 
+from .nav_utils import clamp, safe_round
+
 
 # ─── Geo helpers ─────────────────────────────────────────────────────
 _EARTH_R_M = 6_371_000.0
@@ -129,8 +131,14 @@ class GPSNavigatorConfig:
     slow_min_factor:    float =  0.40  # min multiplier near waypoint
 
     # ── Reactive safety ─────────────────────────────────────────────
-    safety_emergency_mm: int  = 350    # full stop if front below this
-    safety_slow_mm:      int  = 800    # halve speed when below this
+    safety_emergency_mm: int   = 350    # full stop if front below this
+    safety_slow_mm:      int   = 800    # halve speed when below this
+    safety_slow_factor:  float = 0.5    # speed multiplier in safety_slow_mm zone
+
+    # ── Speed shaping ───────────────────────────────────────────────
+    turning_spd_factor:  float = 0.6    # spd multiplier while in-place rotating
+    min_arrival_radius_m: float = 0.5   # floor for waypoint arrival radius
+    min_spd:             int   = 20     # never command below this ESP32 spd
 
     # ── GPS fusion ──────────────────────────────────────────────────
     gps_course_min_kmh:  float = 1.5   # use COG above this speed only
@@ -229,10 +237,10 @@ class GPSNavigator:
             "wp_index":        self._wp_idx,
             "wp_total":        len(self._route),
             "wp_label":        wp.label if wp else None,
-            "distance_m":      _safe_round(self._stats.last_distance_m, 2),
-            "bearing_deg":     _safe_round(self._stats.last_bearing_deg, 1),
-            "heading_deg":     _safe_round(self._stats.last_heading_deg, 1),
-            "error_deg":       _safe_round(self._stats.last_error_deg, 1),
+            "distance_m":      safe_round(self._stats.last_distance_m, 2),
+            "bearing_deg":     safe_round(self._stats.last_bearing_deg, 1),
+            "heading_deg":     safe_round(self._stats.last_heading_deg, 1),
+            "error_deg":       safe_round(self._stats.last_error_deg, 1),
             "loop":            self._loop,
         }
 
@@ -274,7 +282,7 @@ class GPSNavigator:
         self._stats.last_bearing_deg = bearing
 
         # ── Step 3: arrival check ───────────────────────────────
-        if distance_m <= max(0.5, wp.radius_m):
+        if distance_m <= max(self.cfg.min_arrival_radius_m, wp.radius_m):
             return self._advance_waypoint()
 
         # ── Step 4: compute heading reference ───────────────────
@@ -295,12 +303,12 @@ class GPSNavigator:
         if abs(err) > self.cfg.coarse_align_deg:
             self._state = GPSState.TURNING
             wz = int(math.copysign(self.cfg.turn_speed, err))
-            spd = self._scaled_spd(speed_pct, wp.speed_pct, factor=0.6)
+            spd = self._scaled_spd(speed_pct, wp.speed_pct, factor=self.cfg.turning_spd_factor)
             return GPSNavResult(0, 0, wz, spd, self._state.value, done=False)
 
         # In alignment band — drive forward with heading PD.
         self._state = GPSState.DRIVING
-        wz = int(_clip(self.cfg.heading_kp * err, -self.cfg.heading_max_wz, self.cfg.heading_max_wz))
+        wz = int(clamp(self.cfg.heading_kp * err, -self.cfg.heading_max_wz, self.cfg.heading_max_wz))
 
         # Speed shaping: ramp down inside slow_distance_m, halve in slow_mm zone.
         ramp = 1.0
@@ -308,11 +316,11 @@ class GPSNavigator:
             t = max(0.0, distance_m / self.cfg.slow_distance_m)
             ramp = self.cfg.slow_min_factor + (1.0 - self.cfg.slow_min_factor) * t
         if front_mm <= self.cfg.safety_slow_mm:
-            ramp *= 0.5
+            ramp *= self.cfg.safety_slow_factor
 
-        sp = _clip(min(speed_pct, wp.speed_pct) / 100.0, 0.0, 1.0) * ramp
+        sp = clamp(min(speed_pct, wp.speed_pct) / 100.0, 0.0, 1.0) * ramp
         vx  = int(self.cfg.base_vx * sp)
-        spd = max(20, int(self.cfg.base_spd * sp))
+        spd = max(self.cfg.min_spd, int(self.cfg.base_spd * sp))
         return GPSNavResult(vx, 0, wz, spd, self._state.value, done=False)
 
     # ── Helpers ─────────────────────────────────────────────────
@@ -373,19 +381,8 @@ class GPSNavigator:
         return imu
 
     def _scaled_spd(self, op_pct: int, wp_pct: int, factor: float = 1.0) -> int:
-        sp = _clip(min(op_pct, wp_pct) / 100.0, 0.0, 1.0) * factor
-        return max(20, int(self.cfg.base_spd * sp))
-
-
-# ─── Module helpers ─────────────────────────────────────────────────
-def _clip(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def _safe_round(x: float, n: int):
-    if not math.isfinite(x):
-        return None
-    return round(x, n)
+        sp = clamp(min(op_pct, wp_pct) / 100.0, 0.0, 1.0) * factor
+        return max(self.cfg.min_spd, int(self.cfg.base_spd * sp))
 
 
 __all__ = [
