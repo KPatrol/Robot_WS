@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .free_coverage import FreeCoverage, CoverageConfig
 from .gps_navigator import GPSNavigator, GPSNavigatorConfig, Waypoint
@@ -52,6 +52,9 @@ class NavController:
         self._line_follower = LineFollower(lf_config)
         self._free_coverage = FreeCoverage(fc_config)
         self._gps_navigator = GPSNavigator(gps_config)
+        # Stored so it can be re-applied if the line-follower is reinstantiated
+        # later via auto_line_follow_start(lf_config=...).
+        self._lf_front_distance_provider: Optional[Callable[[], Optional[float]]] = None
         # Detection→navigation safety bridge state
         self._alert_cooldowns:  Dict[str, float]    = {}
         self._alert_pause_until: float              = 0.0
@@ -82,6 +85,16 @@ class NavController:
         self._speed = max(0, min(100, int(speed_pct)))
 
     # ── AUTO_LINE_FOLLOW control ─────────────────────────────────
+    def set_line_follow_front_distance_provider(
+        self, provider: Optional[Callable[[], Optional[float]]]
+    ) -> None:
+        """Wire the front-facing ToF reader into the line follower's
+        emergency cut-off path. Reapplied automatically on subsequent
+        auto_line_follow_start() calls so a re-configured follower keeps
+        the safety hookup."""
+        self._lf_front_distance_provider = provider
+        self._line_follower.set_front_distance_provider(provider)
+
     def auto_line_follow_start(
         self, lf_config: Optional[LineFollowerConfig] = None
     ) -> Dict[str, Any]:
@@ -89,6 +102,11 @@ class NavController:
             return {"ok": False, "error": f"cannot start line-follow from mode {self._mode.value}"}
         if lf_config is not None:
             self._line_follower = LineFollower(lf_config)
+            # Reapply the wired ToF provider — a fresh LineFollower has none.
+            if self._lf_front_distance_provider is not None:
+                self._line_follower.set_front_distance_provider(
+                    self._lf_front_distance_provider
+                )
         else:
             self._line_follower.reset_pid()
         self._mode = Mode.AUTO_LINE_FOLLOW
@@ -249,6 +267,29 @@ class NavController:
         self._alert_pause_until = 0.0
         self._mode_before_pause = None
         return True
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Snapshot of bridge + FSM state for telemetry / debug endpoints.
+
+        Cheap, allocation-light dict — safe to call from a 1 Hz status publisher.
+        """
+        now = time.monotonic()
+        cd_remaining: Dict[str, float] = {}
+        for kind, last in self._alert_cooldowns.items():
+            cd_s = self._ALERT_COOLDOWNS_S.get(kind, 5.0)
+            rem = cd_s - (now - last)
+            if rem > 0:
+                cd_remaining[kind] = round(rem, 2)
+        pause_rem = max(0.0, self._alert_pause_until - now) if self._alert_pause_until else 0.0
+        return {
+            "mode":                 self._mode.value,
+            "speed":                self._speed,
+            "is_auto":              self.is_auto(),
+            "alert_cooldowns_s":    cd_remaining,
+            "alert_pause_remaining_s": round(pause_rem, 2),
+            "mode_before_pause":    self._mode_before_pause.value if self._mode_before_pause else None,
+            "last_alert":           self._last_alert,
+        }
 
     # ── Control-loop tick ────────────────────────────────────────
     def tick(
