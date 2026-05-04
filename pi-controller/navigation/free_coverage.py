@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, NamedTuple, Optional, Tuple
 
+from .nav_utils import clamp, wrap_pi
 from .occupancy_grid import (
     CELL_OBSTACLE,
     CELL_VISITED,
@@ -93,6 +94,12 @@ class CoverageConfig:
     wall_kp_yaw:          float = 0.15    # mm error → wz units
     wall_max_vy:          int   = 30
     wall_max_wz:          int   = 35
+    wall_hard_err_mm:     int   = 200     # |err| ≥ this → throttle base_vx
+    wall_hard_throttle:   float = 0.7     # multiplier when correcting hard
+
+    # ── Frontier seek heading PD ─────────────────────────────────────
+    frontier_align_deg:   float = 30.0    # |err| > this → rotate in place first
+    frontier_kp_yaw:      float = 1.0     # deg → wz units while driving
 
     # ── Frontier exploration (requires pose) ─────────────────────────
     frontier_enabled:                bool  = True
@@ -258,10 +265,10 @@ class FreeCoverage:
         err = right_mm - cfg.wall_target_mm
         if abs(err) < cfg.wall_deadband_mm:
             err = 0
-        vy = -int(_clamp(err * cfg.wall_kp_lateral, -cfg.wall_max_vy, cfg.wall_max_vy))
-        wz = -int(_clamp(err * cfg.wall_kp_yaw,     -cfg.wall_max_wz, cfg.wall_max_wz))
+        vy = -int(clamp(err * cfg.wall_kp_lateral, -cfg.wall_max_vy, cfg.wall_max_vy))
+        wz = -int(clamp(err * cfg.wall_kp_yaw,     -cfg.wall_max_wz, cfg.wall_max_wz))
         # Slow down a bit when correcting hard so we don't overshoot.
-        vx = cfg.base_vx if abs(err) < 200 else int(cfg.base_vx * 0.7)
+        vx = cfg.base_vx if abs(err) < cfg.wall_hard_err_mm else int(cfg.base_vx * cfg.wall_hard_throttle)
         return CoverageResult(vx, vy, wz, cfg.base_spd, "WALL_FOLLOW")
 
     # ── Frontier seek ─────────────────────────────────────────────────
@@ -299,10 +306,10 @@ class FreeCoverage:
             return CoverageResult(cfg.base_vx, 0, 0, cfg.base_spd, "FORWARD")
 
         bearing     = math.atan2(dy, dx)
-        heading_err = _wrap_pi(bearing - pose.theta)
+        heading_err = wrap_pi(bearing - pose.theta)
 
-        # Big heading error → rotate in place. ±30° band.
-        if abs(heading_err) > math.radians(30):
+        # Big heading error → rotate in place.
+        if abs(heading_err) > math.radians(cfg.frontier_align_deg):
             wz = cfg.turn_speed if heading_err > 0 else -cfg.turn_speed
             return CoverageResult(0, 0, wz, cfg.base_spd, "FRONTIER_SEEK")
 
@@ -313,8 +320,8 @@ class FreeCoverage:
             self._begin_turn(left_mm, right_mm, now)
             return CoverageResult(0, 0, self._turn_wz, cfg.base_spd, "TURNING")
 
-        wz = int(_clamp(math.degrees(heading_err) * 1.0,
-                        -cfg.wall_max_wz, cfg.wall_max_wz))
+        wz = int(clamp(math.degrees(heading_err) * cfg.frontier_kp_yaw,
+                       -cfg.wall_max_wz, cfg.wall_max_wz))
         return CoverageResult(cfg.base_vx, 0, wz, cfg.base_spd, "FRONTIER_SEEK")
 
     def _is_local_saturated(self, pose: Any) -> bool:
@@ -427,20 +434,6 @@ class FreeCoverage:
             self._turn_wz =  cfg.turn_speed   # CCW (left)
         self._state       = _State.TURNING
         self._state_until = now + duration
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def _wrap_pi(angle: float) -> float:
-    while angle > math.pi:
-        angle -= 2 * math.pi
-    while angle < -math.pi:
-        angle += 2 * math.pi
-    return angle
 
 
 __all__ = ["FreeCoverage", "CoverageConfig", "CoverageResult"]
