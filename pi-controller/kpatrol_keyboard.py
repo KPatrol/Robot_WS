@@ -166,8 +166,8 @@ class RobotController:
             try:
                 self.serial.write(f"{cmd}\n".encode())
                 self.serial.flush()
-            except:
-                pass
+            except (serial.SerialException, OSError) as exc:
+                print(f"⚠️  serial write failed: {exc}")
                 
     def _read_responses(self):
         """Thread đọc response"""
@@ -179,7 +179,7 @@ class RobotController:
                         self.responses.append(line)
                         if len(self.responses) > 5:
                             self.responses.pop(0)
-            except:
+            except (serial.SerialException, OSError, UnicodeDecodeError):
                 pass
             time.sleep(0.01)
             
