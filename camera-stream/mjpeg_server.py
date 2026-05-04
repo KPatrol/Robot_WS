@@ -18,6 +18,7 @@ from flask_cors import CORS
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder, Quality
 from picamera2.outputs import FileOutput
+import functools
 import logging
 import os
 import threading
@@ -25,7 +26,71 @@ import io
 import time
 import socket
 
+try:
+    import jwt as pyjwt  # PyJWT
+except ImportError:
+    pyjwt = None
+
 _ROBOT_SERIAL = os.environ.get("ROBOT_SERIAL", "KPATROL-001")
+
+# Stream-token verification — backend signs short-TTL JWTs (scope=mjpeg) that
+# the operator's browser passes via ?token= or `Authorization: Bearer …`. We
+# fail-secure: if STREAM_TOKEN_SECRET is set we REQUIRE a valid token; if it's
+# unset we disable auth and log loudly (dev-only path, never deploy like that).
+_STREAM_TOKEN_SECRET = os.environ.get("STREAM_TOKEN_SECRET", "").strip()
+_STREAM_TOKEN_SCOPE = "mjpeg"
+_STREAM_TOKEN_LEEWAY_SEC = 5  # tolerate small Pi/server clock drift
+
+
+def _extract_token(req):
+    qs = req.args.get("token")
+    if qs:
+        return qs
+    auth = req.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return None
+
+
+def _verify_token(token):
+    """Returns (ok, reason). Reason is for logging — never leak to clients."""
+    if pyjwt is None:
+        return False, "PyJWT not installed"
+    if not token:
+        return False, "missing token"
+    try:
+        claims = pyjwt.decode(
+            token,
+            _STREAM_TOKEN_SECRET,
+            algorithms=["HS256"],
+            leeway=_STREAM_TOKEN_LEEWAY_SEC,
+            options={"require": ["exp", "scope"]},
+        )
+    except pyjwt.ExpiredSignatureError:
+        return False, "expired"
+    except pyjwt.InvalidTokenError as e:
+        return False, f"invalid: {e}"
+    if claims.get("scope") != _STREAM_TOKEN_SCOPE:
+        return False, "wrong scope"
+    return True, None
+
+
+def require_stream_token(view):
+    """Decorator: enforce stream-token auth when STREAM_TOKEN_SECRET is set."""
+    @functools.wraps(view)
+    def wrapped(*args, **kwargs):
+        if not _STREAM_TOKEN_SECRET:
+            return view(*args, **kwargs)
+        ok, reason = _verify_token(_extract_token(request))
+        if not ok:
+            # Log without echoing the token itself — referer/proxy logs already
+            # carry enough risk.
+            logging.getLogger("mjpeg").warning(
+                "stream auth rejected from %s: %s", request.remote_addr, reason,
+            )
+            return jsonify({"error": "unauthorized"}), 401
+        return view(*args, **kwargs)
+    return wrapped
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 
@@ -176,6 +241,7 @@ def index():
 
 
 @app.route('/stream')
+@require_stream_token
 def stream():
     """MJPEG video stream - optimized for low latency"""
     return Response(
@@ -193,6 +259,7 @@ def stream():
 
 
 @app.route('/stream/hd')
+@require_stream_token
 def stream_hd():
     """HD MJPEG stream (higher quality, higher latency)"""
     # Note: This uses the same stream but could be configured differently
@@ -210,6 +277,7 @@ def stream_hd():
 
 
 @app.route('/snapshot')
+@require_stream_token
 def snapshot():
     """Single JPEG frame"""
     with frame_lock:
@@ -274,7 +342,15 @@ if __name__ == '__main__':
     print("=" * 50)
     
     init_camera()
-    
+
+    if not _STREAM_TOKEN_SECRET:
+        print("⚠️  STREAM_TOKEN_SECRET not set — /stream is OPEN. DO NOT deploy like this.")
+    elif pyjwt is None:
+        print("❌ STREAM_TOKEN_SECRET is set but PyJWT is missing. Install with: pip install PyJWT")
+        sys.exit(1)
+    else:
+        print("🔒 Stream-token auth enabled (HS256, scope=mjpeg)")
+
     local_ip = get_local_ip()
     print(f"Mode:   BALANCED (960x540, Quality: MEDIUM)")
     print(f"Local:  http://{local_ip}:8080/stream")
