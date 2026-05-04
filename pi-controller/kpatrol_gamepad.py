@@ -132,8 +132,8 @@ class GamepadController:
             try:
                 self.serial.write(f"{cmd}\n".encode())
                 self.serial.flush()
-            except:
-                pass
+            except (serial.SerialException, OSError) as exc:
+                print(f"⚠️  serial write failed: {exc}")
                 
     def process_event(self, event):
         """Xử lý event từ gamepad"""
