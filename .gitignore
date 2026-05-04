@@ -36,6 +36,9 @@ Thumbs.db
 *.local
 .deploy-stash-marker
 
+# MQTT credentials — use mqtt.env.example as template
+pi-controller/mqtt.env
+
 # Generated artifacts
 *.log
 *.pid
