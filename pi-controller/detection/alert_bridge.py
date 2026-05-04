@@ -66,22 +66,76 @@ class AlertBridge:
         self.store = AlertStore(db_path)
         self._drain_stop = threading.Event()
         self._drain_thread: Optional[threading.Thread] = None
+        # Reconnect state: when the initial connect fails we keep a "shell"
+        # client around and let the drainer thread retry on each tick. paho's
+        # loop_start handles reconnects only after a successful first connect,
+        # so we own the cold-start retry path ourselves.
+        self._connect_pending: bool = False
+        self._last_connect_attempt: float = 0.0
+        self._connect_retry_sec: float = 10.0
 
-    def connect(self) -> None:
-        if mqtt is None:
-            log.warning("paho-mqtt not installed — events will be printed only")
-            return
+    def _build_client(self) -> "mqtt.Client":
         c = mqtt.Client(client_id=f"{self.serial}-alert")
         user = self.env.get("MQTT_USERNAME")
         pwd = self.env.get("MQTT_PASSWORD")
         if user:
             c.username_pw_set(user, pwd)
+        c.on_disconnect = self._on_disconnect
+        c.on_connect = self._on_connect
+        return c
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            log.info("[bridge] mqtt connected")
+            self._connect_pending = False
+        else:
+            log.warning("[bridge] mqtt connect rc=%s", rc)
+
+    def _on_disconnect(self, client, userdata, rc):
+        # rc != 0 means unexpected drop; paho will auto-reconnect via loop_start.
+        if rc != 0:
+            log.warning("[bridge] mqtt disconnected rc=%s — will auto-reconnect", rc)
+
+    def connect(self) -> None:
+        if mqtt is None:
+            log.warning("paho-mqtt not installed — events will be printed only")
+            return
+        c = self._build_client()
         host = self.env.get("MQTT_HOST", "localhost")
         port = int(self.env.get("MQTT_PORT", "1883"))
         log.info("[bridge] connecting to %s:%d", host, port)
-        c.connect(host, port, keepalive=30)
+        self._last_connect_attempt = time.time()
+        try:
+            c.connect(host, port, keepalive=30)
+        except OSError as exc:
+            # Broker down at startup — keep events flowing into SQLite and let
+            # the drainer retry. Without this, a delayed broker bring-up would
+            # crash the whole detection process.
+            log.warning("[bridge] initial connect failed: %s — buffering to disk", exc)
+            self._connect_pending = True
         c.loop_start()
         self.client = c
+
+    def _try_reconnect(self) -> None:
+        """Retry an initial connect that failed at startup.
+
+        Called from the drainer tick. paho's auto-reconnect only kicks in once
+        a session has been established at least once; cold-start failures stay
+        cold until we explicitly reconnect.
+        """
+        if not self._connect_pending or self.client is None:
+            return
+        now = time.time()
+        if now - self._last_connect_attempt < self._connect_retry_sec:
+            return
+        self._last_connect_attempt = now
+        host = self.env.get("MQTT_HOST", "localhost")
+        port = int(self.env.get("MQTT_PORT", "1883"))
+        try:
+            self.client.reconnect()
+            log.info("[bridge] reconnect attempt to %s:%d issued", host, port)
+        except OSError as exc:
+            log.debug("[bridge] reconnect still failing: %s", exc)
 
     def disconnect(self) -> None:
         self._drain_stop.set()
@@ -136,7 +190,12 @@ class AlertBridge:
         if self.client is None or not self.client.is_connected():
             log.info("[bridge] offline, queued id=%d kind=%s", alert_id, kind)
             return False
-        info = self.client.publish(self.topic, body, qos=1, retain=False)
+        try:
+            info = self.client.publish(self.topic, body, qos=1, retain=False)
+        except (OSError, ValueError) as exc:
+            # Socket can drop mid-publish; surface and let the drainer retry.
+            log.warning("[bridge] publish raised: %s — leaving id=%d unsynced", exc, alert_id)
+            return False
         log.info("[bridge] %s -> %s", self.topic, body)
         # paho rc==0 means accepted onto the outbound buffer; QoS=1 will retry.
         return getattr(info, "rc", 0) == 0
@@ -156,6 +215,11 @@ class AlertBridge:
 
     def _drain_loop(self, interval_sec: float) -> None:
         while not self._drain_stop.wait(interval_sec):
+            # Cold-start retry: if the initial connect failed, keep poking the
+            # broker. We do this before the connectedness check so a successful
+            # reconnect is acted on in the same tick.
+            if self._connect_pending:
+                self._try_reconnect()
             if self.client is None or not self.client.is_connected():
                 continue
             try:
@@ -168,10 +232,15 @@ class AlertBridge:
                     bbox = tuple(json.loads(row["bbox_json"]))
                 except Exception:
                     bbox = (0, 0, 0, 0)
-                ok = self._publish_row(
-                    row["id"], row["kind"], row["confidence"], bbox,
-                    row["ts"], row["snapshot"], row["frame_w"], row["frame_h"],
-                )
+                try:
+                    ok = self._publish_row(
+                        row["id"], row["kind"], row["confidence"], bbox,
+                        row["ts"], row["snapshot"], row["frame_w"], row["frame_h"],
+                    )
+                except Exception as exc:
+                    # Belt-and-braces: never let one bad row kill the drainer.
+                    log.warning("[bridge] drain publish raised on id=%s: %s", row.get("id"), exc)
+                    break
                 if ok:
                     self.store.mark_synced(row["id"])
                 else:
