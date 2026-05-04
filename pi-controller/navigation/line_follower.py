@@ -35,10 +35,17 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from .nav_utils import clamp
+
+
+# Firmware MEC: protocol uses signed-byte (int8) velocity fields, so any
+# (vy, wz) command must saturate inside [-127, 127] before the serial write.
+_TWIST_LIMIT = 127
 
 
 # ── Colour thresholds (HSV) ────────────────────────────────────────────────────
@@ -109,6 +116,16 @@ class LineFollowerConfig:
     # before stopping (~0.5 s at 20 Hz). Set to 0 to disable.
     lost_grace_frames: int = 10
 
+    # ToF emergency cut-off — front distance (mm) below which the controller
+    # forces a full stop regardless of line tracking. Independent of the
+    # directional SafetyController gate at the command-bus level: this hard
+    # short-circuits the line-follow output before it even leaves the module,
+    # so the firmware never sees an unsafe MEC: command.
+    tof_emergency_stop_mm: int   = 250
+    # Distance below which forward speed is halved (early slow-down). Set to
+    # 0 to disable; must be ≥ tof_emergency_stop_mm.
+    tof_slow_distance_mm:  int   = 500
+
     # Overlay appearance
     overlay_alpha:   float = 0.55   # blend strength of annotation layer
 
@@ -125,6 +142,12 @@ class LineResult:
     lateral_error: float   # pixels, + = line is to the right of target
     heading_error: float   # radians, + = line angled left relative to robot
     overlay:       Optional[np.ndarray]   # BGR frame with annotations, or None
+    # True if the front ToF distance dropped below the emergency threshold
+    # and the controller short-circuited to a full stop.
+    tof_blocked:   bool   = False
+    # Latest front distance (mm) sampled from the provider, or None when no
+    # provider is wired. Surfaced so the host can publish it for telemetry.
+    front_dist_mm: Optional[float] = None
 
 
 # ── Main class ─────────────────────────────────────────────────────────────────
@@ -167,6 +190,43 @@ class LineFollower:
         self._last_vy:    int = 0
         self._last_wz:    int = 0
 
+        # Optional callable returning the latest front-facing ToF distance
+        # in millimetres (None / negative ⇒ "no reading"). Wired by the host
+        # after construction via set_front_distance_provider; default-None
+        # keeps unit tests and offline tools working without sensor data.
+        self._front_dist_provider: Optional[Callable[[], Optional[float]]] = None
+
+    def set_front_distance_provider(
+        self,
+        provider: Optional[Callable[[], Optional[float]]],
+    ) -> None:
+        """Inject a callable returning the latest front-facing ToF distance
+        in millimetres. The provider should be cheap (read-only snapshot of
+        a shared sensor cache); it is invoked once per tick(). Pass None to
+        clear and disable the emergency cut-off."""
+        self._front_dist_provider = provider
+
+    def _read_front_distance(self) -> Optional[float]:
+        """Sample the wired ToF provider, swallowing any exception so a
+        sensor glitch never aborts the control loop."""
+        if self._front_dist_provider is None:
+            return None
+        try:
+            d = self._front_dist_provider()
+        except Exception:
+            return None
+        if d is None:
+            return None
+        try:
+            d = float(d)
+        except (TypeError, ValueError):
+            return None
+        # Treat 0 / negative as "no reading" — VL53L1X drivers commonly
+        # report 0 on out-of-range or read failure.
+        if d <= 0.0:
+            return None
+        return d
+
     def tick(
         self,
         frame: np.ndarray,
@@ -176,6 +236,29 @@ class LineFollower:
         now = time.monotonic()
         dt  = max(0.001, now - self._prev_t)
         self._prev_t = now
+
+        # ── Step 0: ToF emergency cut-off ─────────────────────────────────────
+        # Sampled before any vision work so an obstacle cuts forward motion
+        # even if the camera path is slow / stalled this frame.
+        front_dist = self._read_front_distance()
+        if (front_dist is not None
+                and cfg.tof_emergency_stop_mm > 0
+                and front_dist < cfg.tof_emergency_stop_mm):
+            # Short-circuit: full stop. Do not advance PD state — preserves
+            # last-known errors so resumption is smooth once the obstacle
+            # clears, instead of treating the pause as a giant dt.
+            self._lost_count = 0
+            self._last_vy = 0
+            self._last_wz = 0
+            overlay = (
+                self._draw_overlay(frame, np.zeros((cfg.bev_h, cfg.bev_w),
+                                                   dtype=np.uint8),
+                                   [], None, None)
+                if produce_overlay else None
+            )
+            return LineResult(0, 0, 0, cfg.base_spd,
+                              False, 0.0, 0.0, overlay,
+                              tof_blocked=True, front_dist_mm=front_dist)
 
         # ── Step 1: HSV threshold ─────────────────────────────────────────────
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -219,12 +302,14 @@ class LineFollower:
             if self._lost_count <= cfg.lost_grace_frames and (self._last_vy != 0 or self._last_wz != 0):
                 hold_vx = max(0, cfg.base_vx // 2)
                 return LineResult(hold_vx, self._last_vy, self._last_wz, cfg.base_spd,
-                                  False, 0.0, 0.0, overlay)
+                                  False, 0.0, 0.0, overlay,
+                                  tof_blocked=False, front_dist_mm=front_dist)
             # Past grace period: full stop, reset PD state
             self._prev_lat_err = 0.0
             self._prev_hdg_err = 0.0
             return LineResult(cfg.lost_vx, 0, 0, cfg.base_spd,
-                              False, 0.0, 0.0, overlay)
+                              False, 0.0, 0.0, overlay,
+                              tof_blocked=False, front_dist_mm=front_dist)
 
         spine_arr = np.array(spine)
         xs_arr    = spine_arr[:, 0]
@@ -260,21 +345,31 @@ class LineFollower:
         # wz: + = rotate left; when heading_error > 0, line leans left → rotate left
         wz_raw = cfg.kp_heading * heading_error + cfg.kd_heading * d_hdg
 
-        vy = int(max(-127, min(127, vy_raw)))
-        wz = int(max(-127, min(127, wz_raw)))
+        vy = int(clamp(vy_raw, -_TWIST_LIMIT, _TWIST_LIMIT))
+        wz = int(clamp(wz_raw, -_TWIST_LIMIT, _TWIST_LIMIT))
 
         # Line found — reset grace state, save last known steering
         self._lost_count = 0
         self._last_vy    = vy
         self._last_wz    = wz
 
+        # ToF slow-zone: when the path ahead is closer than tof_slow_distance_mm
+        # but still past the emergency cut-off, halve forward speed so the
+        # PD controller still gets to steer without overshooting the obstacle.
+        vx_out = cfg.base_vx
+        if (front_dist is not None
+                and cfg.tof_slow_distance_mm > 0
+                and front_dist < cfg.tof_slow_distance_mm):
+            vx_out = max(0, cfg.base_vx // 2)
+
         overlay = (
             self._draw_overlay(frame, bev, spine, line_x_at_robot, target_x)
             if produce_overlay else None
         )
 
-        return LineResult(cfg.base_vx, vy, wz, cfg.base_spd,
-                          True, lateral_error, heading_error, overlay)
+        return LineResult(vx_out, vy, wz, cfg.base_spd,
+                          True, lateral_error, heading_error, overlay,
+                          tof_blocked=False, front_dist_mm=front_dist)
 
     # ── Overlay renderer ──────────────────────────────────────────────────────
 
