@@ -120,7 +120,7 @@ class RobotDiagnostics:
                 response += self.serial.readline().decode('utf-8', errors='ignore')
                 
             return response.strip()
-        except:
+        except (serial.SerialException, OSError, UnicodeDecodeError):
             return ""
             
     def add_result(self, name: str, status: TestStatus, message: str, details: str = None):
