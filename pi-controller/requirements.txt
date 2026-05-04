@@ -1,0 +1,32 @@
+# K-Patrol Pi Controller - Production Runtime Dependencies
+# Target: Raspberry Pi 4 / Bookworm / Python 3.11
+#
+# Install:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# NOTE: picamera2 is provided by the system (apt: python3-picamera2)
+# and is not installable via pip on Pi OS. Use --system-site-packages
+# when creating the virtualenv if you need camera access.
+
+# Serial communication with ESP32 firmware
+pyserial==3.5
+
+# MQTT client for telemetry / commands
+paho-mqtt==1.6.1
+
+# Numerical / computer vision (line follower, ArUco, YOLO post-processing)
+numpy==1.26.4
+opencv-python==4.10.0.84
+
+# Object detection (optional - guarded by try/import in detection/*)
+# Pin a CPU-friendly version that works on Pi 4 / aarch64.
+ultralytics==8.2.103
+
+# Gamepad / joystick input (only used by kpatrol_gamepad.py)
+inputs==0.5
+
+# Stream-token verification on the MJPEG server (HS256, short-TTL JWTs).
+# Backend signs, Pi verifies. Required when STREAM_TOKEN_SECRET is set.
+PyJWT==2.9.0

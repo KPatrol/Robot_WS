@@ -1,0 +1,20 @@
+# K-Patrol Pi Controller - Development / Tools / Simulator Dependencies
+# Install on top of requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# These are NOT required for the on-robot runtime. They support:
+#   - tools/   : visualisation, marker generation, offline tests
+#   - sim/     : CARLA-based simulator integration
+#   - detection/eval_models.py : offline model evaluation
+
+-r requirements.txt
+
+# Plotting / visualisation (tools/simulator_viz.py, eval scripts)
+matplotlib==3.8.4
+
+# Image generation (tools/generate_markers.py)
+Pillow==10.3.0
+
+# CARLA simulator client (only required when running sim/* on a workstation
+# with a matching CARLA server; install manually if needed):
+# carla==0.9.15
