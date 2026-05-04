@@ -52,6 +52,11 @@
  *     GPIO 42 → GPS RX  - ESP32 TX (UBX out, optional)
  *     5V/GND → NEO-6M VCC/GND
  *
+ *   Battery Monitoring (V10.2):
+ *     GPIO 3  → Battery divider tap (ADC1_CH2, 11dB attenuation)
+ *               Vbat → 100kΩ → GPIO 3 → 22kΩ → GND
+ *               Emits BAT:<pct>,<pack_mv> at 1Hz
+ *
  * PWM Configuration:
  *   - Frequency: 5000 Hz (5 kHz)
  *   - Resolution: 8-bit (0-255)
@@ -87,6 +92,10 @@
  *   IMU (BNO08x):
  *     IMU       : Read current IMU orientation (YAW, PITCH, ROLL)
  *     IMU_CAL   : Start magnetometer calibration
+ *
+ *   Battery (V10.2):
+ *     BAT       : One-shot BAT:<pct>,<pack_mv> line (also emitted at 1Hz)
+ *     BAT_FULL  : Human-readable battery diagnostic
  *
  *   Speed & System:
  *     SPD:xxx           : Set speed (0-255)
@@ -238,6 +247,31 @@ void IRAM_ATTR estopISR();
 #define ESTOP_DEBOUNCE_MS           30   // ignore re-triggers within this window
 
 // ============================================================================
+// BATTERY VOLTAGE MONITORING (V10.2)
+// 3S LiPo (12V nominal, 12.6V full, ~9.9V empty) is read through a resistor
+// divider into ADC1_CH2 (GPIO 3). The pin is left free in the V10.1 pinout —
+// confirmed against motor / IMU / GPS / safety allocations above.
+//
+// Wiring (recommended values keep ADC input ≤3.3V and divider current <0.4 mA):
+//   BATTERY_VBAT ─── R_TOP (100kΩ) ─┬── BATTERY_PIN
+//                                   │
+//                                   R_BOT (22kΩ)
+//                                   │
+//   GND ────────────────────────────┘
+// Vadc = Vbat × R_BOT / (R_TOP + R_BOT) ≈ Vbat × 0.1803
+//   12.6V → 2.27V (within ADC FS @ 11dB attenuation)
+//    9.9V → 1.78V
+// ============================================================================
+#define BATTERY_PIN              3       // GPIO 3 — ESP32-S3 ADC1_CH2
+#define BATTERY_R_TOP_OHM        100000  // top resistor (battery+ → ADC pin)
+#define BATTERY_R_BOT_OHM        22000   // bottom resistor (ADC pin → GND)
+#define BATTERY_CELLS            3       // 3S LiPo / Li-ion pack
+#define BATTERY_EMA_ALPHA_NUM    1       // exponential moving avg numerator
+#define BATTERY_EMA_ALPHA_DEN    8       // EMA denom — α = 1/8 → ~5s settle @1Hz
+#define BATTERY_EMIT_INTERVAL_MS 1000UL  // BAT line cadence — ~1Hz, well under
+                                         // the IMU rate so it never drowns UART
+
+// ============================================================================
 // MOTOR DIRECTION INVERSION
 // Set to true to invert motor direction if wired backward
 // ============================================================================
@@ -303,6 +337,16 @@ bool imuInitialized = false;
 float imuYaw = 0, imuPitch = 0, imuRoll = 0;
 float imuAccuracy = 0;
 unsigned long lastIMUUpdate = 0;
+
+// ============================================================================
+// BATTERY MONITORING GLOBAL STATE
+// batteryFilteredMv is the EMA-smoothed pack voltage in millivolts so we can
+// report sub-volt resolution without dragging in floats inside the ISR-light
+// fast path. lastBatteryEmitMs gates the 1Hz BAT:<pct>,<mv> Serial line.
+// ============================================================================
+uint32_t batteryFilteredMv = 0;        // 0 = "no sample yet"
+uint32_t lastBatteryEmitMs = 0;
+bool     batteryAdcReady   = false;
 
 // ============================================================================
 // GPS NEO-6M GLOBAL STATE
@@ -442,6 +486,19 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), estopISR, FALLING);
   Serial.printf("✓ Buzzer GPIO%d, Remote-relay GPIO%d, E-Stop GPIO%d (FALLING ISR)\n",
                 BUZZER_PIN, REMOTE_RELAY_PIN, ESTOP_PIN);
+
+  // ===== BATTERY ADC SETUP (V10.2) =====
+  // 11dB attenuation maps the divider's 0-2.3V into the ADC's full-scale
+  // range. analogReadMilliVolts() then applies eFuse calibration so we get
+  // reasonable absolute mV out of the box.
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
+  batteryAdcReady = true;
+  // Prime the EMA so the first BAT line is meaningful instead of 0%.
+  for (int i = 0; i < 4; ++i) updateBattery();
+  Serial.printf("✓ Battery ADC GPIO%d (R_top=%dΩ, R_bot=%dΩ, %d cells)\n",
+                BATTERY_PIN, BATTERY_R_TOP_OHM, BATTERY_R_BOT_OHM,
+                BATTERY_CELLS);
   
   // ===== BNO08x IMU SETUP (UART Mode) =====
   Serial.println("\nInitializing BNO08x IMU...");
@@ -1001,6 +1058,107 @@ float getHeading() {
 }
 
 // ============================================================================
+// BATTERY VOLTAGE MONITORING (V10.2)
+// Uses analogReadMilliVolts() which applies the per-chip eFuse ADC calibration
+// table, so we get reasonable absolute mV without per-board tuning. EMA filter
+// suppresses motor-current ripple (PWM commutation injects mV-level noise on
+// the divider node).
+// ============================================================================
+
+// Convert measured cell voltage (mV) to a state-of-charge percent. Linear
+// interpolation across a small piecewise table that matches a lightly loaded
+// LiPo discharge curve — accurate enough for "low / critical" alerting.
+static int batteryCellMvToPct(uint32_t cellMv) {
+  // Anchor points: { mV per cell, % SoC }. Sorted from full → empty.
+  static const struct { uint16_t mv; uint8_t pct; } CURVE[] = {
+    { 4200, 100 },
+    { 4100,  90 },
+    { 4000,  80 },
+    { 3900,  70 },
+    { 3800,  55 },
+    { 3700,  40 },
+    { 3600,  25 },
+    { 3500,  15 },
+    { 3400,   8 },
+    { 3300,   0 },
+  };
+  if (cellMv >= CURVE[0].mv)                        return 100;
+  if (cellMv <= CURVE[sizeof(CURVE)/sizeof(CURVE[0]) - 1].mv) return 0;
+  for (size_t i = 1; i < sizeof(CURVE) / sizeof(CURVE[0]); ++i) {
+    if (cellMv >= CURVE[i].mv) {
+      // Linear lerp between CURVE[i-1] (higher mV) and CURVE[i] (lower mV).
+      uint32_t hi_mv  = CURVE[i - 1].mv;
+      uint32_t lo_mv  = CURVE[i].mv;
+      uint32_t hi_pct = CURVE[i - 1].pct;
+      uint32_t lo_pct = CURVE[i].pct;
+      uint32_t span_mv  = hi_mv  - lo_mv;
+      uint32_t span_pct = hi_pct - lo_pct;
+      uint32_t off_mv   = cellMv - lo_mv;
+      return (int)(lo_pct + (off_mv * span_pct) / span_mv);
+    }
+  }
+  return 0;
+}
+
+// Sample the divider one-shot and feed the EMA filter. Returns true if a fresh
+// sample was incorporated; false if the ADC isn't ready (e.g. before setup()).
+static bool updateBattery() {
+  if (!batteryAdcReady) return false;
+  // analogReadMilliVolts is calibrated; no manual ADC ref math needed.
+  uint32_t adc_mv = (uint32_t)analogReadMilliVolts(BATTERY_PIN);
+  // Reverse the divider to get the pack voltage at the battery+ terminal.
+  // pack_mv = adc_mv * (R_TOP + R_BOT) / R_BOT
+  uint32_t pack_mv = (adc_mv * (BATTERY_R_TOP_OHM + BATTERY_R_BOT_OHM))
+                     / BATTERY_R_BOT_OHM;
+  if (batteryFilteredMv == 0) {
+    batteryFilteredMv = pack_mv;  // seed: avoid a multi-second ramp on boot
+  } else {
+    // EMA: filtered = (1-α)·filtered + α·pack_mv, integer math.
+    batteryFilteredMv = ((BATTERY_EMA_ALPHA_DEN - BATTERY_EMA_ALPHA_NUM)
+                            * batteryFilteredMv
+                         + BATTERY_EMA_ALPHA_NUM * pack_mv)
+                        / BATTERY_EMA_ALPHA_DEN;
+  }
+  return true;
+}
+
+// Print compact battery line for Pi parsing.
+// Format: BAT:<pct>,<pack_mv>   (matches kpatrol_mqtt_v5._parse_battery_line)
+void printBatteryCompact() {
+  if (!batteryAdcReady || batteryFilteredMv == 0) {
+    Serial.println("BAT:ERROR");
+    return;
+  }
+  uint32_t cell_mv = batteryFilteredMv / BATTERY_CELLS;
+  int pct = batteryCellMvToPct(cell_mv);
+  Serial.printf("BAT:%d,%lu\n", pct, (unsigned long)batteryFilteredMv);
+}
+
+// Human-readable diagnostic dump (BAT_FULL command).
+void printBattery() {
+  Serial.println("\n=== Battery ===");
+  if (!batteryAdcReady) {
+    Serial.println("ADC not initialized");
+    Serial.println("===============\n");
+    return;
+  }
+  if (batteryFilteredMv == 0) {
+    Serial.println("No sample yet");
+    Serial.println("===============\n");
+    return;
+  }
+  uint32_t cell_mv = batteryFilteredMv / BATTERY_CELLS;
+  int pct = batteryCellMvToPct(cell_mv);
+  Serial.printf("  Pack:  %lu mV  (%.2f V)\n",
+                (unsigned long)batteryFilteredMv,
+                batteryFilteredMv / 1000.0f);
+  Serial.printf("  Cell:  %lu mV  (%d cells)\n",
+                (unsigned long)cell_mv, BATTERY_CELLS);
+  Serial.printf("  SoC:   %d%%\n", pct);
+  Serial.println("===============\n");
+}
+
+// ============================================================================
 // HELP MENU
 // ============================================================================
 void printHelp() {
@@ -1034,6 +1192,11 @@ void printHelp() {
   Serial.println("  IMU (BNO08x):");
   Serial.println("    IMU      : Compact format (IMU:yaw,pitch,roll,accuracy)");
   Serial.println("    IMU_FULL : Human readable format");
+  Serial.println("");
+  Serial.println("  Battery:");
+  Serial.println("    BAT      : Compact format (BAT:<pct>,<pack_mv>)");
+  Serial.println("    BAT_FULL : Human readable diagnostic");
+  Serial.println("               (BAT:<pct>,<pack_mv> auto-emitted at 1Hz)");
   Serial.println("");
   Serial.println("  Speed Control:");
   Serial.println("    SPD:xxx          : Set speed (0-255), e.g. SPD:150");
@@ -1413,6 +1576,16 @@ void loop() {
     else if (command == "IMU_FULL") {
       printIMU();  // Human readable format
     }
+
+    // Battery telemetry
+    else if (command == "BAT") {
+      updateBattery();
+      printBatteryCompact();   // BAT:<pct>,<pack_mv>
+    }
+    else if (command == "BAT_FULL") {
+      updateBattery();
+      printBattery();          // human readable diagnostic
+    }
     
     // Speed control
     else if (command.startsWith("SPD:")) {
@@ -1654,6 +1827,17 @@ void loop() {
     watchdogTriggered = true;
     Serial.print("WDT:STOP timeout_ms=");
     Serial.println(millis() - lastCommandTime);
+  }
+
+  // Battery: sample fast (every loop) into the EMA, but only emit on the
+  // BAT_EMIT_INTERVAL_MS cadence so we don't drown the 115200-baud UART.
+  // Runs after the command parser so a manual `BAT` reply is not duplicated
+  // by the periodic line in the same iteration.
+  updateBattery();
+  if (batteryAdcReady &&
+      (millis() - lastBatteryEmitMs) >= BATTERY_EMIT_INTERVAL_MS) {
+    lastBatteryEmitMs = millis();
+    printBatteryCompact();
   }
 
   // OTA: service ArduinoOTA pump when enabled. Safe no-op when WiFi down.
