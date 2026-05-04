@@ -7,15 +7,18 @@ Edge-AI person + fire detection running on Raspberry Pi 4 Model B.
 - YOLOv8n (ultralytics) for person detection (COCO class 0).
 - Lightweight fire/smoke detector via HSV color segmentation + motion heuristic
   (cheaper than a fire-trained YOLO model and runs in realtime on Pi).
-- Publishes events to MQTT topic `kpatrol/{serial}/alert` and saves snapshots
-  under ./snapshots/{ts}.jpg.
+- Emits events via the on_event callback (typically AlertBridge.publish, which
+  persists to SQLite then forwards to MQTT topic `kpatrol/{serial}/alert`).
+- Saves annotated snapshots under ./snapshots/{ts}_{kind}.jpg with a rolling
+  buffer (snapshot_max_keep). Inline base64-encoded thumbnails are also
+  embedded in the event payload for fast preview on subscribers.
 
 Designed to run as a sidecar process to the main controller. Imports are lazy
 so the module can be imported on a dev laptop without cv2/ultralytics.
 
 Usage:
-    detector = AnomalyDetector(config)
-    detector.start()   # blocking loop
+    detector = AnomalyDetector(config, on_event=bridge.publish)
+    detector.start(blocking=True)
 """
 
 from __future__ import annotations
@@ -230,18 +233,42 @@ class AnomalyDetector:
             log.error("[detector] no cv2, capture loop cannot start")
             return
 
-        cap = cv2.VideoCapture(self.config.camera_index)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
-        cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+        def _open():
+            cap = cv2.VideoCapture(self.config.camera_index)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
+            cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+            return cap
 
+        cap = _open()
         interval = 1.0 / max(1, self.config.fps)
+        # If the USB camera unplugs or the driver returns errors for too long,
+        # re-open the device rather than burning CPU on a dead handle.
+        consecutive_failures = 0
+        failure_threshold = max(self.config.fps, 10)  # ~1s of bad reads
+
         while self._running:
             start = time.perf_counter()
-            ok, frame = cap.read()
-            if not ok:
+            try:
+                ok, frame = cap.read()
+            except Exception as exc:
+                log.warning("[detector] capture read raised: %s", exc)
+                ok, frame = False, None
+
+            if not ok or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures >= failure_threshold:
+                    log.warning("[detector] camera unresponsive — reopening")
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    cap = _open()
+                    consecutive_failures = 0
                 time.sleep(0.1)
                 continue
+            consecutive_failures = 0
+
             # drop oldest if queue full — always keep most recent
             if self._frame_queue.full():
                 try:
@@ -252,7 +279,10 @@ class AnomalyDetector:
             elapsed = time.perf_counter() - start
             time.sleep(max(0.0, interval - elapsed))
 
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Inference loop
@@ -265,51 +295,59 @@ class AnomalyDetector:
             except Empty:
                 continue
 
-            h, w = frame.shape[:2]
-            now = time.time()
+            # Guard the entire per-frame pipeline so a single bad frame or
+            # transient error in any sub-step never silently kills the thread.
+            try:
+                self._process_frame(frame)
+            except Exception as exc:
+                log.exception("[detector] inference iteration failed: %s", exc)
 
-            # Collect raw hits per class for this frame; the smoother decides
-            # if any of them actually fire after N-of-M consensus.
-            raw: dict[str, float] = {}
+    def _process_frame(self, frame) -> None:
+        h, w = frame.shape[:2]
+        now = time.time()
 
-            if self.config.person_enabled and self._ensure_yolo():
-                best_conf = 0.0
-                best_bbox: Optional[tuple] = None
-                for bbox, conf in self._detect_persons(frame):
-                    x, y, bw, bh = bbox
-                    area_ratio = (bw * bh) / (w * h)
-                    if area_ratio < self.config.person_min_area_ratio:
-                        continue
-                    if conf > best_conf:
-                        best_conf = float(conf)
-                        best_bbox = bbox
-                if best_bbox is not None:
-                    raw["person"] = best_conf
-                    self._last_bbox["person"] = best_bbox
+        # Collect raw hits per class for this frame; the smoother decides
+        # if any of them actually fire after N-of-M consensus.
+        raw: dict[str, float] = {}
 
-            if self.config.fire_enabled:
-                bbox, ratio = self._detect_fire(frame)
-                if bbox is not None and ratio >= self.config.fire_min_area_ratio:
-                    raw["fire"] = float(ratio)
-                    self._last_bbox["fire"] = bbox
-
-            stable = self._smoother.update(raw)
-            for kind, conf in stable.items():
-                # Per-kind cooldown still applies on top of smoothing.
-                last_ts = self._last_person_ts if kind == "person" else self._last_fire_ts
-                cooldown = (
-                    self.config.person_cooldown_sec
-                    if kind == "person"
-                    else self.config.fire_cooldown_sec
-                )
-                if now - last_ts < cooldown:
+        if self.config.person_enabled and self._ensure_yolo():
+            best_conf = 0.0
+            best_bbox: Optional[tuple] = None
+            for bbox, conf in self._detect_persons(frame):
+                x, y, bw, bh = bbox
+                area_ratio = (bw * bh) / (w * h)
+                if area_ratio < self.config.person_min_area_ratio:
                     continue
-                bbox = self._last_bbox.get(kind, (0, 0, 0, 0))
-                if kind == "person":
-                    self._last_person_ts = now
-                else:
-                    self._last_fire_ts = now
-                self._emit_event(kind, conf, bbox, frame, now)
+                if conf > best_conf:
+                    best_conf = float(conf)
+                    best_bbox = bbox
+            if best_bbox is not None:
+                raw["person"] = best_conf
+                self._last_bbox["person"] = best_bbox
+
+        if self.config.fire_enabled:
+            bbox, ratio = self._detect_fire(frame)
+            if bbox is not None and ratio >= self.config.fire_min_area_ratio:
+                raw["fire"] = float(ratio)
+                self._last_bbox["fire"] = bbox
+
+        stable = self._smoother.update(raw)
+        for kind, conf in stable.items():
+            # Per-kind cooldown still applies on top of smoothing.
+            last_ts = self._last_person_ts if kind == "person" else self._last_fire_ts
+            cooldown = (
+                self.config.person_cooldown_sec
+                if kind == "person"
+                else self.config.fire_cooldown_sec
+            )
+            if now - last_ts < cooldown:
+                continue
+            bbox = self._last_bbox.get(kind, (0, 0, 0, 0))
+            if kind == "person":
+                self._last_person_ts = now
+            else:
+                self._last_fire_ts = now
+            self._emit_event(kind, conf, bbox, frame, now)
 
     # ------------------------------------------------------------------
     # Detection primitives
