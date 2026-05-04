@@ -10,8 +10,6 @@ soft-pause window, and EMERGENCY hard-stop.
 
 from __future__ import annotations
 
-import tempfile
-import time
 import unittest
 from unittest import mock
 
@@ -30,7 +28,7 @@ class _Clock:
 
 
 def _make_nav() -> NavController:
-    return NavController(script_dir=tempfile.mkdtemp(prefix="kpatrol_nav_"))
+    return NavController()
 
 
 class FireAlert(unittest.TestCase):
@@ -73,19 +71,19 @@ class PersonAlert(unittest.TestCase):
         from . import nav_controller as nc_mod
         with mock.patch.object(nc_mod.time, "monotonic", clock):
             nav = _make_nav()
-            self.assertTrue(nav.set_mode("FREE_COVERAGE"))
+            self.assertTrue(nav.set_mode("AUTO_FREE_COVERAGE"))
             r = nav.on_alert("person", confidence=0.7)
             self.assertEqual(r["action"], "pause")
             self.assertEqual(r["duration_s"], 5.0)
             # Pause window armed but mode preserved.
-            self.assertEqual(nav.get_mode(), Mode.FREE_COVERAGE.value)
+            self.assertEqual(nav.get_mode(), Mode.AUTO_FREE_COVERAGE.value)
 
     def test_person_cooldown_blocks_repeats(self):
         clock = _Clock(3000.0)
         from . import nav_controller as nc_mod
         with mock.patch.object(nc_mod.time, "monotonic", clock):
             nav = _make_nav()
-            nav.set_mode("FREE_COVERAGE")
+            nav.set_mode("AUTO_FREE_COVERAGE")
             r1 = nav.on_alert("person", confidence=0.7)
             self.assertEqual(r1["action"], "pause")
             clock.advance(3.0)
@@ -109,6 +107,74 @@ class LastAlertSnapshot(unittest.TestCase):
         self.assertEqual(snap["kind"], "person")
         self.assertAlmostEqual(snap["confidence"], 0.66, places=4)
         self.assertEqual(snap["bbox"], (10, 20, 30, 40))
+
+
+class ModeTransitions(unittest.TestCase):
+    """Mode FSM rules — guard against accidental loosening of transitions."""
+
+    def test_invalid_mode_string_rejected(self):
+        nav = _make_nav()
+        self.assertFalse(nav.set_mode("LUDICROUS_SPEED"))
+        # Mode must remain at its previous value.
+        self.assertEqual(nav.get_mode(), Mode.MANUAL.value)
+
+    def test_speed_clamped_to_0_100(self):
+        nav = _make_nav()
+        nav.set_speed(200)
+        self.assertEqual(nav.diagnostics()["speed"], 100)
+        nav.set_speed(-50)
+        self.assertEqual(nav.diagnostics()["speed"], 0)
+
+    def test_cannot_start_line_follow_from_emergency(self):
+        nav = _make_nav()
+        nav.trigger_emergency("test")
+        r = nav.auto_line_follow_start()
+        self.assertFalse(r["ok"])
+        self.assertIn("EMERGENCY", r["error"])
+
+    def test_clear_emergency_returns_to_manual(self):
+        nav = _make_nav()
+        nav.trigger_emergency("operator")
+        self.assertEqual(nav.get_mode(), Mode.EMERGENCY.value)
+        nav.clear_emergency()
+        self.assertEqual(nav.get_mode(), Mode.MANUAL.value)
+
+    def test_estop_clears_pending_pause_window(self):
+        clock = _Clock(5000.0)
+        from . import nav_controller as nc_mod
+        with mock.patch.object(nc_mod.time, "monotonic", clock):
+            nav = _make_nav()
+            nav.set_mode("AUTO_FREE_COVERAGE")
+            nav.on_alert("person", confidence=0.7)
+            # Pause is armed.
+            self.assertGreater(nav.diagnostics()["alert_pause_remaining_s"], 0)
+            # Operator hits e-stop while pause is still pending.
+            nav.trigger_emergency("button")
+            self.assertEqual(nav.get_mode(), Mode.EMERGENCY.value)
+            self.assertEqual(nav.diagnostics()["alert_pause_remaining_s"], 0.0)
+
+
+class Diagnostics(unittest.TestCase):
+    def test_diagnostics_reports_active_cooldown(self):
+        clock = _Clock(7000.0)
+        from . import nav_controller as nc_mod
+        with mock.patch.object(nc_mod.time, "monotonic", clock):
+            nav = _make_nav()
+            nav.on_alert("fire", confidence=0.9)
+            clock.advance(1.0)
+            diag = nav.diagnostics()
+            self.assertIn("fire", diag["alert_cooldowns_s"])
+            self.assertAlmostEqual(diag["alert_cooldowns_s"]["fire"], 4.0, delta=0.1)
+
+    def test_diagnostics_drops_expired_cooldown(self):
+        clock = _Clock(8000.0)
+        from . import nav_controller as nc_mod
+        with mock.patch.object(nc_mod.time, "monotonic", clock):
+            nav = _make_nav()
+            nav.on_alert("fire", confidence=0.9)
+            clock.advance(10.0)  # well past 5s fire cooldown
+            diag = nav.diagnostics()
+            self.assertNotIn("fire", diag["alert_cooldowns_s"])
 
 
 if __name__ == "__main__":
