@@ -53,14 +53,25 @@ class EncoderData:
 
 @dataclass
 class ToFData:
-    """ToF sensor readings (distance in mm)"""
+    """ToF sensor readings (distance in mm).
+
+    valid_mask is a 6-bit bitfield from firmware indicating which lanes
+    produced a fresh, status==0 reading on this frame
+    (bit0=FRONT, bit1=FL, bit2=FR, bit3=LEFT, bit4=RIGHT, bit5=BACK).
+    Lanes whose bit is 0 should be treated as "unknown" by the consumer
+    rather than "no obstacle" — distance for those lanes is 9999 sentinel.
+    """
     front: int = 9999
     front_left: int = 9999
     front_right: int = 9999
     left: int = 9999
     right: int = 9999
     back: int = 9999
+    valid_mask: int = 0x3F
     timestamp: float = 0.0
+
+    def is_valid(self, lane_index: int) -> bool:
+        return bool(self.valid_mask & (1 << lane_index))
 
 @dataclass
 class SafetyData:
@@ -122,6 +133,27 @@ class SensorReader:
         self.on_tof_update = None
         self.on_safety_update = None
         self.on_danger_detected = None
+        self.on_heartbeat = None  # (uptime_ms: int, tca_fail_count: int)
+
+        # Firmware heartbeat (ENC_HB:). last_heartbeat_ts == 0 means we
+        # haven't seen one yet — consumers should treat that as "not stale"
+        # for the first ~3 s after connect, then start checking staleness.
+        self.last_heartbeat_ts: float = 0.0
+        self.heartbeat_uptime_ms: int = 0
+        self.tca_fail_count: int = 0
+
+    HEARTBEAT_STALE_SEC = 3.0
+
+    def is_heartbeat_stale(self, now: Optional[float] = None) -> bool:
+        """True if firmware heartbeat hasn't arrived in HEARTBEAT_STALE_SEC.
+
+        Returns False before the first heartbeat is seen so a slow boot
+        doesn't get flagged as a hang.
+        """
+        if self.last_heartbeat_ts == 0.0:
+            return False
+        now = time.time() if now is None else now
+        return (now - self.last_heartbeat_ts) > self.HEARTBEAT_STALE_SEC
     
     def connect(self) -> bool:
         """Connect to ESP32 via serial"""
@@ -204,10 +236,13 @@ class SensorReader:
                         self.on_encoder_update(self.encoder)
                     return True
             
-            # ToF data: TOF:front,front_left,front_right,left,right,back
+            # ToF data: TOF:front,front_left,front_right,left,right,back[,valid_mask]
+            # valid_mask is the 7th field added in firmware v3.1; firmware
+            # < v3.1 omits it, so we default to "all six lanes valid" (0x3F).
             elif line.startswith('TOF:'):
                 values = line[4:].split(',')
                 if len(values) >= 6:
+                    valid_mask = int(values[6]) if len(values) >= 7 else 0x3F
                     self.tof = ToFData(
                         front=int(values[0]),
                         front_left=int(values[1]),
@@ -215,10 +250,24 @@ class SensorReader:
                         left=int(values[3]),
                         right=int(values[4]),
                         back=int(values[5]),
+                        valid_mask=valid_mask,
                         timestamp=timestamp
                     )
                     if self.on_tof_update:
                         self.on_tof_update(self.tof)
+                    return True
+
+            # Encoder heartbeat: ENC_HB:uptime_ms,tca_fail_count
+            # Emitted by firmware ~1 Hz; absence > 3s => firmware hang or
+            # USB disconnect (consumer should escalate to safe stop).
+            elif line.startswith('ENC_HB:'):
+                values = line[7:].split(',')
+                if len(values) >= 2:
+                    self.last_heartbeat_ts = timestamp
+                    self.heartbeat_uptime_ms = int(values[0])
+                    self.tca_fail_count = int(values[1])
+                    if self.on_heartbeat:
+                        self.on_heartbeat(self.heartbeat_uptime_ms, self.tca_fail_count)
                     return True
             
             # Safety data: SAFETY:zone,min_distance
