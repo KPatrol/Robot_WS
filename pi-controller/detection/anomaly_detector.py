@@ -53,38 +53,38 @@ class DetectionConfig:
     frame_height: int = 480
     fps: int = 10
 
-    # YOLO
+    # YOLO — V10 spec §5.5: 416×416 input for YOLOv8n int8
     yolo_model: str = "yolov8n.pt"
     yolo_confidence: float = 0.55
-    yolo_imgsz: int = 320  # smaller = faster on Pi
+    yolo_imgsz: int = 416
 
     # Person detection
     person_enabled: bool = True
-    person_cooldown_sec: float = 8.0     # min gap between person alerts
+    person_cooldown_sec: float = 8.0     # min gap between person alerts (>5s spec)
     person_min_area_ratio: float = 0.02  # bbox must cover >=2% of frame
 
-    # Fire detection (HSV-based)
+    # Fire detection (HSV-based) — V10 spec §5.5: ≥2% area, 3-frame consensus
     fire_enabled: bool = True
     fire_cooldown_sec: float = 5.0
-    fire_min_area_ratio: float = 0.015
+    fire_min_area_ratio: float = 0.02
     # HSV ranges for flame: low-red and high-red
     fire_hsv_low_red1: tuple = (0, 120, 180)
     fire_hsv_high_red1: tuple = (15, 255, 255)
     fire_hsv_low_red2: tuple = (160, 120, 180)
     fire_hsv_high_red2: tuple = (179, 255, 255)
 
-    # Snapshots
+    # Snapshots — V10 spec §5.5: JPEG quality 70, base64-encoded inline payload
     snapshot_dir: str = "snapshots"
-    snapshot_jpeg_quality: int = 85
+    snapshot_jpeg_quality: int = 70
     snapshot_max_keep: int = 500  # rolling buffer
 
     # Inline snapshot (base64-encoded JPEG embedded in MQTT alert payload).
     # Frame is resized so the longest side ≤ snapshot_b64_max_dim and re-
-    # encoded at snapshot_b64_jpeg_quality. With 320×240 @ q60 a typical
-    # JPEG is ~15–30 KB, ~25–40 KB after base64 — well under the EMQX
+    # encoded at snapshot_b64_jpeg_quality. With 320×240 @ q70 a typical
+    # JPEG is ~20–35 KB, ~30–45 KB after base64 — well under the EMQX
     # 256 KB default limit. Set max_dim=0 to disable inline snapshots.
     snapshot_b64_max_dim: int = 320
-    snapshot_b64_jpeg_quality: int = 60
+    snapshot_b64_jpeg_quality: int = 70
 
     # MQTT topic (prefix only, serial appended at runtime)
     mqtt_topic_prefix: str = "kpatrol"
@@ -92,8 +92,10 @@ class DetectionConfig:
 
     # Temporal smoothing (N-of-M consensus before emitting an event).
     # Suppresses single-frame flickers from YOLO/HSV noise.
+    # V10 spec §5.5: fire requires 3 consecutive frames, person requires 2.
     smoothing_window: int = 5
-    smoothing_required: int = 3
+    fire_smoothing_required: int = 3
+    person_smoothing_required: int = 2
 
     # Runtime
     dry_run: bool = False  # no camera, synthesize events (dev mode)
@@ -179,7 +181,10 @@ class AnomalyDetector:
 
         self._smoother = TemporalSmoother(
             window=self.config.smoothing_window,
-            required=self.config.smoothing_required,
+            required={
+                "fire": self.config.fire_smoothing_required,
+                "person": self.config.person_smoothing_required,
+            },
             class_kinds=("person", "fire"),
         )
         # Hold the most recent raw bbox per kind so that when the smoother
