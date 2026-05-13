@@ -77,13 +77,31 @@ class CoverageConfig:
     # ── Forward / emergency behavior ─────────────────────────────────
     base_vx:          int   = 70    # forward speed (0–127)
     base_spd:         int   = 80    # absolute ESP32 speed (0–255)
-    turn_trigger_mm:  int   = 500   # start turn when front ≤ this
-    emergency_mm:     int   = 200   # immediate reverse
+    turn_trigger_mm:  int   = 500   # start turn when front ≤ this (low-speed baseline)
+    emergency_mm:     int   = 220   # immediate reverse threshold (low-speed baseline)
     turn_speed:       int   = 60    # wz magnitude during rotation
     turn_min_deg:     float = 70.0
     turn_max_deg:     float = 160.0
     deg_per_sec:      float = 90.0  # approx rotation rate at turn_speed
     back_duration_s:  float = 0.40
+
+    # ── Speed-aware safety scaling ──────────────────────────────────
+    # ToF callbacks land at ~5–10 Hz per sensor; at high vx the robot can
+    # cover 100+ mm between samples, so we widen the emergency / turn
+    # zones proportionally to base_vx. Linearly interpolated between
+    # safety_scale_speed_ref (no extra) and 127 (full extra).
+    safety_scale_speed_ref:    int = 60
+    safety_emergency_extra_mm: int = 220
+    safety_turn_extra_mm:      int = 250
+
+    # ── ToF staleness gate ───────────────────────────────────────────
+    # When the freshest ToF timestamp is older than tof_stale_ms, treat
+    # the readings as unreliable: throttle forward speed and tighten the
+    # emergency threshold so a pending obstacle doesn't get hit while we
+    # wait for the next sample. Disabled when tof_timestamp_ms is None.
+    tof_stale_ms:        int   = 280
+    tof_stale_throttle:  float = 0.45
+    tof_stale_margin_mm: int   = 150
 
     # ── Wall-follow PD ───────────────────────────────────────────────
     wall_follow_enabled:  bool  = True
@@ -182,23 +200,53 @@ class FreeCoverage:
         right_mm: int,
         pose: Any = None,                       # Optional[Pose] from odometry
         all_tofs: Optional[dict] = None,        # Optional 6-ToF dict for richer ray casts
+        tof_timestamp_ms: Optional[float] = None,  # ms since epoch of latest ToF sample
     ) -> CoverageResult:
         cfg = self.cfg
         now = time.monotonic()
+
+        # ── Effective thresholds: speed-aware + stale-ToF aware ───────
+        # tof_timestamp_ms can also ride inside all_tofs["timestamp"] so the
+        # caller can pass safety_controller.tof_data.to_float_dict() directly.
+        if tof_timestamp_ms is None and all_tofs is not None:
+            ts = all_tofs.get("timestamp")
+            if isinstance(ts, (int, float)) and ts > 0:
+                tof_timestamp_ms = float(ts)
+
+        ref      = cfg.safety_scale_speed_ref
+        span     = max(1.0, 127.0 - ref)
+        sf       = max(0.0, min(1.0, (cfg.base_vx - ref) / span))
+        eff_emergency_mm    = cfg.emergency_mm    + int(cfg.safety_emergency_extra_mm * sf)
+        eff_turn_trigger_mm = cfg.turn_trigger_mm + int(cfg.safety_turn_extra_mm      * sf)
+        eff_base_vx         = cfg.base_vx
+
+        tof_stale = False
+        if tof_timestamp_ms is not None and tof_timestamp_ms > 0:
+            age_ms = (time.time() * 1000.0) - tof_timestamp_ms
+            if age_ms > cfg.tof_stale_ms:
+                tof_stale = True
+                eff_emergency_mm += cfg.tof_stale_margin_mm
+                eff_base_vx       = max(0, int(eff_base_vx * cfg.tof_stale_throttle))
+
+        # Cache for diagnostics + _frontier_tick.
+        self._eff_emergency_mm    = eff_emergency_mm
+        self._eff_turn_trigger_mm = eff_turn_trigger_mm
+        self._eff_base_vx         = eff_base_vx
+        self._tof_stale_flag      = tof_stale
 
         # ── Map update ─────────────────────────────────────────────────
         if pose is not None and self._grid is not None:
             self._update_map(pose, front_mm, left_mm, right_mm, all_tofs, now)
 
         # ── Emergency reverse takes priority over everything ──────────
-        if front_mm <= cfg.emergency_mm and self._state != _State.BACK:
+        if front_mm <= eff_emergency_mm and self._state != _State.BACK:
             self._state       = _State.BACK
             self._state_until = now + cfg.back_duration_s
             self._frontier_target = None
 
         if self._state == _State.BACK:
             if now < self._state_until:
-                return CoverageResult(-cfg.base_vx, 0, 0, cfg.base_spd, "BACK")
+                return CoverageResult(-eff_base_vx, 0, 0, cfg.base_spd, "BACK")
             self._begin_turn(left_mm, right_mm, now)
 
         if self._state == _State.TURNING:
@@ -226,15 +274,15 @@ class FreeCoverage:
                     return self._frontier_tick(front_mm, left_mm, right_mm, pose, now)
 
         # ── Forward: front blocked → turn ──────────────────────────────
-        if front_mm <= cfg.turn_trigger_mm:
+        if front_mm <= eff_turn_trigger_mm:
             self._begin_turn(left_mm, right_mm, now)
             return CoverageResult(0, 0, self._turn_wz, cfg.base_spd, "TURNING")
 
         # ── Wall-follow takes priority over open-space straight-line ──
         if cfg.wall_follow_enabled and right_mm < cfg.wall_lost_mm:
-            return self._wall_follow_tick(right_mm)
+            return self._wall_follow_tick(right_mm, eff_base_vx)
 
-        return CoverageResult(cfg.base_vx, 0, 0, cfg.base_spd, "FORWARD")
+        return CoverageResult(eff_base_vx, 0, 0, cfg.base_spd, "FORWARD")
 
     def reset(self) -> None:
         self._state              = _State.FORWARD
@@ -248,6 +296,10 @@ class FreeCoverage:
         out: dict = {
             "state":            self._state.value,
             "frontier_target":  list(self._frontier_target) if self._frontier_target else None,
+            "eff_emergency_mm":    getattr(self, "_eff_emergency_mm",    self.cfg.emergency_mm),
+            "eff_turn_trigger_mm": getattr(self, "_eff_turn_trigger_mm", self.cfg.turn_trigger_mm),
+            "eff_base_vx":         getattr(self, "_eff_base_vx",         self.cfg.base_vx),
+            "tof_stale":           bool(getattr(self, "_tof_stale_flag", False)),
         }
         if self._grid is not None:
             out["map"] = self._grid.diagnostics()
@@ -259,8 +311,9 @@ class FreeCoverage:
 
     # ── Wall-follow PD ────────────────────────────────────────────────
 
-    def _wall_follow_tick(self, right_mm: int) -> CoverageResult:
+    def _wall_follow_tick(self, right_mm: int, base_vx: Optional[int] = None) -> CoverageResult:
         cfg = self.cfg
+        vx_ref = cfg.base_vx if base_vx is None else base_vx
         # Error: + means wall is too far → drift right (negative vy / negative wz).
         err = right_mm - cfg.wall_target_mm
         if abs(err) < cfg.wall_deadband_mm:
@@ -268,7 +321,7 @@ class FreeCoverage:
         vy = -int(clamp(err * cfg.wall_kp_lateral, -cfg.wall_max_vy, cfg.wall_max_vy))
         wz = -int(clamp(err * cfg.wall_kp_yaw,     -cfg.wall_max_wz, cfg.wall_max_wz))
         # Slow down a bit when correcting hard so we don't overshoot.
-        vx = cfg.base_vx if abs(err) < cfg.wall_hard_err_mm else int(cfg.base_vx * cfg.wall_hard_throttle)
+        vx = vx_ref if abs(err) < cfg.wall_hard_err_mm else int(vx_ref * cfg.wall_hard_throttle)
         return CoverageResult(vx, vy, wz, cfg.base_spd, "WALL_FOLLOW")
 
     # ── Frontier seek ─────────────────────────────────────────────────
@@ -282,6 +335,9 @@ class FreeCoverage:
         now:      float,
     ) -> CoverageResult:
         cfg = self.cfg
+        eff_emergency_mm    = getattr(self, "_eff_emergency_mm",    cfg.emergency_mm)
+        eff_turn_trigger_mm = getattr(self, "_eff_turn_trigger_mm", cfg.turn_trigger_mm)
+        eff_base_vx         = getattr(self, "_eff_base_vx",         cfg.base_vx)
 
         # Abort conditions: timeout, no target, no pose, blocked.
         if (self._frontier_target is None
@@ -291,11 +347,11 @@ class FreeCoverage:
             self._state = _State.FORWARD
             return CoverageResult(0, 0, 0, cfg.base_spd, "FORWARD")
 
-        if front_mm <= cfg.emergency_mm:
+        if front_mm <= eff_emergency_mm:
             self._frontier_target = None
             self._state       = _State.BACK
             self._state_until = now + cfg.back_duration_s
-            return CoverageResult(-cfg.base_vx, 0, 0, cfg.base_spd, "BACK")
+            return CoverageResult(-eff_base_vx, 0, 0, cfg.base_spd, "BACK")
 
         fx, fy = self._frontier_target
         dx, dy = fx - pose.x, fy - pose.y
@@ -303,7 +359,7 @@ class FreeCoverage:
         if dist < cfg.frontier_arrived_m:
             self._frontier_target = None
             self._state = _State.FORWARD
-            return CoverageResult(cfg.base_vx, 0, 0, cfg.base_spd, "FORWARD")
+            return CoverageResult(eff_base_vx, 0, 0, cfg.base_spd, "FORWARD")
 
         bearing     = math.atan2(dy, dx)
         heading_err = wrap_pi(bearing - pose.theta)
@@ -315,14 +371,14 @@ class FreeCoverage:
 
         # Heading aligned → drive forward with mild yaw correction. If
         # an obstacle pops up mid-seek, abandon target and turn away.
-        if front_mm <= cfg.turn_trigger_mm:
+        if front_mm <= eff_turn_trigger_mm:
             self._frontier_target = None
             self._begin_turn(left_mm, right_mm, now)
             return CoverageResult(0, 0, self._turn_wz, cfg.base_spd, "TURNING")
 
         wz = int(clamp(math.degrees(heading_err) * cfg.frontier_kp_yaw,
                        -cfg.wall_max_wz, cfg.wall_max_wz))
-        return CoverageResult(cfg.base_vx, 0, wz, cfg.base_spd, "FRONTIER_SEEK")
+        return CoverageResult(eff_base_vx, 0, wz, cfg.base_spd, "FRONTIER_SEEK")
 
     def _is_local_saturated(self, pose: Any) -> bool:
         """True when most cells within frontier_local_radius_m have been
