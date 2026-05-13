@@ -39,7 +39,7 @@ import sys
 import os
 import re
 import threading
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Callable, ClassVar
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 
@@ -63,6 +63,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from navigation import (
     NavController, Mode, LineFollowerConfig, HSVRange, CoverageConfig,
     Odometry, VelocityController, VelocityPIDConfig,
+    open_camera,
 )
 
 # Optional OpenCV — required for LINE_FOLLOW mode
@@ -264,10 +265,13 @@ class SafetyZone(Enum):
 
 @dataclass
 class SafetyConfig:
+    # Always-on by default. Only togglable via MQTT safety_config topic.
+    # Thresholds tuned for max sensitivity: danger=350mm covers ~250mm worst-case
+    # latency travel (200ms loop at 1m/s) + ~100mm BTS7960 active-brake distance.
     enabled: bool = True
-    danger_distance: int = 300     # compensate for cheap sensor latency (~200ms)
-    caution_distance: int = 450    # slow down earlier for safe braking
-    slow_distance: int = 600
+    danger_distance: int = 350     # hard stop — covers latency + brake distance
+    caution_distance: int = 550    # heavy slowdown — early brake margin
+    slow_distance: int = 750       # gentle slowdown — earliest reaction
     speed_reduction_slow: float = 0.7
     speed_reduction_caution: float = 0.4
 
@@ -281,6 +285,8 @@ CMD_REQUIRED_DIRECTIONS: Dict[str, List[str]] = {
     'R':  ['forward'],
     'DL': ['forward', 'left'],
     'DR': ['forward', 'right'],
+    'BL': ['backward', 'left'],
+    'BR': ['backward', 'right'],
     'S':  [],
 }
 
@@ -294,33 +300,112 @@ class ToFData:
     right: int = 0
     back: int = 0
     timestamp: int = 0
+    # 6-bit mask from firmware v3.1+ telling us which lanes had a fresh,
+    # status==0 reading on this frame. 0x3F = all six lanes fresh; missing
+    # bit means firmware (or the I2C mux) couldn't read that sensor and the
+    # corresponding distance is the 9999 sentinel rather than a real value.
+    # Older firmware that doesn't emit field 7 keeps the default 0x3F so
+    # consumers see the legacy "trust all distances" behaviour.
+    valid_mask: int = 0x3F
+
+    # ESP firmware contract:
+    #   0     = pre-init / never written        → fail-safe (treated separately)
+    #   1     = "min-range fail" sentinel       → object is RIGHT in front of the
+    #                                             lens; preserve as DANGER trigger
+    #   9999  = out of range / sensor failure   → treat as "far"
+    # Real measurements arrive as median-of-3 distances in mm.
+    VALID_MAX_MM: int = 2000  # >2m considered "no obstacle" for safety purposes
+    # VL53L0X minimum reliable distance. Readings below this — except the
+    # explicit min-range sentinel v==1 — are treated as noise. With a
+    # partially-wired TCA9548A this prevents a single noisy lane (e.g.
+    # front_left=3mm while every other sensor reports 9999) from forcing
+    # the whole robot into DANGER and refusing manual control.
+    MIN_VALID_MM: int = 30
+
+    # bit index in firmware valid_mask, matching the field order in
+    # TOF:front,front_left,front_right,left,right,back,valid_mask
+    _MASK_BITS: ClassVar[Dict[str, int]] = {
+        "front": 0, "front_left": 1, "front_right": 2,
+        "left": 3, "right": 4, "back": 5,
+    }
 
     def to_dict(self) -> Dict:
         return {
             "front": self.front, "front_left": self.front_left,
             "front_right": self.front_right, "left": self.left,
             "right": self.right, "back": self.back,
+            "valid_mask": self.valid_mask,
             "timestamp": self.timestamp
         }
 
+    def _valid_or_far(self, v: int, mask_bit: int = -1) -> int:
+        """Return v if it's a real measurement; else 9999 (far).
+
+        Honours the firmware valid_mask: if the bit for this lane is clear,
+        the reading is rejected regardless of value (sensor on that mux
+        channel never reported status==0). Sub-MIN_VALID_MM readings other
+        than the explicit v==1 sentinel are treated as VL53L0X near-field
+        noise — common when a sensor is partially blocked or not properly
+        attached to the multiplexer. v == 1 is preserved so a blocked lens
+        still trips DANGER.
+        """
+        if mask_bit >= 0 and not (self.valid_mask & (1 << mask_bit)):
+            return 9999
+        if v <= 0 or v >= 9999:
+            return 9999
+        if v == 1:
+            return v
+        if v < self.MIN_VALID_MM:
+            return 9999
+        if v > self.VALID_MAX_MM:
+            return 9999
+        return v
+
     def get_min_distance(self) -> int:
-        return min(self.front, self.front_left, self.front_right,
-                   self.left, self.right, self.back) if self.front > 0 else 9999
+        # Pre-init guard: if no data has ever been written, force DANGER (0)
+        # so the safety controller refuses motion until the ESP confirms a reading.
+        if self.timestamp == 0:
+            return 0
+        vals = [
+            self._valid_or_far(self.front,        self._MASK_BITS["front"]),
+            self._valid_or_far(self.front_left,   self._MASK_BITS["front_left"]),
+            self._valid_or_far(self.front_right,  self._MASK_BITS["front_right"]),
+            self._valid_or_far(self.left,         self._MASK_BITS["left"]),
+            self._valid_or_far(self.right,        self._MASK_BITS["right"]),
+            self._valid_or_far(self.back,         self._MASK_BITS["back"]),
+        ]
+        return min(vals)
 
     def get_direction_distances(self) -> Dict[str, int]:
+        # Pre-init: every direction is DANGER (0).
+        if self.timestamp == 0:
+            return {"forward": 0, "backward": 0, "left": 0, "right": 0}
+        f  = self._valid_or_far(self.front,       self._MASK_BITS["front"])
+        fl = self._valid_or_far(self.front_left,  self._MASK_BITS["front_left"])
+        fr = self._valid_or_far(self.front_right, self._MASK_BITS["front_right"])
+        l  = self._valid_or_far(self.left,        self._MASK_BITS["left"])
+        r  = self._valid_or_far(self.right,       self._MASK_BITS["right"])
+        b  = self._valid_or_far(self.back,        self._MASK_BITS["back"])
         return {
-            "forward":  min(self.front, self.front_left, self.front_right) if self.front > 0 else 9999,
-            "backward": self.back if self.back > 0 else 9999,
-            "left":     min(self.left, self.front_left) if self.left > 0 else 9999,
-            "right":    min(self.right, self.front_right) if self.right > 0 else 9999,
+            "forward":  min(f, fl, fr),
+            "backward": b,
+            "left":     min(l, fl),
+            "right":    min(r, fr),
         }
 
     def to_float_dict(self) -> Dict[str, float]:
-        """Convert to float dict for navigation use."""
+        """Convert to float dict for navigation use.
+
+        `timestamp` (ms since epoch) is included so consumers like FreeCoverage
+        can detect stale ToF samples and throttle forward speed when the I2C
+        mux read loop falls behind. Navigation map-builders ignore unknown
+        keys.
+        """
         return {
             "front": float(self.front), "front_left": float(self.front_left),
             "front_right": float(self.front_right), "left": float(self.left),
             "right": float(self.right), "back": float(self.back),
+            "timestamp": float(self.timestamp),
         }
 
 
@@ -355,23 +440,54 @@ class MotorData:
 
 
 class SafetyController:
-    """Directional Safety Controller — per-direction zone evaluation."""
+    """Directional Safety Controller — per-direction zone evaluation.
+
+    Fail-safe defaults: pre-init zones are DANGER, not SAFE — robot will not
+    move until at least one valid ToF frame is received from the ESP. If the
+    ESP stops sending frames (USB drop, firmware crash) for longer than
+    `STALE_TOF_THRESHOLD_MS`, the controller reverts to DANGER on every
+    direction so the watchdog cuts motion just as if obstacles appeared.
+    """
+
+    # Allow ~3× ESP ToF cycle (worst-case ~200ms × 3 + slack) before declaring
+    # data stale. ESP currently runs ~5–20Hz depending on preset.
+    STALE_TOF_THRESHOLD_MS: int = 700
 
     def __init__(self, config: SafetyConfig = None):
         self.config = config or SafetyConfig()
         self.tof_data = ToFData()
-        self.current_zone = SafetyZone.SAFE
+        # Default pre-init zone is DANGER so motion is refused until a valid
+        # frame arrives. The first update_tof() flips this to real values.
+        self.current_zone = SafetyZone.DANGER
         self.direction_zones: Dict[str, SafetyZone] = {
-            "forward": SafetyZone.SAFE, "backward": SafetyZone.SAFE,
-            "left": SafetyZone.SAFE, "right": SafetyZone.SAFE,
+            "forward": SafetyZone.DANGER, "backward": SafetyZone.DANGER,
+            "left": SafetyZone.DANGER, "right": SafetyZone.DANGER,
         }
         self.direction_distances: Dict[str, int] = {
-            "forward": 9999, "backward": 9999, "left": 9999, "right": 9999,
+            "forward": 0, "backward": 0, "left": 0, "right": 0,
         }
         self.lock = threading.Lock()
+        # Optional callable returning True when the firmware link is healthy.
+        # Wired by KPatrolMQTTV5 to EncoderReader.is_heartbeat_stale so that
+        # `is_command_safe` can fail closed if ENC_HB stops arriving even
+        # while a stale ToF cache might still look "fresh enough".
+        self._link_alive_check: Optional[Callable[[], bool]] = None
+
+    def set_link_alive_check(self, check: Callable[[], bool]) -> None:
+        self._link_alive_check = check
+
+    def _is_link_dead(self) -> bool:
+        if self._link_alive_check is None:
+            return False
+        try:
+            return not self._link_alive_check()
+        except Exception:
+            # Fail closed: any exception in the probe = link unsafe.
+            return True
 
     def update_tof(self, front: int, front_left: int, front_right: int,
-                   left: int, right: int, back: int):
+                   left: int, right: int, back: int,
+                   valid_mask: int = 0x3F):
         with self.lock:
             self.tof_data.front = front
             self.tof_data.front_left = front_left
@@ -379,6 +495,7 @@ class SafetyController:
             self.tof_data.left = left
             self.tof_data.right = right
             self.tof_data.back = back
+            self.tof_data.valid_mask = valid_mask
             self.tof_data.timestamp = int(time.time() * 1000)
 
             self.direction_distances = self.tof_data.get_direction_distances()
@@ -395,9 +512,23 @@ class SafetyController:
             return SafetyZone.SLOW
         return SafetyZone.SAFE
 
+    def _is_data_stale(self) -> bool:
+        """True if no ToF frame received within STALE_TOF_THRESHOLD_MS.
+
+        Treat stale data as DANGER so the safety net fails closed when the
+        ESP link drops mid-run (USB unplug, crash, firmware reset).
+        """
+        if self.tof_data.timestamp == 0:
+            return True
+        age_ms = int(time.time() * 1000) - self.tof_data.timestamp
+        return age_ms > self.STALE_TOF_THRESHOLD_MS
+
     def is_command_safe(self, cmd: str) -> bool:
         if not self.config.enabled:
             return True
+        # Fail-safe: stale ToF OR dead firmware link → reject motion.
+        if self._is_data_stale() or self._is_link_dead():
+            return False
         cmd_upper = cmd.strip().upper()
         for direction in CMD_REQUIRED_DIRECTIONS.get(cmd_upper, []):
             if self.direction_zones.get(direction) == SafetyZone.DANGER:
@@ -407,6 +538,8 @@ class SafetyController:
     def get_command_speed_multiplier(self, cmd: str) -> float:
         if not self.config.enabled:
             return 1.0
+        if self._is_data_stale() or self._is_link_dead():
+            return 0.0  # Stale data or dead link → block motion
         cmd_upper = cmd.strip().upper()
         required = CMD_REQUIRED_DIRECTIONS.get(cmd_upper, [])
         if not required:
@@ -426,18 +559,29 @@ class SafetyController:
     def get_speed_multiplier(self) -> float:
         if not self.config.enabled:
             return 1.0
+        if self._is_data_stale():
+            return 0.0
         return self._zone_multiplier(self.current_zone)
 
     def should_stop(self) -> bool:
-        return self.config.enabled and self.current_zone == SafetyZone.DANGER
+        if not self.config.enabled:
+            return False
+        if self._is_data_stale():
+            return True  # Fail-safe stop on link loss
+        return self.current_zone == SafetyZone.DANGER
 
     def get_status(self) -> Dict:
         with self.lock:
+            stale = self._is_data_stale()
+            age_ms = (int(time.time() * 1000) - self.tof_data.timestamp
+                      if self.tof_data.timestamp > 0 else -1)
             return {
                 "enabled": self.config.enabled,
-                "zone": self.current_zone.value,
+                "zone": self.current_zone.value if not stale else SafetyZone.DANGER.value,
                 "speed_multiplier": self.get_speed_multiplier(),
                 "min_distance": self.tof_data.get_min_distance(),
+                "tof_stale": stale,
+                "tof_age_ms": age_ms,
                 "tof": self.tof_data.to_dict(),
                 "thresholds": {
                     "danger": self.config.danger_distance,
@@ -552,6 +696,8 @@ class MotorController:
             'L': {'FR': 'forward', 'FL': 'backward', 'BR': 'forward', 'BL': 'backward'},
             'DR': {'FR': 'stopped', 'FL': 'forward', 'BR': 'forward', 'BL': 'stopped'},
             'DL': {'FR': 'forward', 'FL': 'stopped', 'BR': 'stopped', 'BL': 'forward'},
+            'BR': {'FR': 'backward', 'FL': 'stopped', 'BR': 'stopped', 'BL': 'backward'},
+            'BL': {'FR': 'stopped', 'FL': 'backward', 'BR': 'backward', 'BL': 'stopped'},
             'S': {'FR': 'stopped', 'FL': 'stopped', 'BR': 'stopped', 'BL': 'stopped'},
         }
         cmd_base = command.split()[0] if ' ' in command else command
@@ -616,7 +762,10 @@ class MotorController:
             pct = float(payload)
         except (ValueError, IndexError):
             return
-        if pct < 0.0 or pct > 100.0:
+        # Drop pct<=0 / pct>100 — uncalibrated ADC or no battery plugged.
+        # Without this guard, BatteryWatcher would fire CRITICAL on bench runs
+        # where the firmware reports BAT:0,XXX before the ADC is calibrated.
+        if pct <= 0.0 or pct > 100.0:
             return
         self.battery_pct = pct
         self.battery_ts = int(time.time() * 1000)
@@ -643,6 +792,26 @@ class EncoderReader:
         self._reconnect_interval = 3
         self.tof_callback = None
 
+        # Firmware v3.1+ heartbeat: ENC_HB:<uptime_ms>,<tca_fail_count>
+        # arrives ~1 Hz. Used to detect ESP hang / USB-stall — independent
+        # of ToF freshness because ENC_HB fires even if all 6 ToFs failed.
+        self.last_heartbeat_ms: float = 0.0  # local monotonic, 0 == never seen
+        self.heartbeat_uptime_ms: int = 0    # firmware-side uptime
+        self.tca_fail_count: int = 0
+        self._last_tca_fail_warned: int = 0  # avoid spamming logs
+
+    HEARTBEAT_STALE_SEC = 3.0
+
+    def is_heartbeat_stale(self) -> bool:
+        """True if firmware's 1-Hz heartbeat hasn't arrived in ~3 s.
+
+        Returns False during the boot window (before any heartbeat) so a
+        slow ESP boot doesn't get flagged as a hang.
+        """
+        if self.last_heartbeat_ms == 0.0:
+            return False
+        return (time.monotonic() - self.last_heartbeat_ms) > self.HEARTBEAT_STALE_SEC
+
     def set_tof_callback(self, callback):
         self.tof_callback = callback
 
@@ -654,6 +823,10 @@ class EncoderReader:
             self.connected = True
             logger.info(f"[Encoder] Connected to {self.port}")
             time.sleep(2)
+            # ESP32 Dev (CH340) does NOT reset on DTR toggle, so the firmware
+            # may still be stuck in JSON mode from a previous session. Probe
+            # and cycle output mode (`m`) until it reports MODE_COMPACT.
+            self._ensure_compact_mode()
             if not self.running:
                 self.running = True
                 self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -663,6 +836,44 @@ class EncoderReader:
             logger.error(f"[Encoder] Connection failed: {e}")
             self.connected = False
             return False
+
+    def _ensure_compact_mode(self, max_cycles: int = 4) -> None:
+        """Send `m` (cycle output mode) until firmware reports MODE_COMPACT.
+
+        Default firmware boot is MODE_COMPACT, but the ESP32 Dev (CH340 USB)
+        does not reset on DTR toggle — if a previous session toggled it to
+        JSON or HUMAN, the chip stays there across `serial.Serial()` opens.
+        We send `m` (cycle Human->Compact->JSON->Human), read the OK echo,
+        and stop once we see `OK:MODE_COMPACT`. Bounded so a dead chip
+        cannot hang the connect path.
+        """
+        if not self.serial:
+            return
+        try:
+            self.serial.reset_input_buffer()
+        except Exception:
+            return
+        for _ in range(max_cycles):
+            try:
+                self.serial.write(b'm\n')
+                self.serial.flush()
+            except (OSError, serial.SerialException):
+                return
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                try:
+                    raw = self.serial.readline()
+                except (OSError, serial.SerialException):
+                    return
+                if not raw:
+                    continue
+                resp = raw.decode(errors="ignore").strip()
+                if resp.startswith("OK:MODE_"):
+                    if resp == "OK:MODE_COMPACT":
+                        logger.info("[Encoder] Output mode locked to COMPACT")
+                        return
+                    break  # got a different mode echo; cycle again
+        logger.warning("[Encoder] Could not confirm COMPACT mode after %d cycles", max_cycles)
 
     def _try_reconnect(self) -> bool:
         if time.time() - self._last_reconnect_attempt < self._reconnect_interval:
@@ -710,24 +921,119 @@ class EncoderReader:
             time.sleep(0.05)
 
     def _parse_line(self, line: str):
-        pattern = r'(\w+):\s*Count=(-?\d+)\s+Rev=(-?[\d.]+)\s+RPM=(-?[\d.]+)'
-        match = re.match(pattern, line)
+        if not line:
+            return
+        # Firmware v3.0+ compact: ENC:fr,fl,br,bl,rpm_fr,rpm_fl,rpm_br,rpm_bl
+        if line.startswith("ENC:"):
+            self._parse_enc_compact_line(line)
+            return
+        if line.startswith("TOF:"):
+            self._parse_tof_line(line)
+            return
+        if line.startswith("ENC_HB:"):
+            self._parse_heartbeat_line(line)
+            return
+        # Firmware JSON mode (sticky if Pi previously toggled `j`). Parsing
+        # the same payload here means the watchdog still sees ENC_HB / TOF,
+        # the only difference is the line that carries the per-wheel data.
+        if line.startswith("{"):
+            self._parse_json_line(line)
+            return
+        # Legacy per-motor text: `<FR>: Count=N Rev=N.N RPM=N.N`
+        match = re.match(
+            r'(\w+):\s*Count=(-?\d+)\s+Rev=(-?[\d.]+)\s+RPM=(-?[\d.]+)', line)
         if match:
             motor = match.group(1)
             if motor in self.encoder_data:
                 self.encoder_data[motor].count = int(match.group(2))
                 self.encoder_data[motor].revolutions = float(match.group(3))
                 self.encoder_data[motor].rpm = float(match.group(4))
-        elif line.startswith("TOF:"):
-            self._parse_tof_line(line)
+
+    # Firmware compact: ENC:<fr_cnt>,<fl_cnt>,<br_cnt>,<bl_cnt>,<fr_rpm>,<fl_rpm>,<br_rpm>,<bl_rpm>
+    _ENC_COMPACT_ORDER = ("FR", "FL", "BR", "BL")
+
+    def _parse_enc_compact_line(self, line: str):
+        try:
+            parts = line[4:].split(',')
+            if len(parts) < 8:
+                return
+            counts = [int(p) for p in parts[:4]]
+            rpms = [float(p) for p in parts[4:8]]
+            for motor, cnt, rpm in zip(self._ENC_COMPACT_ORDER, counts, rpms):
+                if motor in self.encoder_data:
+                    self.encoder_data[motor].count = cnt
+                    self.encoder_data[motor].rpm = rpm
+        except (ValueError, IndexError):
+            pass
+
+    def _parse_json_line(self, line: str):
+        try:
+            payload = json.loads(line)
+        except (ValueError, TypeError):
+            return
+        enc = payload.get("enc") or {}
+        for key, motor in (("fr", "FR"), ("fl", "FL"), ("br", "BR"), ("bl", "BL")):
+            wheel = enc.get(key)
+            if isinstance(wheel, dict) and motor in self.encoder_data:
+                cnt = wheel.get("cnt")
+                rpm = wheel.get("rpm")
+                if cnt is not None:
+                    try:
+                        self.encoder_data[motor].count = int(cnt)
+                    except (TypeError, ValueError):
+                        pass
+                if rpm is not None:
+                    try:
+                        self.encoder_data[motor].rpm = float(rpm)
+                    except (TypeError, ValueError):
+                        pass
+        tof = payload.get("tof")
+        if isinstance(tof, dict) and self.tof_callback:
+            try:
+                vals = (
+                    int(tof.get("front", 0)),
+                    int(tof.get("front_left", 0)),
+                    int(tof.get("front_right", 0)),
+                    int(tof.get("left", 0)),
+                    int(tof.get("right", 0)),
+                    int(tof.get("back", 0)),
+                )
+                self.tof_callback(*vals, valid_mask=0x3F)
+            except (TypeError, ValueError):
+                pass
+
+    def _parse_heartbeat_line(self, line: str):
+        try:
+            parts = line[7:].split(',')
+            if len(parts) >= 2:
+                self.heartbeat_uptime_ms = int(parts[0])
+                fail_count = int(parts[1])
+                self.last_heartbeat_ms = time.monotonic()
+                # Log only on transitions so a flaky mux doesn't flood at 1 Hz.
+                if fail_count != self.tca_fail_count:
+                    delta = fail_count - self._last_tca_fail_warned
+                    if delta >= 5 or fail_count == 0:
+                        logger.warning(
+                            f"[Encoder] TCA9548A fail count: {fail_count} "
+                            f"(+{delta} since last warn)"
+                        )
+                        self._last_tca_fail_warned = fail_count
+                    self.tca_fail_count = fail_count
+        except (ValueError, IndexError):
+            pass
 
     def _parse_tof_line(self, line: str):
         try:
             parts = line[4:].split(',')
             if len(parts) >= 6:
                 vals = [int(p) for p in parts[:6]]
+                # Field 7 (valid_mask) was added in firmware v3.1 and is
+                # appended to the existing positional payload. Default to
+                # 0x3F (all lanes valid) when the firmware is older so
+                # SafetyController.update_tof preserves prior behaviour.
+                valid_mask = int(parts[6]) if len(parts) >= 7 else 0x3F
                 if self.tof_callback:
-                    self.tof_callback(*vals)
+                    self.tof_callback(*vals, valid_mask=valid_mask)
         except (ValueError, IndexError):
             pass
 
@@ -796,6 +1102,14 @@ class KPatrolMQTTV5:
         # Connect ToF callback
         self.encoder_reader.set_tof_callback(self.safety_controller.update_tof)
 
+        # Wire firmware-link health into the safety gate so a dead ESP
+        # (no ENC_HB heartbeat for ~3s) blocks motion even if a stale ToF
+        # frame is still cached. lambda inverts the meaning: SafetyController
+        # wants a "link is alive" predicate.
+        self.safety_controller.set_link_alive_check(
+            lambda: not self.encoder_reader.is_heartbeat_stale()
+        )
+
         # Navigation: scripted patrol + LINE_FOLLOW + FREE_COVERAGE.
         # Map persistence is opt-in: set KPATROL_MAP_PERSIST_DIR=/path/to/dir
         # and the FREE_COVERAGE occupancy grid is loaded on start + auto-saved
@@ -812,7 +1126,7 @@ class KPatrolMQTTV5:
             except OSError as exc:
                 logger.error(f"[FC] map persistence init failed: {exc} — running without persistence")
                 _fc_cfg = None
-        self._nav = NavController(script_dir="data/scripts", fc_config=_fc_cfg)
+        self._nav = NavController(fc_config=_fc_cfg)
         self._last_nav_cmd = ""
         self._nav_lock = threading.Lock()
 
@@ -912,6 +1226,14 @@ class KPatrolMQTTV5:
         self._per_topic_bytes: Dict[str, int] = {}
         self._metrics_started_at = time.time()
 
+        # V10 §5.3: MQTT link watchdog. If broker connection drops for >3s while
+        # the robot is in an autonomous mode, slam to EMERGENCY so a runaway
+        # pursuit can't continue without operator oversight.
+        self._mqtt_connected: bool = False
+        self._last_connect_loss_ts: Optional[float] = None
+        self._link_watchdog_grace_s: float = 3.0
+        self._link_watchdog_fired: bool = False
+
         # V5.4: Safety actuator + watchers. The actuator turns logical alerts
         # (person/fire/tipover/battery) into LP:/BUZZ: commands sent to firmware;
         # the watchers convert raw IMU and battery samples into level changes.
@@ -1004,14 +1326,26 @@ class KPatrolMQTTV5:
             # This covers ALL command topics in a single subscription.
             client.subscribe(T.WILDCARD, 1)
             logger.info(f"[MQTT] Subscribed to {T.WILDCARD}")
+            # V10 §5.3 link watchdog: broker reachable again — reset state.
+            self._mqtt_connected = True
+            self._last_connect_loss_ts = None
+            self._link_watchdog_fired = False
             self.send_heartbeat("online")
             self.publish_log(f"K-Patrol V5 connected | serial={T.serial}")
         else:
             logger.info(f"[MQTT] Connect failed with code: {reason_code}")
+            self._mqtt_connected = False
+            if self._last_connect_loss_ts is None:
+                self._last_connect_loss_ts = time.time()
 
     def on_disconnect(self, client, userdata, disconnect_flags=None, rc=None, properties=None):
         reason = rc.value if hasattr(rc, 'value') else (rc if rc is not None else 0)
         logger.info(f"[MQTT] Disconnected (rc={reason})")
+        # V10 §5.3 link watchdog: start the 3s grace timer; main loop will
+        # promote to EMERGENCY if reconnect doesn't happen in time.
+        self._mqtt_connected = False
+        self._last_connect_loss_ts = time.time()
+        self._link_watchdog_fired = False
 
     def on_message(self, client, userdata, msg):
         try:
@@ -1078,11 +1412,6 @@ class KPatrolMQTTV5:
             self.motor_controller.set_speed(int(speed * multiplier))
 
         self.motor_controller.send_command(cmd_type)
-        self._nav.record_feed(
-            cmd_type,
-            self.motor_controller.current_speed,
-            self.motor_controller.imu_data.yaw,
-        )
 
     def handle_motor_command(self, payload: Dict[str, Any]):
         # Refuse manual control while any autonomous mode is active.
@@ -1096,11 +1425,6 @@ class KPatrolMQTTV5:
             multiplier = self.safety_controller.get_speed_multiplier()
             self.motor_controller.set_speed(int(speed * multiplier))
         self.motor_controller.send_command(cmd_type)
-        self._nav.record_feed(
-            cmd_type,
-            self.motor_controller.current_speed,
-            self.motor_controller.imu_data.yaw,
-        )
 
     def handle_speed(self, payload: Dict[str, Any]):
         speed = payload.get("speed", 150)
@@ -1365,22 +1689,30 @@ class KPatrolMQTTV5:
             "timestamp": int(time.time() * 1000),
         }, qos=1, retain=True)
 
+    def _tick_battery_watcher(self):
+        # Sampled at 5Hz from the main loop so the LFP cliff (≤20% → critical)
+        # is detected within ~200ms instead of waiting for the 2s status cadence.
+        if self._battery_watcher is None:
+            return
+        battery_pct = self.motor_controller.get_battery_pct()
+        if battery_pct is None:
+            return
+        try:
+            self._battery_watcher.tick(battery_pct)
+        except Exception as exc:
+            logger.error(f"[BATTERY] tick error: {exc}")
+
     def publish_status(self):
         # Retained: latest full snapshot is always available to new subscribers.
         # Battery: prefer firmware-reported pct; fall back to 85 only when no
         # reading has arrived yet (firmware older than V5.4 / sensor offline).
+        # Watcher tick happens in its own 5Hz loop branch — keep this method
+        # publish-only so MQTT cadence and safety cadence are independent.
         battery_pct = self.motor_controller.get_battery_pct()
         if battery_pct is None:
             battery_value = 85
         else:
             battery_value = round(float(battery_pct), 1)
-            # Drive the watcher off the same value we publish so dashboards and
-            # actuator never disagree about the current level.
-            if self._battery_watcher is not None:
-                try:
-                    self._battery_watcher.tick(battery_pct)
-                except Exception as exc:
-                    logger.error(f"[BATTERY] tick error: {exc}")
         self._pub(self.T.STATUS, {
             "connected": True,
             "esp32_motor": self.motor_controller.connected,
@@ -1537,19 +1869,28 @@ class KPatrolMQTTV5:
         self._pub(self.T.SAFETY, self.safety_controller.get_status())
 
     def publish_imu(self):
+        # MQTT publish only — tipover tick runs in its own 20Hz branch so
+        # dashboard cadence (2Hz) is decoupled from safety reaction time.
         status = self.motor_controller.get_imu_status()
         self._pub(self.T.IMU, status)
-        # V5.4: feed the tip-over watcher with each fresh IMU sample. The
-        # firmware-stamped timestamp tells us if the data is stale; we only
-        # tick when the IMU has actually been updated since last publish.
-        if self._tipover_watcher is not None and self.motor_controller.imu_data.timestamp:
-            try:
-                self._tipover_watcher.tick(
-                    roll_deg=float(status.get("roll", 0.0)),
-                    pitch_deg=float(status.get("pitch", 0.0)),
-                )
-            except Exception as exc:
-                logger.error(f"[TIPOVER] tick error: {exc}")
+
+    def _tick_tipover_watcher(self):
+        # 20Hz tipover sampling: roll/pitch crosses must be caught within
+        # ~50ms to brake before the robot commits to falling. Firmware
+        # timestamp gates ticks so a stale IMU (UART silence) doesn't spam
+        # zero-angle into the watcher.
+        if self._tipover_watcher is None:
+            return
+        if not self.motor_controller.imu_data.timestamp:
+            return
+        status = self.motor_controller.get_imu_status()
+        try:
+            self._tipover_watcher.tick(
+                roll_deg=float(status.get("roll", 0.0)),
+                pitch_deg=float(status.get("pitch", 0.0)),
+            )
+        except Exception as exc:
+            logger.error(f"[TIPOVER] tick error: {exc}")
 
     # ── V5.4: Safety watcher callbacks ─────────────────────────────
 
@@ -1678,19 +2019,23 @@ class KPatrolMQTTV5:
             logger.info("[LF] cv2 not available — LINE_FOLLOW camera disabled")
             return
 
-        cap = _cv2.VideoCapture(self._camera_index)
-        cap.set(_cv2.CAP_PROP_FRAME_WIDTH,  640)
-        cap.set(_cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(_cv2.CAP_PROP_FPS, 30)
-
-        if not cap.isOpened():
-            logger.error(f"[LF] Camera {self._camera_index} failed to open — LINE_FOLLOW disabled")
+        # picamera2 first, cv2.VideoCapture fallback. Threaded latest-frame
+        # grabber: PD always reads the freshest frame, never replays a stale
+        # one (replaying inflates D-term spuriously).
+        cam = open_camera(
+            index=self._camera_index,
+            width=640, height=480, framerate=30,
+            threaded=True,
+        )
+        if cam is None:
+            logger.error(f"[LF] No camera backend opened (index={self._camera_index}) — LINE_FOLLOW disabled")
             return
 
-        logger.info(f"[LF] Camera {self._camera_index} opened (640×480)")
+        logger.info(f"[LF] Camera ready via {cam.backend} (640×480 @ 30fps)")
         interval      = 0.05  # 20 Hz control loop
         cam_pub_interval = 0.20  # 5 Hz JPEG stream (MQTT bandwidth friendly)
         last_cam_pub  = 0.0
+        consecutive_misses = 0
 
         while self.running:
             t0 = time.time()
@@ -1701,13 +2046,26 @@ class KPatrolMQTTV5:
                 time.sleep(interval)
                 continue
 
-            ret, frame = cap.read()
-            if not ret:
-                logger.info("[LF] Frame capture failed")
-                time.sleep(0.1)
+            frame = cam.read()
+            if frame is None:
+                # ThreadedFrameGrabber returns None when no fresh frame yet.
+                # Brief wait then retry; only log if it persists so we don't
+                # flood when PD ticks faster than camera FPS.
+                consecutive_misses += 1
+                if consecutive_misses == 40:  # ~2 s of dry reads
+                    logger.warning("[LF] No fresh frames for ~2s — camera stalled?")
+                time.sleep(0.01)
                 continue
+            consecutive_misses = 0
 
-            result = self._nav.line_follow_tick(frame, produce_overlay=True)
+            # Per-tick try/except: any vision/PD bug logs once and resumes
+                # next frame instead of silently killing the LF thread.
+            try:
+                result = self._nav.auto_line_follow_tick(frame, produce_overlay=True)
+            except Exception as exc:
+                logger.exception(f"[LF] tick error: {exc}")
+                time.sleep(interval)
+                continue
 
             vx, vy, wz, spd = result.vx, result.vy, result.wz, result.spd
             twist = (vx, vy, wz, spd)
@@ -1726,14 +2084,15 @@ class KPatrolMQTTV5:
 
             # Publish JPEG overlay at ≤5 Hz for dashboard live view
             if result.overlay is not None and t0 - last_cam_pub >= cam_pub_interval:
-                _, jpg = _cv2.imencode(".jpg", result.overlay, [_cv2.IMWRITE_JPEG_QUALITY, 70])
-                self._pub_raw(self.T.CAMERA, jpg.tobytes())
-                last_cam_pub = t0
+                ok, jpg = _cv2.imencode(".jpg", result.overlay, [_cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    self._pub_raw(self.T.CAMERA, jpg.tobytes())
+                    last_cam_pub = t0
 
             elapsed = time.time() - t0
             time.sleep(max(0.0, interval - elapsed))
 
-        cap.release()
+        cam.stop()
         logger.info("[LF] Camera released")
 
     # ── V5: Navigation Loop (separate thread) ─────────────────────
@@ -1910,6 +2269,9 @@ class KPatrolMQTTV5:
         metrics_interval = 10     # V5.1 link telemetry at 0.1Hz
         gps_interval = self.gps_config.publish_interval   # V5.2 default 1Hz
         odom_interval = 0.05      # V5.3 odometry at 20Hz
+        battery_tick_interval = 0.2   # V10: 5Hz battery sampling for LFP cliff
+        imu_request_interval = 0.05   # V10: 20Hz IMU poll for tipover safety
+        tipover_tick_interval = 0.05  # V10: 20Hz tipover watcher
 
         last_heartbeat = 0
         last_status = 0
@@ -1921,6 +2283,8 @@ class KPatrolMQTTV5:
         last_metrics = 0
         last_gps = 0
         last_odom = 0.0
+        last_battery_tick = 0.0
+        last_tipover_tick = 0.0
 
         logger.info("\n" + "=" * 60)
         logger.info("    K-PATROL MQTT CLIENT V5.0")
@@ -1946,9 +2310,35 @@ class KPatrolMQTTV5:
             while self.running:
                 current_time = time.time()
 
+                # V10 §5.3: MQTT link watchdog. Broker dropout >3s while in an
+                # autonomous mode must force EMERGENCY — operator can't see or
+                # override a runaway robot if telemetry is silent.
+                if (
+                    not self._mqtt_connected
+                    and self._last_connect_loss_ts is not None
+                    and not self._link_watchdog_fired
+                    and current_time - self._last_connect_loss_ts > self._link_watchdog_grace_s
+                ):
+                    nav_mode = self._nav.get_mode()
+                    if nav_mode in ("AUTO_FREE_COVERAGE", "AUTO_LINE_FOLLOW", "AUTO_GPS_WAYPOINT"):
+                        logger.warning(
+                            f"[LINK-WATCHDOG] MQTT down >{self._link_watchdog_grace_s:.0f}s "
+                            f"in mode={nav_mode} — forcing EMERGENCY"
+                        )
+                        try:
+                            self._nav.trigger_emergency("mqtt-link-lost-3s")
+                        except AttributeError:
+                            self._nav.set_mode("EMERGENCY")
+                            self.motor_controller.send_command("S")
+                    self._link_watchdog_fired = True
+
                 if current_time - last_heartbeat >= heartbeat_interval:
                     self.send_heartbeat()
                     last_heartbeat = current_time
+
+                if current_time - last_battery_tick >= battery_tick_interval:
+                    self._tick_battery_watcher()
+                    last_battery_tick = current_time
 
                 if current_time - last_status >= status_interval:
                     self.publish_status()
@@ -1971,9 +2361,13 @@ class KPatrolMQTTV5:
                     self.publish_imu()
                     last_imu = current_time
 
-                if current_time - last_imu_request >= 1.0:
+                if current_time - last_imu_request >= imu_request_interval:
                     self.motor_controller.request_imu()
                     last_imu_request = current_time
+
+                if current_time - last_tipover_tick >= tipover_tick_interval:
+                    self._tick_tipover_watcher()
+                    last_tipover_tick = current_time
 
                 if current_time - last_metrics >= metrics_interval:
                     self.publish_metrics()
