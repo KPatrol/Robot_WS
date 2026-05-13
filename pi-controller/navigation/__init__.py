@@ -42,6 +42,13 @@ from .gps_navigator import (
 from .occupancy_grid import OccupancyGrid, GridConfig, CELL_VISITED, CELL_OBSTACLE
 from .odometry import Odometry, Pose
 from .velocity_pid import VelocityController, VelocityPIDConfig
+from .camera_source import (
+    CameraSource,
+    Picamera2Source,
+    OpenCVSource,
+    ThreadedFrameGrabber,
+    open_camera,
+)
 
 __all__ = [
     "NavController",
@@ -68,4 +75,9 @@ __all__ = [
     "Pose",
     "VelocityController",
     "VelocityPIDConfig",
+    "CameraSource",
+    "Picamera2Source",
+    "OpenCVSource",
+    "ThreadedFrameGrabber",
+    "open_camera",
 ]
