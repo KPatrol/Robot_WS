@@ -29,30 +29,57 @@ Lightweight: O(M) memory per kind, no numpy required.
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Dict, Iterable, Optional, Tuple
+from typing import Deque, Dict, Iterable, Mapping, Optional, Tuple, Union
 
 
 class TemporalSmoother:
-    """N-of-M rolling-window consensus per detection kind."""
+    """N-of-M rolling-window consensus per detection kind.
+
+    `required` accepts either a single int (applies to every kind) or a mapping
+    of kind→int so different signals can have different debouncing thresholds.
+    Per V10 spec: fire requires 3 frames (slower, costlier false-alarm), person
+    requires 2 (faster reaction, YOLO already filters most noise).
+    """
 
     def __init__(
         self,
         window: int = 5,
-        required: int = 3,
+        required: Union[int, Mapping[str, int]] = 3,
         class_kinds: Iterable[str] = ("person", "fire"),
     ):
-        if required > window:
-            raise ValueError("required cannot exceed window")
-        if window < 1 or required < 1:
-            raise ValueError("window and required must be >= 1")
+        if window < 1:
+            raise ValueError("window must be >= 1")
+
+        if isinstance(required, Mapping):
+            self._default_required = max(required.values()) if required else 1
+            self._required_map: Dict[str, int] = dict(required)
+        else:
+            self._default_required = int(required)
+            self._required_map = {}
+
+        if self._default_required < 1:
+            raise ValueError("required must be >= 1")
+        for k, r in self._required_map.items():
+            if r < 1 or r > window:
+                raise ValueError(f"required[{k}]={r} must be in [1, window]")
+        if self._default_required > window:
+            raise ValueError("default required cannot exceed window")
+
         self.window = window
-        self.required = required
         # Per-kind rolling window of confidences (0.0 == no hit this frame).
         self._buffers: Dict[str, Deque[float]] = {
             k: deque(maxlen=window) for k in class_kinds
         }
         # Latched state: True once threshold met, reset when below again.
         self._latched: Dict[str, bool] = {k: False for k in self._buffers}
+
+    @property
+    def required(self) -> int:
+        """Back-compat: returns the default threshold (max of per-kind map)."""
+        return self._default_required
+
+    def required_for(self, kind: str) -> int:
+        return self._required_map.get(kind, self._default_required)
 
     def _ensure_kind(self, kind: str) -> None:
         if kind not in self._buffers:
@@ -83,8 +110,9 @@ class TemporalSmoother:
 
             positive = [c for c in buf if c > 0.0]
             count = len(positive)
+            threshold = self.required_for(kind)
 
-            if count >= self.required:
+            if count >= threshold:
                 if not self._latched[kind]:
                     self._latched[kind] = True
                     # Average the non-zero confidences for a stable score.
