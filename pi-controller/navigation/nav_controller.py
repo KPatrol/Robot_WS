@@ -310,6 +310,16 @@ class NavController:
         """
         status = self._base_status()
 
+        # EMERGENCY dominates every other state. Check it before the person
+        # pause window so a stale `_alert_pause_until` (from a person alert
+        # that landed milliseconds before a fire alert) cannot mask an
+        # active emergency in telemetry. Motor command is identical in
+        # both branches, but the status payload must reflect EMERGENCY.
+        if self._mode == Mode.EMERGENCY:
+            self._alert_pause_until = 0.0
+            self._mode_before_pause = None
+            return "S", None, (0, 0, 0, 0), status
+
         # Person-detection pause window: hold motors at zero, auto-resume.
         now = time.monotonic()
         if self._alert_pause_until > now:
@@ -321,9 +331,6 @@ class NavController:
 
         if self._mode == Mode.MANUAL:
             return None, None, None, status
-
-        if self._mode == Mode.EMERGENCY:
-            return "S", None, (0, 0, 0, 0), status
 
         if self._mode == Mode.AUTO_LINE_FOLLOW:
             # AUTO_LINE_FOLLOW does not use the tick() path — callers must use
