@@ -97,10 +97,23 @@ class LineFollowerConfig:
     target_left_offset_cm: float   = 10.0   # robot drives this far LEFT of the line
 
     # Controller gains
+    # heading_error is in RADIANS (arctan of slope), so kp_heading must be
+    # large enough that a typical ±0.2 rad tilt produces a non-zero int8
+    # wz. Earlier values (0.30) were sized for degrees and silently
+    # truncated to zero rotation in real use — symptom: robot strafes but
+    # never rotates into curves. Verified in tools/line_follow_sim.py.
     kp_lateral:  float = 0.40   # P gain for lateral error → vy
     kd_lateral:  float = 0.08   # D gain for lateral error → vy
-    kp_heading:  float = 0.30   # P gain for heading error → wz
-    kd_heading:  float = 0.06   # D gain for heading error → wz
+    kp_heading:  float = 8.0    # P gain for heading error (rad) → wz
+    kd_heading:  float = 0.0    # D gain off — derivative on polyfit-derived slope
+                                # is too noisy and induces a rotational limit cycle
+                                # on mecanum platforms. Lateral_error already drives
+                                # strafe correction; wz handles slow heading drift
+                                # and curve following.
+    heading_deadband_rad: float = 0.02  # Ignore heading_error below ~1°. On straight
+                                # lines small slope noise (from polyfit on slightly
+                                # tilted spine) would otherwise make wz nudge robot,
+                                # which couples back into vy and amplifies oscillation.
 
     # Speed
     base_vx:     int   = 60     # forward speed when line is found (0–127)
@@ -115,6 +128,48 @@ class LineFollowerConfig:
     # Heading-hold fallback: when line is lost hold last steering for N frames
     # before stopping (~0.5 s at 20 Hz). Set to 0 to disable.
     lost_grace_frames: int = 10
+
+    # Active rotation-recovery: after lost_grace_frames expire, rotate in place
+    # toward the last steering direction for up to recovery_max_frames so the
+    # camera can re-acquire a line that left the FOV during a sharp turn.
+    # Set recovery_max_frames=0 to disable (full stop after grace).
+    recovery_wz:          int = 45
+    recovery_max_frames:  int = 40
+
+    # 2nd-order line fit: lets heading_error capture the start of a curve
+    # (lookahead) instead of the instantaneous slope at the robot. Falls back
+    # to 1st order if fewer than 4 spine points or RankWarning.
+    polyfit_order:        int   = 2
+    # Where in the BEV (0..1, 0=top/far, 1=bottom/near robot) to evaluate the
+    # lookahead slope. 0.4 = mid-far, 1.0 = directly under the robot.
+    lookahead_y_ratio:    float = 0.45
+    # Blend weight of lookahead heading vs. robot heading (0=use robot only,
+    # 1=use lookahead only). 0.6 favours anticipating the curve.
+    lookahead_blend:      float = 0.6
+    # Adaptive lookahead: at higher commanded vx the robot covers more ground
+    # per control tick, so it must look further ahead (smaller y_ratio) to keep
+    # the same response time. effective_y_ratio = lookahead_y_ratio
+    #   - lookahead_speed_gain * (last_vx / 127). Tuned so vx=127 shaves the
+    # ratio by ~0.20 → 0.45 default → 0.25 at top speed (≈ twice as far). Set
+    # to 0.0 to disable (fixed-distance lookahead, original behaviour).
+    lookahead_speed_gain: float = 0.20
+    # Curvature-aware slowdown: when |Δslope between near/lookahead| exceeds
+    # threshold, scale vx down to curvature_min_vx_factor * base_vx. Slope is
+    # dx/dy in BEV pixel units → ~0.3 already corresponds to a ~17° lean.
+    curvature_threshold:      float = 0.30
+    curvature_min_vx_factor:  float = 0.45
+
+    # Optional turn-marker detection: a coloured square placed left/right of
+    # the line that biases lateral_error toward that side, helping the robot
+    # commit to a turn before the line bends. Disabled when turn_marker=False.
+    turn_marker:               bool = False
+    turn_marker_left_hsv_low:  Tuple[int, int, int] = (100,  80,  60)   # blue
+    turn_marker_left_hsv_high: Tuple[int, int, int] = (130, 255, 255)
+    turn_marker_right_hsv_low: Tuple[int, int, int] = (  0, 120,  80)   # red
+    turn_marker_right_hsv_high:Tuple[int, int, int] = ( 12, 255, 255)
+    turn_marker_min_area:      int   = 800
+    turn_marker_bias_px:       float = 60.0    # added to lateral_error toward turn side
+    turn_marker_hold_frames:   int   = 8       # how long bias persists after marker exits FOV
 
     # ToF emergency cut-off — front distance (mm) below which the controller
     # forces a full stop regardless of line tracking. Independent of the
@@ -148,6 +203,13 @@ class LineResult:
     # Latest front distance (mm) sampled from the provider, or None when no
     # provider is wired. Surfaced so the host can publish it for telemetry.
     front_dist_mm: Optional[float] = None
+    # |slope_lookahead - slope_near|; >0 = curve detected. 0 when straight or
+    # 2nd-order fit unavailable. Surfaced for telemetry/diagnostics.
+    curvature:     float = 0.0
+    # "MANUAL" | "RECOVER_LEFT" | "RECOVER_RIGHT" | "HOLD" | "STOP" — only
+    # populated when line_found is False; helps the operator/log interpret
+    # what the controller is doing during line-loss events.
+    recovery_mode: str   = ""
 
 
 # ── Main class ─────────────────────────────────────────────────────────────────
@@ -186,9 +248,17 @@ class LineFollower:
         )
 
         # Heading-hold state
-        self._lost_count: int = 0
-        self._last_vy:    int = 0
-        self._last_wz:    int = 0
+        self._lost_count:     int = 0
+        self._last_vx:        int = 0
+        self._last_vy:        int = 0
+        self._last_wz:        int = 0
+        # Active recovery counter — separate from _lost_count so we can
+        # distinguish passive grace (hold last steering) vs. active rotate.
+        self._recovery_count: int = 0
+        # Turn-marker bias: latched +/- pixel offset that decays over
+        # turn_marker_hold_frames once the marker leaves the FOV.
+        self._marker_bias_px: float = 0.0
+        self._marker_hold:    int   = 0
 
         # Optional callable returning the latest front-facing ToF distance
         # in millimetres (None / negative ⇒ "no reading"). Wired by the host
@@ -227,6 +297,43 @@ class LineFollower:
             return None
         return d
 
+    def _detect_turn_marker(self, hsv: np.ndarray) -> int:
+        """Detect a coloured turn marker in the HSV frame.
+
+        Returns -1 if a left-marker (default blue) blob with area ≥
+        turn_marker_min_area is present, +1 for right-marker (default red),
+        0 if neither side has a sufficiently large blob. When both sides
+        are above threshold the larger one wins — defensive against noise
+        bands but in practice only one marker is placed per turn.
+        """
+        cfg = self.cfg
+        def _blob_area(low: Tuple[int, int, int],
+                       high: Tuple[int, int, int]) -> int:
+            m = cv2.inRange(hsv,
+                            np.array(low,  dtype=np.uint8),
+                            np.array(high, dtype=np.uint8))
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                return 0
+            return int(max(cv2.contourArea(c) for c in cnts))
+
+        left_area  = _blob_area(cfg.turn_marker_left_hsv_low,
+                                cfg.turn_marker_left_hsv_high)
+        right_area = _blob_area(cfg.turn_marker_right_hsv_low,
+                                cfg.turn_marker_right_hsv_high)
+
+        thresh = int(cfg.turn_marker_min_area)
+        left_ok  = left_area  >= thresh
+        right_ok = right_area >= thresh
+        if left_ok and right_ok:
+            return -1 if left_area > right_area else 1
+        if left_ok:
+            return -1
+        if right_ok:
+            return 1
+        return 0
+
     def tick(
         self,
         frame: np.ndarray,
@@ -236,6 +343,21 @@ class LineFollower:
         now = time.monotonic()
         dt  = max(0.001, now - self._prev_t)
         self._prev_t = now
+
+        # Camera stutter guard: a dropped or partially-decoded frame from
+        # picamera2 / V4L2 can surface here as None or a zero-sized array.
+        # Treat it as a "lost line" tick so the lost-grace passive-hold
+        # bridge keeps applying instead of crashing the nav loop.
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            self._lost_count += 1
+            if (self._lost_count <= cfg.lost_grace_frames
+                    and (self._last_vy != 0 or self._last_wz != 0)):
+                hold_vx = max(0, cfg.base_vx // 2)
+                return LineResult(hold_vx, self._last_vy, self._last_wz, cfg.base_spd,
+                                  False, 0.0, 0.0, None)
+            self._last_vy = 0
+            self._last_wz = 0
+            return LineResult(0, 0, 0, cfg.base_spd, False, 0.0, 0.0, None)
 
         # ── Step 0: ToF emergency cut-off ─────────────────────────────────────
         # Sampled before any vision work so an obstacle cuts forward motion
@@ -297,40 +419,175 @@ class LineFollower:
         if len(spine) < 3:
             self._lost_count += 1
             overlay = self._draw_overlay(frame, bev, [], None, None) if produce_overlay else None
-            # Heading-hold: keep last steering for grace period to bridge
-            # brief occlusions during turns before stopping.
-            if self._lost_count <= cfg.lost_grace_frames and (self._last_vy != 0 or self._last_wz != 0):
+
+            # Phase 1 — passive heading-hold: bridge brief occlusions by
+            # keeping last steering at half forward speed.
+            if (self._lost_count <= cfg.lost_grace_frames
+                    and (self._last_vy != 0 or self._last_wz != 0)):
                 hold_vx = max(0, cfg.base_vx // 2)
                 return LineResult(hold_vx, self._last_vy, self._last_wz, cfg.base_spd,
                                   False, 0.0, 0.0, overlay,
-                                  tof_blocked=False, front_dist_mm=front_dist)
-            # Past grace period: full stop, reset PD state
+                                  tof_blocked=False, front_dist_mm=front_dist,
+                                  recovery_mode="HOLD")
+
+            # Phase 2 — active rotation-recovery: rotate in place toward the
+            # last steering direction so the camera sweeps back over the line
+            # that vanished off-side during a sharp turn. Capped to avoid
+            # spinning forever on a genuine end-of-line.
+            if (cfg.recovery_max_frames > 0
+                    and self._recovery_count < cfg.recovery_max_frames
+                    and self._last_wz != 0):
+                self._recovery_count += 1
+                wz_dir = 1 if self._last_wz > 0 else -1
+                rec_wz = wz_dir * int(cfg.recovery_wz)
+                mode   = "RECOVER_LEFT" if wz_dir > 0 else "RECOVER_RIGHT"
+                return LineResult(0, 0, rec_wz, cfg.base_spd,
+                                  False, 0.0, 0.0, overlay,
+                                  tof_blocked=False, front_dist_mm=front_dist,
+                                  recovery_mode=mode)
+
+            # Phase 3 — full stop. Reset PD + recovery state so the next
+            # successful detection starts clean instead of carrying stale
+            # derivatives.
             self._prev_lat_err = 0.0
             self._prev_hdg_err = 0.0
+            self._recovery_count = 0
+            self._marker_bias_px = 0.0
+            self._marker_hold    = 0
             return LineResult(cfg.lost_vx, 0, 0, cfg.base_spd,
                               False, 0.0, 0.0, overlay,
-                              tof_blocked=False, front_dist_mm=front_dist)
+                              tof_blocked=False, front_dist_mm=front_dist,
+                              recovery_mode="STOP")
 
         spine_arr = np.array(spine)
         xs_arr    = spine_arr[:, 0]
         ys_arr    = spine_arr[:, 1]
 
-        # ── Step 4: Line fit (1st-order polynomial x = a*y + b) ───────────────
-        coeffs = np.polyfit(ys_arr, xs_arr, 1)   # x as function of y (vertical)
-        a, b   = float(coeffs[0]), float(coeffs[1])
+        # ── Step 4: Line fit (adaptive 1st/2nd order x = poly(y)) ─────────────
+        # Try 2nd-order so heading_error can anticipate curves; fall back to
+        # linear when too few points or rank-deficient (e.g. all spine points
+        # at the same y after BEV warp). np.polyfit returns highest-order
+        # coefficient first.
+        order = max(1, min(int(cfg.polyfit_order), 2))
+        if len(spine) < 4:
+            order = 1
+        try:
+            coeffs = np.polyfit(ys_arr, xs_arr, order)
+        except (np.linalg.LinAlgError, ValueError):
+            coeffs = np.polyfit(ys_arr, xs_arr, 1)
+            order  = 1
 
-        # Robot is at bottom of BEV → evaluate line at y = bev_h
-        line_x_at_robot = a * cfg.bev_h + b
-        robot_x         = cfg.bev_w / 2.0
+        # Evaluation helpers — derivative dx/dy at a given y so heading is
+        # the line's tangent at that point, not the chord across all of it.
+        def _x_at(y: float) -> float:
+            return float(np.polyval(coeffs, y))
+        def _slope_at(y: float) -> float:
+            if order == 2:
+                a2, a1, _ = (float(c) for c in coeffs)
+                return 2.0 * a2 * y + a1
+            return float(coeffs[0])
+
+        # Robot is at bottom of BEV → evaluate line at y = bev_h (near) and
+        # at y = bev_h * effective_y_ratio (far) so we can sense curvature.
+        # Adaptive lookahead: at higher commanded vx, push the lookahead point
+        # further ahead so the PD has the same time-to-target. Anchored on the
+        # last commanded vx (not base_vx) so we automatically pull the lookahead
+        # back in during curvature-induced slowdowns where reaction matters more.
+        speed_norm = max(0.0, min(1.0, abs(self._last_vx) / 127.0))
+        y_ratio_eff = float(cfg.lookahead_y_ratio) - float(cfg.lookahead_speed_gain) * speed_norm
+        # Clamp eval points to spine's actual y-range — order-2 polyfit
+        # extrapolated beyond the data fit produces wild line_x values
+        # (thousands of px) when the line only occupies the upper portion
+        # of BEV, which would saturate vy/wz every other tick.
+        y_min_spine = float(ys_arr.min())
+        y_max_spine = float(ys_arr.max())
+        y_near = min(float(cfg.bev_h), y_max_spine)
+        y_far_raw = float(cfg.bev_h) * float(max(0.15, min(0.95, y_ratio_eff)))
+        y_far  = max(y_min_spine, min(y_far_raw, y_max_spine))
+
+        line_x_at_robot = _x_at(y_near)
+        # Slopes from a separate linear regression are far more stable than
+        # the local derivative of an order-2 polyfit. Order-2 derivative
+        # `2*a2*y + a1` swings wildly when the spine sample shifts even a
+        # few pixels (small ψ rotations between ticks), causing heading_error
+        # to jump 9° → 87° → saturate wz → induce more rotation → limit cycle.
+        # Linear fit slope is the average tangent across the spine and stays
+        # bounded.
+        if order == 2 and len(spine) >= 4:
+            # Full-spine linear fit as fallback / single-source slope
+            try:
+                lin_coeffs = np.polyfit(ys_arr, xs_arr, 1)
+                lin_slope  = float(lin_coeffs[0])
+            except (np.linalg.LinAlgError, ValueError):
+                lin_slope = float(_slope_at(y_near))
+
+            # Split spine in half along y to recover a curvature signal that
+            # full-spine regression averages away. Per-half linear regression
+            # is still bounded (Rule 1: never use polyfit-order-2 derivative,
+            # which jitters 9°→87° in one tick); using regression on a subset
+            # is at most as noisy as a pointwise spot, but in practice each
+            # half has ≥3 samples so the slope is smoothed.
+            y_mid = 0.5 * (float(y_min_spine) + float(y_max_spine))
+            near_mask = ys_arr >= y_mid  # high y in BEV = closer to robot
+            far_mask  = ys_arr <  y_mid  # low  y in BEV = further ahead
+
+            def _half_slope(mask: np.ndarray) -> float:
+                if int(mask.sum()) >= 3:
+                    try:
+                        c = np.polyfit(ys_arr[mask], xs_arr[mask], 1)
+                        return float(c[0])
+                    except (np.linalg.LinAlgError, ValueError):
+                        pass
+                return lin_slope
+
+            slope_near = _half_slope(near_mask)
+            slope_far  = _half_slope(far_mask)
+        else:
+            slope_near = _slope_at(y_near)
+            slope_far  = _slope_at(y_far)
+
+        # Curvature = how much the slope changes between near and far. Used
+        # purely as a magnitude for vx slowdown — sign already lives in the
+        # heading_error term.
+        curvature = abs(slope_far - slope_near)
+
+        robot_x   = cfg.bev_w / 2.0
+        target_x  = robot_x + self._target_offset_px
+
+        # ── Step 4b: Turn-marker bias ─────────────────────────────────────────
+        # Optional coloured square placed on one side of the line. While in
+        # FOV it adds a fixed pixel bias to lateral_error; once it exits, the
+        # bias persists for turn_marker_hold_frames so the robot commits to
+        # the turn even after the marker scrolls out of frame.
+        marker_side = 0   # -1 = left, +1 = right, 0 = none
+        if cfg.turn_marker:
+            marker_side = self._detect_turn_marker(hsv)
+        if marker_side != 0:
+            # +bias_px pushes lateral_error positive → robot interprets as
+            # "line drifted right" → strafes right (toward right marker).
+            self._marker_bias_px = marker_side * float(cfg.turn_marker_bias_px)
+            self._marker_hold    = max(1, int(cfg.turn_marker_hold_frames))
+        elif self._marker_hold > 0:
+            self._marker_hold -= 1
+            if self._marker_hold == 0:
+                self._marker_bias_px = 0.0
 
         # lateral_error: positive = line is to the right of the target position
-        # We want line at (robot_x + target_offset_px)
-        target_x        = robot_x + self._target_offset_px
-        lateral_error   = line_x_at_robot - target_x   # + = line right of target
+        lateral_error = (line_x_at_robot - target_x) + self._marker_bias_px
 
-        # heading_error: slope of line in BEV; ideal = vertical (slope ~0)
-        # angle in radians relative to vertical axis
-        heading_error   = float(np.arctan(a))   # + = line leans left
+        # heading_error: blend of robot-tangent and lookahead-tangent so the
+        # robot starts rotating into a curve a beat before its centre crosses
+        # the bend. arctan converts pixel slope (dx/dy) → radians vs. vertical.
+        blend = max(0.0, min(1.0, float(cfg.lookahead_blend)))
+        slope_eff    = (1.0 - blend) * slope_near + blend * slope_far
+        heading_error_raw = float(np.arctan(slope_eff))
+        # Deadband suppresses tiny slope noise on straight lines that would
+        # otherwise cause wz to nudge the robot and re-couple into vy.
+        if abs(heading_error_raw) < float(cfg.heading_deadband_rad):
+            heading_error = 0.0
+        else:
+            sign = 1.0 if heading_error_raw > 0 else -1.0
+            heading_error = sign * (abs(heading_error_raw) - float(cfg.heading_deadband_rad))
 
         # ── Step 5: PD control ────────────────────────────────────────────────
         d_lat = (lateral_error   - self._prev_lat_err) / dt
@@ -348,28 +605,47 @@ class LineFollower:
         vy = int(clamp(vy_raw, -_TWIST_LIMIT, _TWIST_LIMIT))
         wz = int(clamp(wz_raw, -_TWIST_LIMIT, _TWIST_LIMIT))
 
-        # Line found — reset grace state, save last known steering
-        self._lost_count = 0
-        self._last_vy    = vy
-        self._last_wz    = wz
+        # Line found — reset all loss/recovery state, save last steering
+        self._lost_count     = 0
+        self._recovery_count = 0
+        self._last_vy        = vy
+        self._last_wz        = wz
+
+        # ── Step 6: vx selection ──────────────────────────────────────────────
+        # Three independent slowdown sources, take the most restrictive:
+        #   a) base_vx
+        #   b) curvature scaling — faster bend ⇒ slower forward
+        #   c) ToF proximity scaling
+        vx_out = cfg.base_vx
+
+        if cfg.curvature_threshold > 0.0 and curvature > 0.0:
+            # Linear ramp from base_vx (at curvature=0) to curvature_min_vx
+            # (at curvature=threshold), clamped beyond. min_vx_factor=0.45
+            # means forward speed bottoms out at 45% of base_vx in tight bends.
+            ratio = min(1.0, curvature / float(cfg.curvature_threshold))
+            curve_factor = 1.0 - ratio * (1.0 - float(cfg.curvature_min_vx_factor))
+            vx_out = min(vx_out, max(0, int(cfg.base_vx * curve_factor)))
 
         # ToF slow-zone: when the path ahead is closer than tof_slow_distance_mm
         # but still past the emergency cut-off, halve forward speed so the
         # PD controller still gets to steer without overshooting the obstacle.
-        vx_out = cfg.base_vx
         if (front_dist is not None
                 and cfg.tof_slow_distance_mm > 0
                 and front_dist < cfg.tof_slow_distance_mm):
-            vx_out = max(0, cfg.base_vx // 2)
+            vx_out = min(vx_out, max(0, cfg.base_vx // 2))
 
         overlay = (
             self._draw_overlay(frame, bev, spine, line_x_at_robot, target_x)
             if produce_overlay else None
         )
 
+        # Cache for adaptive lookahead next tick.
+        self._last_vx = int(vx_out)
+
         return LineResult(vx_out, vy, wz, cfg.base_spd,
                           True, lateral_error, heading_error, overlay,
-                          tof_blocked=False, front_dist_mm=front_dist)
+                          tof_blocked=False, front_dist_mm=front_dist,
+                          curvature=curvature, recovery_mode="")
 
     # ── Overlay renderer ──────────────────────────────────────────────────────
 
@@ -446,12 +722,16 @@ class LineFollower:
         self._M = cv2.getPerspectiveTransform(src_pts, dst_pts)
 
     def reset_pid(self) -> None:
-        self._prev_lat_err = 0.0
-        self._prev_hdg_err = 0.0
-        self._prev_t = time.monotonic()
-        self._lost_count = 0
-        self._last_vy    = 0
-        self._last_wz    = 0
+        self._prev_lat_err   = 0.0
+        self._prev_hdg_err   = 0.0
+        self._prev_t         = time.monotonic()
+        self._lost_count     = 0
+        self._recovery_count = 0
+        self._last_vx        = 0
+        self._last_vy        = 0
+        self._last_wz        = 0
+        self._marker_bias_px = 0.0
+        self._marker_hold    = 0
 
 
 __all__ = ["LineFollower", "LineFollowerConfig", "LineResult", "HSVRange"]
