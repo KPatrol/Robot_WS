@@ -117,6 +117,33 @@
 #include <Adafruit_BNO08x.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include <esp_task_wdt.h>
+#include <esp_idf_version.h>
+
+// ============================================================================
+// DEBUG GATING
+// ----------------------------------------------------------------------------
+// `KPATROL_DEBUG` toggles human-readable diagnostic output (boot banner,
+// heartbeats, "✓ configured" notes). Protocol lines that the Pi parses —
+// ENC:, RPM:, MEC:, IMU:, IMU_COMPACT:, BAT:, TOF:, NMEA:, STATUS:, OK,
+// ERR — MUST keep using raw Serial.* and never go through DBG_*. Disabling
+// debug shortens boot, kills the 5s GPS_HB chatter, and trims UART noise
+// during deployment without changing protocol surface.
+// Set to 0 in deployment builds; 1 during development.
+// ============================================================================
+#ifndef KPATROL_DEBUG
+#define KPATROL_DEBUG 1
+#endif
+
+#if KPATROL_DEBUG
+  #define DBG_PRINT(x)        Serial.print(x)
+  #define DBG_PRINTLN(x)      Serial.println(x)
+  #define DBG_PRINTF(...)     Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_PRINT(x)        do { } while (0)
+  #define DBG_PRINTLN(x)      do { } while (0)
+  #define DBG_PRINTF(...)     do { } while (0)
+#endif
 
 // ----------------------------------------------------------------------------
 // Forward declarations (Arduino IDE auto-prototyping fix — must come before
@@ -290,10 +317,17 @@ bool mainLightState = false;    // Main light relay state (Đèn chính)
 
 // ============================================================================
 // WATCHDOG + OTA GLOBALS
-// Watchdog: auto-stop motors if Pi stops sending commands for >3s.
+// Watchdog: auto-stop motors if Pi stops sending commands for >WATCHDOG_TIMEOUT_MS.
+// 200ms bounds worst-case post-failure travel to ~20cm at 1m/s — inside the
+// SLOW zone of the ToF safety net and below human reaction time. Pi pushes
+// telemetry pings ≥10Hz (IMU poll @20Hz) so steady-state will not false-trigger.
 // OTA: firmware update via WiFi (ArduinoOTA), enabled on demand to save RAM.
 // ============================================================================
-#define WATCHDOG_TIMEOUT_MS 3000UL      // stop motors if no command for this long
+#define WATCHDOG_TIMEOUT_MS 200UL       // stop motors if no command for this long
+// Hardware task-WDT panic-reset if loop() stalls. 2s gives plenty of headroom
+// over the ~10ms typical loop period but catches fatal hangs (deadlock, runaway
+// ISR, malloc OOM) that would otherwise leave motors energised.
+#define HW_WDT_TIMEOUT_S    2
 bool watchdogEnabled    = true;
 bool watchdogTriggered  = false;
 bool otaEnabled         = false;
@@ -394,9 +428,9 @@ void gpsTask(void *param) {
     uint32_t nowMs = millis();
     if (nowMs - lastHbMs >= 5000) {
       lastHbMs = nowMs;
-      Serial.printf("GPS_HB:bytes=%u lines=%u avail=%d\n",
-                    (unsigned)gpsBytesRead, (unsigned)gpsLinesForwarded,
-                    (int)GPSSerial.available());
+      DBG_PRINTF("GPS_HB:bytes=%u lines=%u avail=%d\n",
+                 (unsigned)gpsBytesRead, (unsigned)gpsLinesForwarded,
+                 (int)GPSSerial.available());
     }
     vTaskDelay(pdMS_TO_TICKS(10));  // 100Hz poll, NMEA at 9600 ≈ 1KB/s
   }
@@ -409,13 +443,30 @@ void setup() {
   // Serial initialization (UART mode - USB CDC must be OFF)
   Serial.begin(115200);
   delay(1000);
+
+  // Hardware task-watchdog: panic-reset chip if loop() stalls > HW_WDT_TIMEOUT_S.
+  // Catches deadlocks, runaway ISRs, OOM — guarantees motors de-energise via
+  // power-on reset rather than staying stuck at last PWM. We init here but
+  // defer subscribe(NULL) until the bottom of setup() so multi-second module
+  // init (BNO08x boot, GPS task spin-up) doesn't trip the panic before loop.
+#if ESP_IDF_VERSION_MAJOR >= 5
+  // ESP-IDF 5.x (Arduino core 3.x): init takes a config struct.
+  esp_task_wdt_config_t hwWdtCfg = {
+    .timeout_ms = HW_WDT_TIMEOUT_S * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true,
+  };
+  esp_task_wdt_init(&hwWdtCfg);
+#else
+  esp_task_wdt_init(HW_WDT_TIMEOUT_S, true);
+#endif
   
-  Serial.println("\n\n");
-  Serial.println("========================================");
-  Serial.println("  KPatrol - Mecanum Wheel Control");
-  Serial.println("  4 Motors (FR + FL + BR + BL)");
-  Serial.println("========================================");
-  Serial.println("Initializing motors...");
+  DBG_PRINTLN("\n\n");
+  DBG_PRINTLN("========================================");
+  DBG_PRINTLN("  KPatrol - Mecanum Wheel Control");
+  DBG_PRINTLN("  4 Motors (FR + FL + BR + BL)");
+  DBG_PRINTLN("========================================");
+  DBG_PRINTLN("Initializing motors...");
   
   // ===== FRONT-RIGHT MOTOR SETUP =====
   ledcSetup(FR_PWM_CH_R, PWM_FREQ, PWM_RES);
@@ -428,7 +479,7 @@ void setup() {
   digitalWrite(FR_L_EN, HIGH);
   ledcWrite(FR_PWM_CH_R, 0);
   ledcWrite(FR_PWM_CH_L, 0);
-  Serial.println("✓ Front-Right motor configured");
+  DBG_PRINTLN("✓ Front-Right motor configured");
   
   // ===== FRONT-LEFT MOTOR SETUP =====
   ledcSetup(FL_PWM_CH_R, PWM_FREQ, PWM_RES);
@@ -441,7 +492,7 @@ void setup() {
   digitalWrite(FL_L_EN, HIGH);
   ledcWrite(FL_PWM_CH_R, 0);
   ledcWrite(FL_PWM_CH_L, 0);
-  Serial.println("✓ Front-Left motor configured");
+  DBG_PRINTLN("✓ Front-Left motor configured");
   
   // ===== BACK-RIGHT MOTOR SETUP =====
   ledcSetup(BR_PWM_CH_R, PWM_FREQ, PWM_RES);
@@ -454,7 +505,7 @@ void setup() {
   digitalWrite(BR_L_EN, HIGH);
   ledcWrite(BR_PWM_CH_R, 0);
   ledcWrite(BR_PWM_CH_L, 0);
-  Serial.println("✓ Back-Right motor configured");
+  DBG_PRINTLN("✓ Back-Right motor configured");
   
   // ===== BACK-LEFT MOTOR SETUP =====
   ledcSetup(BL_PWM_CH_R, PWM_FREQ, PWM_RES);
@@ -467,15 +518,15 @@ void setup() {
   digitalWrite(BL_L_EN, HIGH);
   ledcWrite(BL_PWM_CH_R, 0);
   ledcWrite(BL_PWM_CH_L, 0);
-  Serial.println("✓ Back-Left motor configured");
+  DBG_PRINTLN("✓ Back-Left motor configured");
   
   // ===== LIGHT RELAY SETUP =====
   pinMode(RELAY_WARNING_LIGHT_PIN, OUTPUT);
   pinMode(RELAY_MAIN_LIGHT_PIN, OUTPUT);
   warning_light_off();  // Start with warning light OFF
   main_light_off();     // Start with main light OFF
-  Serial.println("✓ Warning Light relay configured (GPIO 38)");
-  Serial.println("✓ Main Light relay configured (GPIO 39)");
+  DBG_PRINTLN("✓ Warning Light relay configured (GPIO 38)");
+  DBG_PRINTLN("✓ Main Light relay configured (GPIO 39)");
 
   // ===== SAFETY HARDWARE SETUP (V10.1) =====
   pinMode(BUZZER_PIN, OUTPUT);
@@ -484,8 +535,8 @@ void setup() {
   remote_relay_cutoff_set(false);
   pinMode(ESTOP_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), estopISR, FALLING);
-  Serial.printf("✓ Buzzer GPIO%d, Remote-relay GPIO%d, E-Stop GPIO%d (FALLING ISR)\n",
-                BUZZER_PIN, REMOTE_RELAY_PIN, ESTOP_PIN);
+  DBG_PRINTF("✓ Buzzer GPIO%d, Remote-relay GPIO%d, E-Stop GPIO%d (FALLING ISR)\n",
+             BUZZER_PIN, REMOTE_RELAY_PIN, ESTOP_PIN);
 
   // ===== BATTERY ADC SETUP (V10.2) =====
   // 11dB attenuation maps the divider's 0-2.3V into the ADC's full-scale
@@ -496,54 +547,60 @@ void setup() {
   batteryAdcReady = true;
   // Prime the EMA so the first BAT line is meaningful instead of 0%.
   for (int i = 0; i < 4; ++i) updateBattery();
-  Serial.printf("✓ Battery ADC GPIO%d (R_top=%dΩ, R_bot=%dΩ, %d cells)\n",
-                BATTERY_PIN, BATTERY_R_TOP_OHM, BATTERY_R_BOT_OHM,
-                BATTERY_CELLS);
+  DBG_PRINTF("✓ Battery ADC GPIO%d (R_top=%dΩ, R_bot=%dΩ, %d cells)\n",
+             BATTERY_PIN, BATTERY_R_TOP_OHM, BATTERY_R_BOT_OHM,
+             BATTERY_CELLS);
   
   // ===== BNO08x IMU SETUP (UART Mode) =====
-  Serial.println("\nInitializing BNO08x IMU...");
+  DBG_PRINTLN("\nInitializing BNO08x IMU...");
   Serial1.begin(3000000, SERIAL_8N1, BNO08X_RX, BNO08X_TX);
-  
+
   if (bno08x.begin_UART(&Serial1)) {
     imuInitialized = true;
-    Serial.println("✓ BNO08x IMU initialized (UART mode)");
-    
+    DBG_PRINTLN("✓ BNO08x IMU initialized (UART mode)");
+
     // Enable rotation vector report
     if (bno08x.enableReport(SH2_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US)) {
-      Serial.println("  Rotation Vector: OK (20Hz)");
+      DBG_PRINTLN("  Rotation Vector: OK (20Hz)");
     } else {
-      Serial.println("  Rotation Vector: FAILED");
+      DBG_PRINTLN("  Rotation Vector: FAILED");
     }
   } else {
     imuInitialized = false;
-    Serial.println("✗ BNO08x not found! Check wiring:");
-    Serial.println("    VIN → 3.3V");
-    Serial.println("    GND → GND");
-    Serial.println("    SDA → GPIO 35");
-    Serial.println("    SCL → GPIO 36");
-    Serial.println("    RST → GPIO 37 (or 3.3V)");
+    DBG_PRINTLN("✗ BNO08x not found! Check wiring:");
+    DBG_PRINTLN("    VIN → 3.3V");
+    DBG_PRINTLN("    GND → GND");
+    DBG_PRINTLN("    SDA → GPIO 35");
+    DBG_PRINTLN("    SCL → GPIO 36");
+    DBG_PRINTLN("    RST → GPIO 37 (or 3.3V)");
   }
 
   // ===== GPS NEO-6M SETUP (UART2 on Core 0) =====
-  Serial.println("\nInitializing GPS NEO-6M (UART2)...");
+  DBG_PRINTLN("\nInitializing GPS NEO-6M (UART2)...");
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   delay(50);
   gpsEnabled = true;
   BaseType_t taskOk = xTaskCreatePinnedToCore(
       gpsTask, "gpsTask", 4096, NULL, 1, &gpsTaskHandle, GPS_TASK_CORE);
   if (taskOk == pdPASS) {
-    Serial.printf("✓ GPS UART2 ready (RX=GPIO%d, TX=GPIO%d, %d baud, Core %d)\n",
-                  GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD, GPS_TASK_CORE);
-    Serial.println("  Forwarding NMEA sentences to Pi with prefix 'NMEA:'");
+    DBG_PRINTF("✓ GPS UART2 ready (RX=GPIO%d, TX=GPIO%d, %d baud, Core %d)\n",
+               GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD, GPS_TASK_CORE);
+    DBG_PRINTLN("  Forwarding NMEA sentences to Pi with prefix 'NMEA:'");
   } else {
     gpsEnabled = false;
-    Serial.println("✗ GPS task creation FAILED — outdoor mode disabled");
+    DBG_PRINTLN("✗ GPS task creation FAILED — outdoor mode disabled");
   }
 
+  // Hardware WDT subscribe — from now on loop() must reset within HW_WDT_TIMEOUT_S.
+  esp_task_wdt_add(NULL);
+  DBG_PRINTF("✓ Hardware task-WDT armed (%ds)\n", HW_WDT_TIMEOUT_S);
+
   // System ready
-  Serial.println("\n✓ Mecanum system ready!");
-  Serial.println("----------------------------------------");
+  DBG_PRINTLN("\n✓ Mecanum system ready!");
+  DBG_PRINTLN("----------------------------------------");
+#if KPATROL_DEBUG
   printHelp();
+#endif
 }
 
 // ============================================================================
@@ -659,7 +716,7 @@ void BL_stop() {
 // ============================================================================
 
 void mecanum_forward(int speed) {
-  Serial.println("\n>>> MECANUM: FORWARD <<<");
+  DBG_PRINTLN("\n>>> MECANUM: FORWARD <<<");
   FR_forward(speed);
   FL_forward(speed);
   BR_forward(speed);
@@ -667,7 +724,7 @@ void mecanum_forward(int speed) {
 }
 
 void mecanum_backward(int speed) {
-  Serial.println("\n>>> MECANUM: BACKWARD <<<");
+  DBG_PRINTLN("\n>>> MECANUM: BACKWARD <<<");
   FR_backward(speed);
   FL_backward(speed);
   BR_backward(speed);
@@ -675,7 +732,7 @@ void mecanum_backward(int speed) {
 }
 
 void mecanum_strafe_right(int speed) {
-  Serial.println("\n>>> MECANUM: STRAFE RIGHT <<<");
+  DBG_PRINTLN("\n>>> MECANUM: STRAFE RIGHT <<<");
   FR_backward(speed);  // Front-Right backward
   FL_forward(speed);   // Front-Left forward
   BR_forward(speed);   // Back-Right forward
@@ -683,7 +740,7 @@ void mecanum_strafe_right(int speed) {
 }
 
 void mecanum_strafe_left(int speed) {
-  Serial.println("\n>>> MECANUM: STRAFE LEFT <<<");
+  DBG_PRINTLN("\n>>> MECANUM: STRAFE LEFT <<<");
   FR_forward(speed);   // Front-Right forward
   FL_backward(speed);  // Front-Left backward
   BR_backward(speed);  // Back-Right backward
@@ -691,7 +748,7 @@ void mecanum_strafe_left(int speed) {
 }
 
 void mecanum_rotate_right(int speed) {
-  Serial.println("\n>>> MECANUM: ROTATE RIGHT <<<");
+  DBG_PRINTLN("\n>>> MECANUM: ROTATE RIGHT <<<");
   FR_backward(speed);  // Right side backward
   FL_forward(speed);   // Left side forward
   BR_backward(speed);  // Right side backward
@@ -699,7 +756,7 @@ void mecanum_rotate_right(int speed) {
 }
 
 void mecanum_rotate_left(int speed) {
-  Serial.println("\n>>> MECANUM: ROTATE LEFT <<<");
+  DBG_PRINTLN("\n>>> MECANUM: ROTATE LEFT <<<");
   FR_forward(speed);   // Right side forward
   FL_backward(speed);  // Left side backward
   BR_forward(speed);   // Right side forward
@@ -707,7 +764,7 @@ void mecanum_rotate_left(int speed) {
 }
 
 void mecanum_diagonal_forward_right(int speed) {
-  Serial.println("\n>>> MECANUM: DIAGONAL FORWARD-RIGHT <<<");
+  DBG_PRINTLN("\n>>> MECANUM: DIAGONAL FORWARD-RIGHT <<<");
   FR_stop();           // Front-Right stationary
   FL_forward(speed);   // Front-Left forward
   BR_forward(speed);   // Back-Right forward
@@ -715,15 +772,32 @@ void mecanum_diagonal_forward_right(int speed) {
 }
 
 void mecanum_diagonal_forward_left(int speed) {
-  Serial.println("\n>>> MECANUM: DIAGONAL FORWARD-LEFT <<<");
+  DBG_PRINTLN("\n>>> MECANUM: DIAGONAL FORWARD-LEFT <<<");
   FR_forward(speed);   // Front-Right forward
   FL_stop();           // Front-Left stationary
   BR_stop();           // Back-Right stationary
   BL_forward(speed);   // Back-Left forward
 }
 
+// Reverse diagonals — mirror DR/DL with reversed motor direction
+void mecanum_diagonal_backward_right(int speed) {
+  DBG_PRINTLN("\n>>> MECANUM: DIAGONAL BACKWARD-RIGHT <<<");
+  FR_backward(speed);  // Front-Right backward
+  FL_stop();
+  BR_stop();
+  BL_backward(speed);  // Back-Left backward
+}
+
+void mecanum_diagonal_backward_left(int speed) {
+  DBG_PRINTLN("\n>>> MECANUM: DIAGONAL BACKWARD-LEFT <<<");
+  FR_stop();
+  FL_backward(speed);  // Front-Left backward
+  BR_backward(speed);  // Back-Right backward
+  BL_stop();
+}
+
 void mecanum_stop() {
-  Serial.println("\n>>> MECANUM: STOP ALL <<<");
+  DBG_PRINTLN("\n>>> MECANUM: STOP ALL <<<");
   FR_stop();
   FL_stop();
   BR_stop();
@@ -739,7 +813,32 @@ void mecanum_active_brake(int brake_pwm = 80) {
   ledcWrite(BL_PWM_CH_R, brake_pwm); ledcWrite(BL_PWM_CH_L, brake_pwm);
   delay(40);
   FR_stop(); FL_stop(); BR_stop(); BL_stop();
-  Serial.println(">>> MECANUM: ACTIVE BRAKE <<<");
+  DBG_PRINTLN(">>> MECANUM: ACTIVE BRAKE <<<");
+}
+
+// Hardware-level cutoff: drive every BTS7960 *_EN pin LOW so the gate drivers
+// disable the H-bridge regardless of PWM state. Use on watchdog trip, e-stop,
+// or any safety lockout — PWM=0 alone leaves the bridge enabled, so a stuck
+// PWM line could re-energise the motor; pulling EN LOW is the hard guarantee.
+volatile bool motorsDisabledByLockout = false;
+void motors_disable_all() {
+  digitalWrite(FR_R_EN, LOW); digitalWrite(FR_L_EN, LOW);
+  digitalWrite(FL_R_EN, LOW); digitalWrite(FL_L_EN, LOW);
+  digitalWrite(BR_R_EN, LOW); digitalWrite(BR_L_EN, LOW);
+  digitalWrite(BL_R_EN, LOW); digitalWrite(BL_L_EN, LOW);
+  ledcWrite(FR_PWM_CH_R, 0); ledcWrite(FR_PWM_CH_L, 0);
+  ledcWrite(FL_PWM_CH_R, 0); ledcWrite(FL_PWM_CH_L, 0);
+  ledcWrite(BR_PWM_CH_R, 0); ledcWrite(BR_PWM_CH_L, 0);
+  ledcWrite(BL_PWM_CH_R, 0); ledcWrite(BL_PWM_CH_L, 0);
+  motorsDisabledByLockout = true;
+}
+
+void motors_enable_all() {
+  digitalWrite(FR_R_EN, HIGH); digitalWrite(FR_L_EN, HIGH);
+  digitalWrite(FL_R_EN, HIGH); digitalWrite(FL_L_EN, HIGH);
+  digitalWrite(BR_R_EN, HIGH); digitalWrite(BR_L_EN, HIGH);
+  digitalWrite(BL_R_EN, HIGH); digitalWrite(BL_L_EN, HIGH);
+  motorsDisabledByLockout = false;
 }
 
 // ============================================================================
@@ -935,14 +1034,29 @@ void IRAM_ATTR estopISR() {
 
 void handleEstopIfTriggered() {
   static bool announced = false;
-  if (!estopTriggered) { announced = false; return; }
-  // Hold motors stopped; idempotent — safe to call every loop().
-  FR_stop(); FL_stop(); BR_stop(); BL_stop();
+  if (!estopTriggered) {
+    if (announced) {
+      // E-stop just cleared (parser ran ESTOP_CLEAR). Re-arm motors so the next
+      // command can drive them again — until then EN pins stay LOW.
+      motors_enable_all();
+      announced = false;
+    }
+    return;
+  }
   if (!announced) {
+    // First entry: hard-cut via active brake + EN-pin disable, alarm, light.
+    mecanum_active_brake();
+    motors_disable_all();
     warning_light_on();
     buzzer_start_pattern(BUZZ_ALARM);
     Serial.println("ESTOP:TRIGGERED source=physical_button");
     announced = true;
+  } else {
+    // Idempotent hold: keep PWM 0 even if a stray write tried to re-arm.
+    ledcWrite(FR_PWM_CH_R, 0); ledcWrite(FR_PWM_CH_L, 0);
+    ledcWrite(FL_PWM_CH_R, 0); ledcWrite(FL_PWM_CH_L, 0);
+    ledcWrite(BR_PWM_CH_R, 0); ledcWrite(BR_PWM_CH_L, 0);
+    ledcWrite(BL_PWM_CH_R, 0); ledcWrite(BL_PWM_CH_L, 0);
   }
 }
 
@@ -956,10 +1070,13 @@ void remote_relay_cutoff_set(bool cutoff) {
   bool level = REMOTE_RELAY_ACTIVE_HIGH ? cutoff : !cutoff;
   digitalWrite(REMOTE_RELAY_PIN, level ? HIGH : LOW);
   if (cutoff) {
-    FR_stop(); FL_stop(); BR_stop(); BL_stop();
+    mecanum_active_brake();
+    motors_disable_all();
     warning_light_on();
     Serial.println("REMOTE_RELAY:CUTOFF — motors disabled");
   } else {
+    // Re-arm EN pins only if no other lockout is active.
+    if (!estopTriggered && !watchdogTriggered) motors_enable_all();
     Serial.println("REMOTE_RELAY:RELEASED — motors re-enabled");
   }
 }
@@ -1422,6 +1539,10 @@ void runTestSequence() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
+  // Pet the hardware task-WDT. Must run before any code path that could
+  // throw / block — but after we have a chance to abort if WDT is unhealthy.
+  esp_task_wdt_reset();
+
   // Update IMU data continuously
   updateIMU();
 
@@ -1443,6 +1564,7 @@ void loop() {
     // (IMU, status, etc.) are still allowed.
     bool isMotion = (command == "F" || command == "B" || command == "SR" || command == "SL" ||
                      command == "R" || command == "L" || command == "DR" || command == "DL" ||
+                     command == "BL" || command == "BR" ||
                      command == "BRAKE" ||
                      command == "FR_F" || command == "FR_B" ||
                      command == "FL_F" || command == "FL_B" ||
@@ -1536,6 +1658,12 @@ void loop() {
     }
     else if (command == "DL") {
       mecanum_diagonal_forward_left(currentSpeed);
+    }
+    else if (command == "BR") {
+      mecanum_diagonal_backward_right(currentSpeed);
+    }
+    else if (command == "BL") {
+      mecanum_diagonal_backward_left(currentSpeed);
     }
     else if (command == "S") {
       mecanum_stop();
@@ -1815,15 +1943,22 @@ void loop() {
 
     lastCommandTime = millis();
     // Any recognized command clears the watchdog trigger so motors can move
-    // again after the Pi recovers from a brief silence.
+    // again after the Pi recovers from a brief silence. Re-arm EN pins only
+    // if e-stop / remote cutoff are NOT also active — those keep the lockout.
+    if (watchdogTriggered && !estopTriggered && !remoteRelayCutoff) {
+      motors_enable_all();
+    }
     watchdogTriggered = false;
   }
 
   // Watchdog: auto-stop motors if Pi goes silent for > WATCHDOG_TIMEOUT_MS.
-  // Runs every loop iteration, independent of Serial.available().
+  // Runs every loop iteration, independent of Serial.available(). Hard-cut via
+  // active_brake (~50ms stop) + EN-pin disable so a runaway PWM line cannot
+  // re-energise the bridge while we wait for the Pi.
   if (watchdogEnabled && !watchdogTriggered &&
       (millis() - lastCommandTime) > WATCHDOG_TIMEOUT_MS) {
-    mecanum_stop();
+    mecanum_active_brake();
+    motors_disable_all();
     watchdogTriggered = true;
     Serial.print("WDT:STOP timeout_ms=");
     Serial.println(millis() - lastCommandTime);
