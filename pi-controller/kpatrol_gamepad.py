@@ -100,12 +100,16 @@ class GamepadController:
         self.connected = False
         self.running = True
         
-        # Gamepad state
-        self.left_x = 0.0    # Strafe
-        self.left_y = 0.0    # Forward/Backward
-        self.right_x = 0.0   # Rotation
+        # Analog stick state (raw axis input)
+        self.stick_x = 0.0    # Strafe (left stick X)
+        self.stick_y = 0.0    # Forward/Backward (left stick Y, inverted)
+        self.right_x = 0.0    # Rotation (right stick X)
+        # D-pad state — kept separate so stick-center events do not zero
+        # a held D-pad direction. Effective input = stick OR dpad (priority dpad).
+        self.dpad_x = 0.0
+        self.dpad_y = 0.0
         self.max_speed = 200
-        
+
         # Buttons
         self.emergency_stop = False
         
@@ -139,45 +143,46 @@ class GamepadController:
         """Xử lý event từ gamepad"""
         # Left stick X (Strafe)
         if event.code == 'ABS_X':
-            self.left_x = event.state / MAX_AXIS
-            
+            self.stick_x = event.state / MAX_AXIS
+
         # Left stick Y (Forward/Backward)
         elif event.code == 'ABS_Y':
-            self.left_y = -event.state / MAX_AXIS  # Invert
-            
+            self.stick_y = -event.state / MAX_AXIS  # Invert
+
         # Right stick X (Rotation)
         elif event.code == 'ABS_RX':
             self.right_x = event.state / MAX_AXIS
-            
+
         # Right stick Y
         elif event.code == 'ABS_RY':
             pass  # Not used
-            
+
         # Triggers for speed control
         elif event.code == 'ABS_Z':  # Left trigger
             # Reduce speed
             self.max_speed = max(50, 200 - int(event.state / 255 * 150))
-            
+
         elif event.code == 'ABS_RZ':  # Right trigger
             # Boost speed
             self.max_speed = min(255, 200 + int(event.state / 255 * 55))
-            
-        # D-Pad
+
+        # D-Pad — kept separate from stick so released-dpad does not require
+        # a fresh stick event to take effect.
         elif event.code == 'ABS_HAT0Y':
             if event.state == -1:
-                self.left_y = 1.0  # D-pad Up
+                self.dpad_y = 1.0   # Up
             elif event.state == 1:
-                self.left_y = -1.0  # D-pad Down
+                self.dpad_y = -1.0  # Down
             else:
-                self.left_y = 0
-                
+                self.dpad_y = 0.0
+
         elif event.code == 'ABS_HAT0X':
             if event.state == -1:
-                self.left_x = -1.0  # D-pad Left
+                self.dpad_x = -1.0  # Left
             elif event.state == 1:
-                self.left_x = 1.0  # D-pad Right
+                self.dpad_x = 1.0   # Right
             else:
-                self.left_x = 0
+                self.dpad_x = 0.0
                 
         # Buttons
         elif event.code == 'BTN_SOUTH' and event.state == 1:  # A button
@@ -197,11 +202,15 @@ class GamepadController:
         """Cập nhật tốc độ motor"""
         if self.emergency_stop:
             return
-            
+
+        # Effective input: D-pad takes priority when held; otherwise stick.
+        eff_x = self.dpad_x if self.dpad_x != 0.0 else self.stick_x
+        eff_y = self.dpad_y if self.dpad_y != 0.0 else self.stick_y
+
         # Calculate wheel speeds
         fl, fr, bl, br = MecanumMixer.mix(
-            self.left_x,
-            self.left_y,
+            eff_x,
+            eff_y,
             self.right_x,
             self.max_speed
         )
@@ -283,8 +292,11 @@ Press START button or Ctrl+C to exit.
                     
                     # Status display
                     status = "⛔ EMERGENCY" if self.emergency_stop else "🟢 ACTIVE"
+                    eff_x = self.dpad_x if self.dpad_x != 0.0 else self.stick_x
+                    eff_y = self.dpad_y if self.dpad_y != 0.0 else self.stick_y
+                    src = "DPAD" if (self.dpad_x or self.dpad_y) else "STK "
                     sys.stdout.write(f"\r   Status: {status} | Speed: {self.max_speed} | "
-                                   f"X:{self.left_x:+.2f} Y:{self.left_y:+.2f} R:{self.right_x:+.2f}   ")
+                                   f"{src} X:{eff_x:+.2f} Y:{eff_y:+.2f} R:{self.right_x:+.2f}   ")
                     sys.stdout.flush()
                     
                 time.sleep(0.01)
