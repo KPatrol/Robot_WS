@@ -28,6 +28,7 @@ Design
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -90,6 +91,17 @@ class AlertActuator:
         # BEEP patterns so a 10-Hz event stream doesn't flood the serial link.
         self._light_ts: float = 0.0
         self._buzzer_ts: float = 0.0
+
+        # Dispatch UART writes via a background worker so safety callbacks
+        # (detection / tipover / battery) never block the main loop on a
+        # slow serial port. Bounded queue drops oldest on overflow rather
+        # than back-pressuring the safety thread.
+        self._tx_queue: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=32)
+        self._tx_stop = threading.Event()
+        self._tx_thread = threading.Thread(
+            target=self._tx_loop, name="alert_actuator_tx", daemon=True,
+        )
+        self._tx_thread.start()
 
     # ------------------------------------------------------------------
     # Public API
@@ -186,23 +198,71 @@ class AlertActuator:
         return {"light": light, "buzzer": buzzer}
 
     def _write_light(self, pattern: str) -> None:
-        try:
-            ok = bool(self.send_cmd(f"LP:{pattern}"))
-        except Exception as exc:
-            log.warning("[actuator] light send raised: %s", exc)
-            ok = False
-        if ok:
-            with self._lock:
-                self._light = pattern
-                self._light_ts = time.monotonic()
+        # Optimistically update local state — the UART write is queued and
+        # drained off-thread so callers don't block on serial. Worker logs
+        # failures; coalescing in _apply already prevents loops on errors.
+        with self._lock:
+            self._light = pattern
+            self._light_ts = time.monotonic()
+        self._enqueue(f"LP:{pattern}")
 
     def _write_buzzer(self, pattern: str) -> None:
+        with self._lock:
+            self._buzzer = pattern
+            self._buzzer_ts = time.monotonic()
+        self._enqueue(f"BUZZ:{pattern}")
+
+    def _enqueue(self, line: str) -> None:
         try:
-            ok = bool(self.send_cmd(f"BUZZ:{pattern}"))
-        except Exception as exc:
-            log.warning("[actuator] buzzer send raised: %s", exc)
-            ok = False
-        if ok:
-            with self._lock:
-                self._buzzer = pattern
-                self._buzzer_ts = time.monotonic()
+            self._tx_queue.put_nowait(line)
+        except queue.Full:
+            # Drop the oldest queued line to keep the most recent intent.
+            # Safety patterns are idempotent — losing a stale frame is fine.
+            try:
+                _ = self._tx_queue.get_nowait()
+                self._tx_queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._tx_queue.put_nowait(line)
+            except queue.Full:
+                log.warning("[actuator] tx queue still full after drop; dropping %s", line)
+
+    def _tx_loop(self) -> None:
+        while not self._tx_stop.is_set():
+            try:
+                line = self._tx_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if line is None:  # sentinel
+                self._tx_queue.task_done()
+                break
+            try:
+                self.send_cmd(line)
+            except Exception as exc:
+                log.warning("[actuator] send_cmd raised for %s: %s", line, exc)
+            finally:
+                self._tx_queue.task_done()
+
+    def _drain_for_tests(self, timeout: float = 1.0) -> None:
+        """Block until the TX queue has been fully drained. Test-only.
+
+        Production code must never call this — the whole point of the worker
+        thread is to keep safety callbacks off the UART critical path.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._tx_queue.unfinished_tasks == 0:
+                return
+            time.sleep(0.005)
+
+    def shutdown(self, timeout: float = 1.0) -> None:
+        """Stop the background TX worker. Safe to call multiple times."""
+        if self._tx_stop.is_set():
+            return
+        self._tx_stop.set()
+        try:
+            self._tx_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._tx_thread.join(timeout=timeout)
