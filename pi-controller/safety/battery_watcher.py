@@ -29,17 +29,26 @@ log = logging.getLogger("kpatrol.safety.battery")
 
 @dataclass
 class BatteryConfig:
+    # LFP 4S (10000 mAh) — discharge curve is flat from ~95% to ~15% then
+    # cliffs hard. Set "low" higher than a Li-ion pack so the operator has
+    # time to dock before voltage collapses.
     # Below this percentage we are "low" — slow blink + occasional beep.
-    low_pct: float = 25.0
+    low_pct: float = 30.0
     # Below this percentage we are "critical" — strobe + alarm + must dock.
-    critical_pct: float = 10.0
+    # 20% on LFP ≈ 12.4V (4S) which is still above the BMS cutoff (~10V) but
+    # already on the steep part of the curve, so we want to halt patrols here.
+    critical_pct: float = 20.0
     # Hysteresis: once we've fired LOW we don't clear back to NORMAL until
-    # the battery climbs at least this many points above low_pct (e.g. 25 + 3
-    # = 28%). Prevents oscillation when the pack rests near the threshold.
+    # the battery climbs at least this many points above low_pct (e.g. 30 + 3
+    # = 33%). Prevents oscillation when the pack rests near the threshold.
     hysteresis_pct: float = 3.0
     # Re-fire the same level no more than this often. Prevents the actuator
-    # from being re-armed every telemetry tick.
-    refire_interval_sec: float = 60.0
+    # from being re-armed every telemetry tick. 10s for "low" gives a clear
+    # operator-noticeable cadence; below we re-fire even faster on critical.
+    refire_interval_sec: float = 10.0
+    # Critical-level re-fire is shorter: we want the alarm/strobe re-armed
+    # promptly if a downstream actuator dropped the event.
+    refire_interval_critical_sec: float = 3.0
 
 
 _LEVELS = ("normal", "low", "critical")
@@ -80,9 +89,12 @@ class BatteryWatcher:
                 fire = True
             elif _rank(new_level) < _rank(cur) and self._has_recovered(p, cur):
                 fire = True
-                self._level = new_level
-            elif new_level == cur and new_level != "normal" and now - last >= cfg.refire_interval_sec:
-                fire = True
+            elif new_level == cur and new_level != "normal":
+                refire = (cfg.refire_interval_critical_sec
+                          if new_level == "critical"
+                          else cfg.refire_interval_sec)
+                fire = (now - last) >= refire
+            # else fall through to fire = False below
             else:
                 fire = False
             if fire:
