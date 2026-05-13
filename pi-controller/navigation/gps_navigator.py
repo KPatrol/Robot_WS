@@ -84,6 +84,25 @@ def shortest_angle_deg(target_deg: float, current_deg: float) -> float:
     return err
 
 
+def local_xy_m(lat0: float, lon0: float, lat: float, lon: float):
+    """Project (lat,lon) into a local east/north metric frame anchored at
+    (lat0,lon0). Flat-earth, accurate for the few-hundred-metre legs we
+    plan; avoids expensive UTM/Mercator setup."""
+    dlat = math.radians(lat - lat0)
+    dlon = math.radians(lon - lon0)
+    coslat = math.cos(math.radians(lat0))
+    north = dlat * _EARTH_R_M
+    east  = dlon * _EARTH_R_M * coslat
+    return east, north
+
+
+def bearing_from_xy(de: float, dn: float) -> float:
+    """Bearing (deg true, 0=N CW) of vector (east=de, north=dn)."""
+    if abs(de) < 1e-9 and abs(dn) < 1e-9:
+        return 0.0
+    return (math.degrees(math.atan2(de, dn)) + 360.0) % 360.0
+
+
 # ─── Data classes ────────────────────────────────────────────────────
 @dataclass
 class Waypoint:
@@ -120,8 +139,10 @@ class GPSNavigatorConfig:
     # ── Heading control ─────────────────────────────────────────────
     coarse_align_deg:   float = 25.0   # |err| > this → rotate in place
     align_ok_deg:       float =  8.0   # exit TURNING when |err| < this
-    heading_kp:         float =  1.4   # error_deg → wz scale
-    heading_max_wz:     int   =  60    # cap rotational speed
+    heading_kp:         float =  1.4   # error_deg → wz scale (P term)
+    heading_kd:         float =  0.18  # error_deg/s → wz scale (D term, damps overshoot)
+    heading_max_wz:     int   =  60    # cap rotational speed at low forward speed
+    heading_max_wz_min: int   =  35    # cap at full forward speed (to avoid swerving)
     turn_speed:         int   =  55    # in-place TURNING wz magnitude
 
     # ── Forward speed ───────────────────────────────────────────────
@@ -129,6 +150,17 @@ class GPSNavigatorConfig:
     base_spd:           int   =  90    # ESP32 absolute (0..255) at 100%
     slow_distance_m:    float =  4.0   # below this distance → ramp speed down
     slow_min_factor:    float =  0.40  # min multiplier near waypoint
+
+    # ── Cross-track correction (pure-pursuit-lite) ──────────────────
+    # When ON and a previous waypoint exists, the navigator aims at a
+    # virtual lookahead point on the line prev→current rather than at
+    # the waypoint itself, so the robot tracks the planned path instead
+    # of "shortcutting" between waypoints.
+    crosstrack_enabled:    bool  = True
+    crosstrack_lookahead_m: float = 3.0   # distance ahead along the leg
+    # If cross-track error exceeds this, project lookahead just to the
+    # nearest leg point so we re-acquire the line before chasing forward.
+    crosstrack_max_offset_m: float = 4.0
 
     # ── Reactive safety ─────────────────────────────────────────────
     safety_emergency_mm: int   = 350    # full stop if front below this
@@ -150,15 +182,27 @@ class GPSNavigatorConfig:
     # ── IMU calibration ─────────────────────────────────────────────
     imu_yaw_offset_deg:  float = 0.0   # added to imu_yaw before use
 
+    # ── Stuck / progress monitor ────────────────────────────────────
+    # If DRIVING for stuck_check_s and best-recent distance has dropped
+    # by less than stuck_progress_m, we briefly back off + re-align so
+    # the robot doesn't grind into an obstacle the front ToF can't see
+    # (low/wide kerb, planter, soft hedge). Set stuck_check_s=0 to
+    # disable.
+    stuck_check_s:    float = 8.0
+    stuck_progress_m: float = 0.6
+    stuck_back_s:     float = 1.2     # how long to drive vx<0 once stuck
+    stuck_back_vx:    int   = -45     # gentle reverse
+
 
 class GPSState(str, Enum):
-    IDLE        = "IDLE"
-    NO_FIX      = "NO_FIX"
-    TURNING     = "TURNING"
-    DRIVING     = "DRIVING"
-    ARRIVED     = "ARRIVED"
-    SAFETY_STOP = "SAFETY_STOP"
-    DONE        = "DONE"
+    IDLE         = "IDLE"
+    NO_FIX       = "NO_FIX"
+    TURNING      = "TURNING"
+    DRIVING      = "DRIVING"
+    ARRIVED      = "ARRIVED"
+    SAFETY_STOP  = "SAFETY_STOP"
+    BACKING_OFF  = "BACKING_OFF"
+    DONE         = "DONE"
 
 
 class GPSNavResult(NamedTuple):
@@ -179,6 +223,13 @@ class _RuntimeStats:
     last_fix_ts:      float = 0.0
     waypoint_index:   int   = 0
     started_ts:       float = 0.0
+    last_xtrack_m:    float = float("nan")   # signed cross-track error
+    # Stuck monitor: best (smallest) distance seen recently while DRIVING,
+    # and the timestamp at which we logged it. If we don't beat it by
+    # stuck_progress_m within stuck_check_s, we trigger BACKING_OFF.
+    best_distance_m:  float = float("inf")
+    best_distance_ts: float = 0.0
+    backoff_until_ts: float = 0.0
 
 
 # ─── Navigator ──────────────────────────────────────────────────────
@@ -194,6 +245,15 @@ class GPSNavigator:
         self._prev_state: GPSState = GPSState.IDLE
         self._stats = _RuntimeStats()
         self._running: bool = False
+        # Heading-PD state — previous error and timestamp so D-term has a
+        # stable dt; reset across waypoint changes to avoid spikes.
+        self._prev_err_deg: float = 0.0
+        self._prev_err_ts:  float = 0.0
+        # Cross-track baseline: the leg start point. Default to "current
+        # robot position at the moment we begin tracking this waypoint",
+        # captured on first DRIVING tick of each leg.
+        self._leg_start_lat: Optional[float] = None
+        self._leg_start_lon: Optional[float] = None
 
     # ── Route management ──────────────────────────────────────────
     def set_route(self, waypoints: List[Waypoint], loop: bool = False) -> None:
@@ -217,8 +277,12 @@ class GPSNavigator:
             return
         self._running = True
         self._wp_idx  = 0
-        self._stats.waypoint_index = 0
+        self._stats = _RuntimeStats()
         self._stats.started_ts = time.monotonic()
+        self._prev_err_deg = 0.0
+        self._prev_err_ts  = 0.0
+        self._leg_start_lat = None
+        self._leg_start_lon = None
         self._state  = GPSState.NO_FIX  # bumped to TURNING on first usable fix
 
     def stop(self) -> None:
@@ -241,6 +305,7 @@ class GPSNavigator:
             "bearing_deg":     safe_round(self._stats.last_bearing_deg, 1),
             "heading_deg":     safe_round(self._stats.last_heading_deg, 1),
             "error_deg":       safe_round(self._stats.last_error_deg, 1),
+            "xtrack_m":        safe_round(self._stats.last_xtrack_m, 2),
             "loop":            self._loop,
         }
 
@@ -285,13 +350,69 @@ class GPSNavigator:
         if distance_m <= max(self.cfg.min_arrival_radius_m, wp.radius_m):
             return self._advance_waypoint()
 
+        # ── Step 3b: cross-track lookahead (pure-pursuit-lite) ──
+        # Capture leg origin at the first non-arrival tick so the leg
+        # vector is `leg_start → wp`. Project robot onto that leg and
+        # aim at a virtual point lookahead_m ahead — this corrects the
+        # tendency of bearing-only control to "shortcut" between
+        # waypoints when the robot is pushed off the planned line.
+        if self._leg_start_lat is None:
+            self._leg_start_lat = lat
+            self._leg_start_lon = lon
+        target_bearing = bearing
+        signed_xtrack = float("nan")
+        if (
+            self.cfg.crosstrack_enabled
+            and self._leg_start_lat is not None
+            and self._leg_start_lon is not None
+        ):
+            rx, ry = local_xy_m(self._leg_start_lat, self._leg_start_lon, lat, lon)
+            wx, wy = local_xy_m(self._leg_start_lat, self._leg_start_lon, wp.lat, wp.lon)
+            leg_len = math.hypot(wx, wy)
+            if leg_len > 0.5:
+                ux, uy = wx / leg_len, wy / leg_len
+                s     = rx * ux + ry * uy            # along-leg progress (m)
+                xperp = rx - s * ux
+                yperp = ry - s * uy
+                xtrack = math.hypot(xperp, yperp)
+                # Sign: +ve when robot is to the LEFT of leg direction.
+                cross = ux * ry - uy * rx
+                signed_xtrack = math.copysign(xtrack, cross) if xtrack > 0 else 0.0
+                if xtrack > self.cfg.crosstrack_max_offset_m:
+                    target_s = max(s, 0.0)            # re-acquire the line
+                else:
+                    target_s = min(leg_len, max(0.0, s) + self.cfg.crosstrack_lookahead_m)
+                tx, ty = ux * target_s, uy * target_s
+                target_bearing = bearing_from_xy(tx - rx, ty - ry)
+        self._stats.last_xtrack_m = signed_xtrack
+
         # ── Step 4: compute heading reference ───────────────────
         heading = self._fuse_heading(imu_yaw_deg, cog, gnd_kmh)
         self._stats.last_heading_deg = heading
-        err = shortest_angle_deg(bearing, heading)
+        err = shortest_angle_deg(target_bearing, heading)
         self._stats.last_error_deg = err
 
-        # ── Step 5: reactive ToF safety ─────────────────────────
+        # ── Step 5a: BACKING_OFF state (drives reverse for a fixed window)
+        # Continues even if front ToF clears — we want a deterministic
+        # back-off duration so the robot escapes whatever pinned it.
+        if self._state == GPSState.BACKING_OFF:
+            if now < self._stats.backoff_until_ts:
+                spd = self._scaled_spd(
+                    speed_pct, wp.speed_pct, factor=self.cfg.turning_spd_factor
+                )
+                return GPSNavResult(
+                    int(self.cfg.stuck_back_vx), 0, 0, spd,
+                    self._state.value, done=False,
+                )
+            # Back-off complete → re-align, reset progress monitor.
+            self._state = GPSState.TURNING
+            self._stats.best_distance_m  = float("inf")
+            self._stats.best_distance_ts = 0.0
+            self._stats.backoff_until_ts = 0.0
+            self._prev_err_ts = 0.0   # PD reset
+
+        # ── Step 5b: reactive ToF safety (front emergency stop) ─
+        # Always-on: only operator e-stop or mode change can disable.
         front_mm = int(tof_dict.get("front", 9999))
         if front_mm <= self.cfg.safety_emergency_mm:
             if self._state != GPSState.SAFETY_STOP:
@@ -304,11 +425,22 @@ class GPSNavigator:
             self._state = GPSState.TURNING
             wz = int(math.copysign(self.cfg.turn_speed, err))
             spd = self._scaled_spd(speed_pct, wp.speed_pct, factor=self.cfg.turning_spd_factor)
+            # PD baseline reset while we rotate in place.
+            self._prev_err_deg = err
+            self._prev_err_ts  = now
             return GPSNavResult(0, 0, wz, spd, self._state.value, done=False)
 
         # In alignment band — drive forward with heading PD.
         self._state = GPSState.DRIVING
-        wz = int(clamp(self.cfg.heading_kp * err, -self.cfg.heading_max_wz, self.cfg.heading_max_wz))
+
+        # PD: P on heading error, D damps overshoot from quick jerks.
+        if self._prev_err_ts > 0.0:
+            dt = max(1e-3, min(0.5, now - self._prev_err_ts))
+            d_err = (err - self._prev_err_deg) / dt
+        else:
+            d_err = 0.0
+        self._prev_err_deg = err
+        self._prev_err_ts  = now
 
         # Speed shaping: ramp down inside slow_distance_m, halve in slow_mm zone.
         ramp = 1.0
@@ -319,8 +451,40 @@ class GPSNavigator:
             ramp *= self.cfg.safety_slow_factor
 
         sp = clamp(min(speed_pct, wp.speed_pct) / 100.0, 0.0, 1.0) * ramp
+        # Speed-aware wz cap — at full vx we tighten the cap to avoid
+        # body-roll/oversteer; at low vx we permit the original max.
+        wz_cap = self.cfg.heading_max_wz - (
+            self.cfg.heading_max_wz - self.cfg.heading_max_wz_min
+        ) * sp
+        wz_cap_i = max(int(self.cfg.heading_max_wz_min), int(wz_cap))
+        raw_wz   = self.cfg.heading_kp * err + self.cfg.heading_kd * d_err
+        wz = int(clamp(raw_wz, -wz_cap_i, wz_cap_i))
+
         vx  = int(self.cfg.base_vx * sp)
         spd = max(self.cfg.min_spd, int(self.cfg.base_spd * sp))
+
+        # ── Step 7: stuck monitor ───────────────────────────────
+        # Track the best (smallest) distance seen on this leg. If we
+        # haven't beaten it by stuck_progress_m within stuck_check_s,
+        # something is pinning us — trigger BACKING_OFF.
+        if self.cfg.stuck_check_s > 0:
+            if (
+                self._stats.best_distance_ts == 0.0
+                or distance_m < self._stats.best_distance_m - self.cfg.stuck_progress_m
+            ):
+                self._stats.best_distance_m  = distance_m
+                self._stats.best_distance_ts = now
+            elif (now - self._stats.best_distance_ts) > self.cfg.stuck_check_s:
+                self._state = GPSState.BACKING_OFF
+                self._stats.backoff_until_ts = now + self.cfg.stuck_back_s
+                spd_back = self._scaled_spd(
+                    speed_pct, wp.speed_pct, factor=self.cfg.turning_spd_factor
+                )
+                return GPSNavResult(
+                    int(self.cfg.stuck_back_vx), 0, 0, spd_back,
+                    self._state.value, done=False,
+                )
+
         return GPSNavResult(vx, 0, wz, spd, self._state.value, done=False)
 
     # ── Helpers ─────────────────────────────────────────────────
@@ -334,6 +498,14 @@ class GPSNavigator:
     def _advance_waypoint(self) -> GPSNavResult:
         self._wp_idx += 1
         self._stats.waypoint_index = self._wp_idx
+        # Fresh leg → reset PD + stuck + cross-track baseline.
+        self._prev_err_deg       = 0.0
+        self._prev_err_ts        = 0.0
+        self._leg_start_lat      = None
+        self._leg_start_lon      = None
+        self._stats.best_distance_m  = float("inf")
+        self._stats.best_distance_ts = 0.0
+        self._stats.backoff_until_ts = 0.0
         if self._wp_idx >= len(self._route):
             if self._loop:
                 self._wp_idx = 0
