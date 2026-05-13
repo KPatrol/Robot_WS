@@ -1,5 +1,5 @@
 [Unit]
-Description=K-Patrol MQTT Robot Controller V3.0 - Centralized Control
+Description=K-Patrol MQTT Robot Controller V5.x - Centralized Control
 After=network-online.target
 Wants=network-online.target
 
@@ -7,15 +7,18 @@ Wants=network-online.target
 Type=simple
 User=khoavd
 Group=dialout
-WorkingDirectory=/home/khoavd/kpatrol
-ExecStart=/usr/bin/python3 -u /home/khoavd/kpatrol/kpatrol_mqtt_v3.py
+WorkingDirectory=/home/khoavd/kpatrol/pi-controller
+EnvironmentFile=-/home/khoavd/kpatrol/pi-controller/config.env
+EnvironmentFile=-/home/khoavd/kpatrol/pi-controller/mqtt.env
+Environment=PYTHONUNBUFFERED=1
+Environment=KPATROL_VPID_ENABLED=0
+Environment=KPATROL_VPID_MAX_MPS=1.0
+Environment=KPATROL_VPID_MAX_WZ=3.0
+ExecStart=/usr/bin/python3 -u /home/khoavd/kpatrol/pi-controller/kpatrol_mqtt_v5.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-
-# Environment
-Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
