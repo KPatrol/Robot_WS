@@ -66,6 +66,42 @@
 
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
+#include <esp_task_wdt.h>
+#include <esp_idf_version.h>
+
+// ============================================================================
+// DEBUG / BUILD FLAGS
+// ============================================================================
+// KPATROL_DEBUG = 1 → human-readable boot banner + wiring guide + ✓ logs.
+// KPATROL_DEBUG = 0 → silent boot; only protocol-prefix lines (ENC:, TOF:,
+// ENC_HB:, OK, ERR) and explicit user-invoked H/W output remain. Production
+// builds for the Pi must use 0 to avoid corrupting the COMPACT line stream
+// the Pi parser expects.
+#ifndef KPATROL_DEBUG
+#define KPATROL_DEBUG 0
+#endif
+
+#if KPATROL_DEBUG
+  #define DBG_PRINT(...)    Serial.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...)  Serial.println(__VA_ARGS__)
+  #define DBG_PRINTF(...)   Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_PRINT(...)    do {} while (0)
+  #define DBG_PRINTLN(...)  do {} while (0)
+  #define DBG_PRINTF(...)   do {} while (0)
+#endif
+
+// Hardware watchdog: 2s timeout. Loop must reset within this window or the
+// chip reboots. Longer than the worst-case ToF read (~140ms × 6 sensors at
+// startup = ~1s) but short enough that a wedged loop produces a fast recovery
+// rather than silent freeze.
+#define WDT_TIMEOUT_SEC   2
+
+// Heartbeat: emit `ENC_HB:<uptime_ms>` every 1s so the Pi detects a hung
+// ESP32 Dev even when nothing else changes (e.g. encoders idle, all ToF
+// sensors at 9999). Pi-side watchdog can flag stale heartbeat as a failure.
+const unsigned long ENC_HB_INTERVAL = 1000;
+unsigned long lastEncHbTime = 0;
 
 // ============================================================================
 // I2C CONFIGURATION (ToF Sensors)
@@ -73,6 +109,7 @@
 #define I2C_SDA           21    // GPIO 21 - I2C Data
 #define I2C_SCL           22    // GPIO 22 - I2C Clock
 #define TCA9548A_ADDR     0x70  // TCA9548A I2C address (A0=A1=A2=GND)
+#define VL53L0X_ADDR      0x29  // VL53L0X default I2C address (all 6 sensors share this on different mux channels)
 
 // ============================================================================
 // TOF SENSOR CONFIGURATION
@@ -96,13 +133,34 @@ enum ToFPosition {
 Adafruit_VL53L0X tofSensors[TOF_COUNT];
 bool tofInitialized[TOF_COUNT] = {false};
 
-// ToF readings (mm)
+// ToF readings (mm) — published value (post-median-filter)
 uint16_t tofDistance[TOF_COUNT] = {9999, 9999, 9999, 9999, 9999, 9999};
 bool tofValid[TOF_COUNT] = {false};
 
-// ToF timing
+// Bitmask version of tofValid[], emitted in TOF: line so the Pi can
+// distinguish "no obstacle (true 9999)" from "sensor failed (fake 9999)".
+// Bit i = 1 → sensor i produced a trustworthy reading this cycle.
+uint8_t tofValidMask = 0;
+
+// Median-of-3 temporal filter: keep last 3 raw readings per sensor and
+// publish the median. Rejects single-frame VL53L0X spikes/dropouts without
+// adding latency beyond one extra cycle. 9999 is treated as "no reading"
+// when filling the window so a transient out-of-range doesn't poison the
+// median permanently.
+uint16_t tofRaw[TOF_COUNT][3] = {{9999, 9999, 9999}, {9999, 9999, 9999},
+                                 {9999, 9999, 9999}, {9999, 9999, 9999},
+                                 {9999, 9999, 9999}, {9999, 9999, 9999}};
+uint8_t  tofRawIdx[TOF_COUNT] = {0, 0, 0, 0, 0, 0};
+
+// ToF timing.
+// HIGH_SPEED preset → ~20ms timing budget per sensor. With 6 sensors on
+// TCA9548A switched sequentially this gives a real loop time of
+//   6 × (20ms + ~3ms overhead) ≈ 140ms (~7Hz).
+// Setting the gate to 30ms means we always run as fast as the sensors allow
+// and never block CPU on artificial waiting. Don't expect a true 33Hz —
+// the bottleneck is sensor integration time, not the loop interval.
 unsigned long lastToFReadTime = 0;
-const unsigned long TOF_READ_INTERVAL = 50;  // Read every 50ms (20Hz)
+const unsigned long TOF_READ_INTERVAL = 30;
 
 // Min distance tracking (for info only, Pi handles safety)
 uint16_t minFrontDistance = 9999;
@@ -214,30 +272,50 @@ void IRAM_ATTR BL_encoderISR() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  
-  Serial.println("\n\n");
-  Serial.println("================================================");
-  Serial.println("  KPatrol - Encoder + ToF Sensors Reader v2.0");
-  Serial.println("================================================");
-  
+
+  // Hardware watchdog. Subscribed AFTER serial so a wedge during sensor
+  // init still produces a reboot rather than a silent freeze.
+#if ESP_IDF_VERSION_MAJOR >= 5
+  // ESP-IDF 5.x (Arduino core 3.x): init takes a config struct.
+  esp_task_wdt_config_t encWdtCfg = {
+    .timeout_ms = WDT_TIMEOUT_SEC * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true,
+  };
+  esp_task_wdt_init(&encWdtCfg);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+#endif
+  esp_task_wdt_add(NULL);
+
+  DBG_PRINTLN("\n\n");
+  DBG_PRINTLN("================================================");
+  DBG_PRINTLN("  KPatrol - Encoder + ToF Sensors Reader v3.0");
+  DBG_PRINTLN("================================================");
+
   // Initialize I2C for ToF sensors
-  Serial.println("\n[1/2] Initializing I2C & ToF sensors...");
+  DBG_PRINTLN("\n[1/2] Initializing I2C & ToF sensors...");
   setupToFSensors();
-  
+  esp_task_wdt_reset();
+
   // Initialize encoders
-  Serial.println("\n[2/2] Initializing encoders...");
+  DBG_PRINTLN("\n[2/2] Initializing encoders...");
   setupEncoders();
-  
+  esp_task_wdt_reset();
+
+#if KPATROL_DEBUG
   printWiringGuide();
-  
-  Serial.println("\n================================================");
-  Serial.println("  SYSTEM READY!");
-  Serial.println("================================================");
-  Serial.println("Commands: R=Reset, T=ToF, E=Encoder, J=JSON, H=Help\n");
-  
+#endif
+
+  DBG_PRINTLN("\n================================================");
+  DBG_PRINTLN("  SYSTEM READY!");
+  DBG_PRINTLN("================================================");
+  DBG_PRINTLN("Commands: R=Reset, T=ToF, E=Encoder, J=JSON, H=Help\n");
+
   lastPrintTime = millis();
   lastSpeedCalcTime = millis();
   lastToFReadTime = millis();
+  lastEncHbTime = millis();
 }
 
 // ============================================================================
@@ -261,97 +339,283 @@ void setupEncoders() {
   attachInterrupt(digitalPinToInterrupt(BR_ENC_A), BR_encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(BL_ENC_A), BL_encoderISR, CHANGE);
   
-  Serial.println("  ✓ FR encoder: GPIO 34 (A), GPIO 35 (B)");
-  Serial.println("  ✓ FL encoder: GPIO 32 (A), GPIO 33 (B)");
-  Serial.println("  ✓ BR encoder: GPIO 25 (A), GPIO 26 (B)");
-  Serial.println("  ✓ BL encoder: GPIO 27 (A), GPIO 14 (B)");
+  DBG_PRINTLN("  ✓ FR encoder: GPIO 34 (A), GPIO 35 (B)");
+  DBG_PRINTLN("  ✓ FL encoder: GPIO 32 (A), GPIO 33 (B)");
+  DBG_PRINTLN("  ✓ BR encoder: GPIO 25 (A), GPIO 26 (B)");
+  DBG_PRINTLN("  ✓ BL encoder: GPIO 27 (A), GPIO 14 (B)");
 }
 
 // ============================================================================
 // TCA9548A CHANNEL SELECT
 // ============================================================================
-void tcaSelect(uint8_t channel) {
-  if (channel > 7) return;
+// Returns true on success, false if the mux NACKs / is unreachable. Callers
+// must propagate the failure (mark sensor invalid) instead of silently
+// reading whichever channel was previously selected — that mode produced
+// "all distances 9999, no error" when the mux locked up, hiding hardware
+// faults from the Pi-side safety layer.
+unsigned long tcaFailCount = 0;
+bool tcaSelect(uint8_t channel) {
+  if (channel > 7) return false;
   Wire.beginTransmission(TCA9548A_ADDR);
   Wire.write(1 << channel);
-  Wire.endTransmission();
+  uint8_t err = Wire.endTransmission();
+  if (err != 0) {
+    tcaFailCount++;
+    return false;
+  }
   delayMicroseconds(100);  // Small delay for channel switch
+  return true;
 }
 
 // ============================================================================
 // SETUP TOF SENSORS
 // ============================================================================
 void setupToFSensors() {
-  // Initialize I2C
+  // I²C at 100kHz Standard Mode. Empirically: a pure address scan at 100kHz
+  // finds all 6 VL53L0X ACK at 0x29, while 400kHz Fast Mode misses CH2 and
+  // CH3 (NACK at probe). The mux lane wiring + sensor cabling can't always
+  // satisfy 400kHz tSU/tHD margins; 100kHz gives the headroom needed.
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000);  // 400kHz I2C Fast Mode
-  
-  Serial.println("  I2C initialized: SDA=GPIO21, SCL=GPIO22");
-  
-  // Check if TCA9548A is present
-  Wire.beginTransmission(TCA9548A_ADDR);
-  if (Wire.endTransmission() != 0) {
-    Serial.println("  ✗ ERROR: TCA9548A not found at 0x70!");
-    Serial.println("    Check wiring: VCC→3.3V, GND→GND, SDA→GPIO21, SCL→GPIO22");
+  Wire.setClock(100000);
+
+  // VDD warm-up before first transaction.
+  // Standalone scanner saw all 6 ACK after Serial setup (~2s). CH0 fails probe
+  // here unless we replicate that warm-up. Bump to 1500ms after Wire.begin.
+  delay(1500);
+
+  DBG_PRINTLN("  I2C initialized: SDA=GPIO21, SCL=GPIO22 @100kHz");
+
+  // Check if TCA9548A is present, with retries.
+  bool tcaOk = false;
+  for (int retry = 0; retry < 5; retry++) {
+    Wire.beginTransmission(TCA9548A_ADDR);
+    if (Wire.endTransmission() == 0) {
+      tcaOk = true;
+      if (retry > 0) DBG_PRINTF("  ↻ TCA9548A found on retry %d\n", retry);
+      break;
+    }
+    delay(100);
+  }
+  if (!tcaOk) {
+    Serial.println("ERR:TCA9548A_NOT_FOUND");
+    DBG_PRINTLN("    Check wiring: VCC→3.3V, GND→GND, SDA→GPIO21, SCL→GPIO22");
     return;
   }
-  Serial.println("  ✓ TCA9548A found at 0x70");
-  
-  // Initialize each VL53L0X sensor
+  DBG_PRINTLN("  ✓ TCA9548A found at 0x70");
+
+  // Extra power-on settle. VL53L0X internal boot calibration takes time;
+  // some lanes (CH0) drop probe if we hit them too early after reset.
+  delay(500);
+  esp_task_wdt_reset();
+
   const char* sensorNames[] = {"FRONT", "FRONT_LEFT", "FRONT_RIGHT", "LEFT", "RIGHT", "BACK"};
-  
+
+  // Pass 1: probe presence on every channel BEFORE any begin() runs.
+  // Empirically: a pure scan (no begin() between probes) finds all 6 sensors
+  // ACK at 0x29, but interleaving begin()'s many register transactions before
+  // probing a later channel makes that later channel NACK. Theory: TCA9548A
+  // lane stub capacitance + slow VL53L0X internal state machine need a
+  // settling window after sustained activity on a different channel.
+  bool probePresent[TOF_COUNT];
   for (int i = 0; i < TOF_COUNT; i++) {
-    tcaSelect(i);
-    delay(10);
-    
-    if (tofSensors[i].begin()) {
+    probePresent[i] = false;
+    if (!tcaSelect(i)) {
+      Serial.printf("ERR:TOF_MUX_CH%d\n", i);
+      continue;
+    }
+    delay(50);
+    // Full-bus warm-up scan 0x01..0x77 (skip TCA 0x70). Standalone scanner
+    // pattern: probing many addresses before 0x29 lets the lane's slow
+    // VL53L0X / pull-up RC fully settle so 0x29 ACKs reliably. A direct
+    // 0x29 probe (even with retries) NACKs on CH2/CH3 — the warm-up is what
+    // tips the balance. We don't care which other address ACKs; we only
+    // record whether 0x29 ACK'd anywhere in the sweep.
+    for (uint8_t addr = 0x01; addr < 0x78; addr++) {
+      if (addr == TCA9548A_ADDR) continue;
+      Wire.beginTransmission(addr);
+      uint8_t err = Wire.endTransmission();
+      if (err == 0 && addr == VL53L0X_ADDR) {
+        probePresent[i] = true;
+      }
+    }
+    if (probePresent[i]) {
+      DBG_PRINTF("  ✓ CH%d (%s) probe OK\n", i, sensorNames[i]);
+    }
+  }
+
+  // Retry pass for any channel that didn't ACK first time. Give each failed
+  // lane an extra 300ms settle plus a fresh full-bus sweep. CH0 in particular
+  // is the FIRST lane scanned and needs the most warm-up after Wire.begin.
+  for (int i = 0; i < TOF_COUNT; i++) {
+    if (probePresent[i]) continue;
+    if (!tcaSelect(i)) continue;
+    delay(300);
+    esp_task_wdt_reset();
+    for (uint8_t addr = 0x01; addr < 0x78; addr++) {
+      if (addr == TCA9548A_ADDR) continue;
+      Wire.beginTransmission(addr);
+      uint8_t err = Wire.endTransmission();
+      if (err == 0 && addr == VL53L0X_ADDR) {
+        probePresent[i] = true;
+      }
+    }
+    if (probePresent[i]) {
+      DBG_PRINTF("  ↻ CH%d (%s) probe OK on retry\n", i, sensorNames[i]);
+    } else {
+      Serial.printf("ERR:TOF_NO_ACK_CH%d_%s_err2\n", i, sensorNames[i]);
+    }
+  }
+
+  // Give sensors extra settle time between probe sweep and begin() —
+  // internal VL53L0X boot calibration takes time after power-on; the
+  // probe sweep alone doesn't guarantee they're ready for begin().
+  delay(300);
+
+  // Pass 2: now init each present sensor, with soft-reset retry.
+  for (int i = 0; i < TOF_COUNT; i++) {
+    if (!probePresent[i]) {
+      tofInitialized[i] = false;
+      tofValid[i] = false;
+      continue;
+    }
+    if (!tcaSelect(i)) {
+      tofInitialized[i] = false;
+      tofValid[i] = false;
+      Serial.printf("ERR:TOF_MUX_CH%d\n", i);
+      continue;
+    }
+    delay(80);
+
+    bool initOk = tofSensors[i].begin();
+
+    // Retry with VL53L0X soft-reset (register 0xBF) up to 3 times if begin()
+    // fails. Some sensors need an explicit reset to recover from a half-baked
+    // power-on calibration state — happens on CH2/CH3 empirically. CH2 in
+    // particular sometimes needs multiple reset cycles + longer settle.
+    for (int attempt = 0; attempt < 3 && !initOk; attempt++) {
+      DBG_PRINTF("  ↻ CH%d (%s) begin failed, soft reset attempt %d\n",
+                 i, sensorNames[i], attempt + 1);
+      Wire.beginTransmission(VL53L0X_ADDR);
+      Wire.write(0xBF);
+      Wire.write(0x00);
+      Wire.endTransmission();
+      delay(10);
+      Wire.beginTransmission(VL53L0X_ADDR);
+      Wire.write(0xBF);
+      Wire.write(0x01);
+      Wire.endTransmission();
+      delay(100);  // generous post-reset settle (datasheet says ≥1.2ms)
+      esp_task_wdt_reset();
+      initOk = tofSensors[i].begin();
+      if (initOk) {
+        DBG_PRINTF("  ✓ CH%d (%s) recovered after %d reset(s)\n",
+                   i, sensorNames[i], attempt + 1);
+        break;
+      }
+    }
+
+    if (initOk) {
       tofInitialized[i] = true;
       tofValid[i] = true;
-      
-      // Configure for long range mode (up to 2m)
-      tofSensors[i].configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_LONG_RANGE);
-      
-      Serial.printf("  ✓ ToF #%d (%s) - OK\n", i, sensorNames[i]);
+
+      // HIGH_SPEED: ~20ms timing budget — fastest meaningful refresh rate
+      // for a ~1m/s indoor robot. LONG_RANGE (~33ms+ low signal threshold)
+      // is overkill indoors and ~1.5× slower per-sensor; the safety net
+      // only cares about objects within ~750mm, well inside HIGH_SPEED's
+      // valid range (~1.2m typical) so we lose no useful information.
+      tofSensors[i].configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED);
+
+      DBG_PRINTF("  ✓ ToF #%d (%s) - OK\n", i, sensorNames[i]);
     } else {
       tofInitialized[i] = false;
       tofValid[i] = false;
-      Serial.printf("  ✗ ToF #%d (%s) - FAILED\n", i, sensorNames[i]);
+      // Keep this in production: a missing sensor is a fault the Pi must
+      // know about (lane is permanently masked-out below).
+      Serial.printf("ERR:TOF_INIT_CH%d_%s\n", i, sensorNames[i]);
     }
   }
-  
+
   // Count successful sensors
   int successCount = 0;
   for (int i = 0; i < TOF_COUNT; i++) {
     if (tofInitialized[i]) successCount++;
   }
-  Serial.printf("  ToF sensors initialized: %d/%d\n", successCount, TOF_COUNT);
+  // Always emit init summary so Pi can log "started with N/6 sensors"
+  // regardless of build flavor.
+  Serial.printf("STATUS:TOF_INIT,%d,%d\n", successCount, TOF_COUNT);
 }
 
 // ============================================================================
-// READ ALL TOF SENSORS
+// READ ALL TOF SENSORS — strict status filter + median-of-3 temporal filter
 // ============================================================================
+//   Range status meanings (Adafruit_VL53L0X / ST datasheet):
+//     0 = valid
+//     1 = sigma fail (low confidence)        → reject as noise
+//     2 = signal fail (target too dark/far)  → reject as noise
+//     3 = min-range fail (target too close)  → publish min-range sentinel (1)
+//                                               so Pi sees "very close" not "far"
+//     4 = phase fail (out of range)          → publish 9999 (far)
+// Only status 0 is treated as a trustworthy distance value. Anything else
+// gets a deterministic sentinel before the median filter sees it.
+static uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
+  if (a > b) { uint16_t t = a; a = b; b = t; }
+  if (b > c) { uint16_t t = b; b = c; c = t; }
+  if (a > b) { uint16_t t = a; a = b; b = t; }
+  return b;
+}
+
 void readToFSensors() {
   VL53L0X_RangingMeasurementData_t measure;
-  
+  uint8_t validMask = 0;
+
   for (int i = 0; i < TOF_COUNT; i++) {
     if (!tofInitialized[i]) {
       tofDistance[i] = 9999;
       tofValid[i] = false;
       continue;
     }
-    
-    tcaSelect(i);
-    tofSensors[i].rangingTest(&measure, false);
-    
-    if (measure.RangeStatus != 4) {  // Phase failures = 4 means out of range
-      tofDistance[i] = measure.RangeMilliMeter;
-      tofValid[i] = true;
-    } else {
-      tofDistance[i] = 9999;  // Out of range
+
+    if (!tcaSelect(i)) {
+      // Mux NACK → cannot trust whatever sensor was previously selected.
+      // Mark this sensor failed for the cycle; do NOT poison the median
+      // window with a fake 1mm — that would force a phantom DANGER on the
+      // Pi side. 9999 + valid=false lets the Pi mask this lane out.
+      tofDistance[i] = 9999;
       tofValid[i] = false;
+      continue;
     }
+    tofSensors[i].rangingTest(&measure, false);
+
+    uint16_t raw;
+    bool valid = false;
+    switch (measure.RangeStatus) {
+      case 0:  // valid
+        raw = measure.RangeMilliMeter;
+        valid = true;
+        break;
+      case 3:  // too close — collision-imminent signal, NOT far
+        raw = 1;  // 1mm sentinel forces DANGER on Pi side
+        valid = true;
+        break;
+      case 1:  // sigma fail
+      case 2:  // signal fail
+      case 4:  // phase / out of range
+      default:
+        raw = 9999;  // far / unknown
+        valid = false;
+        break;
+    }
+
+    // Push into median-of-3 ring buffer.
+    tofRaw[i][tofRawIdx[i]] = raw;
+    tofRawIdx[i] = (tofRawIdx[i] + 1) % 3;
+    tofDistance[i] = median3(tofRaw[i][0], tofRaw[i][1], tofRaw[i][2]);
+    tofValid[i] = valid;
+    if (valid) validMask |= (1u << i);
   }
-  
+
+  tofValidMask = validMask;
+
   // Update min front distance (for info, safety handled by Pi)
   updateMinDistance();
 }
@@ -533,16 +797,21 @@ void printCompactEncoderData() {
 
 // ============================================================================
 // PRINT COMPACT TOF DATA (for Pi parsing)
-// Format: TOF:front,front_left,front_right,left,right,back
+// Format: TOF:front,front_left,front_right,left,right,back,valid_mask
+// The 7th field (valid_mask, hex bitmap of which sensors produced a valid
+// reading) is APPENDED rather than replacing the 6 distance fields, so old
+// Pi parsers that slice `parts[:6]` keep working unchanged. New parsers can
+// read parts[6] and AND with (1<<i) to ignore failed lanes.
 // ============================================================================
 void printCompactToFData() {
-  Serial.printf("TOF:%d,%d,%d,%d,%d,%d\n",
+  Serial.printf("TOF:%d,%d,%d,%d,%d,%d,%u\n",
     tofDistance[TOF_FRONT],
     tofDistance[TOF_FRONT_LEFT],
     tofDistance[TOF_FRONT_RIGHT],
     tofDistance[TOF_LEFT],
     tofDistance[TOF_RIGHT],
-    tofDistance[TOF_BACK]);
+    tofDistance[TOF_BACK],
+    (unsigned)tofValidMask);
 }
 
 // ============================================================================
@@ -596,9 +865,23 @@ OutputMode outputMode = MODE_COMPACT;  // Default to COMPACT for Pi parsing
 // ============================================================================
 void loop() {
   unsigned long currentTime = millis();
-  
+
+  // Pet the watchdog every loop iteration. If anything below blocks for
+  // >WDT_TIMEOUT_SEC, the chip reboots and the Pi will see a reset banner
+  // (or, in production builds, a stale heartbeat) instead of frozen data.
+  esp_task_wdt_reset();
+
   // Calculate encoder speed periodically
   calculateSpeed();
+
+  // Heartbeat: emit even when nothing else is happening so the Pi can
+  // distinguish "ESP32 Dev alive but idle" from "ESP32 Dev hung". Includes
+  // uptime + cumulative TCA9548A failure count so the Pi can alert on a
+  // mux that's degrading mid-run.
+  if (currentTime - lastEncHbTime >= ENC_HB_INTERVAL) {
+    Serial.printf("ENC_HB:%lu,%lu\n", currentTime, tcaFailCount);
+    lastEncHbTime = currentTime;
+  }
   
   // Read ToF sensors periodically (50ms = 20Hz)
   if (currentTime - lastToFReadTime >= TOF_READ_INTERVAL) {
