@@ -1,0 +1,32 @@
+[Unit]
+Description=K-Patrol Detection Bridge - YOLOv8n person/fire alerts → MQTT
+After=network-online.target kpatrol.service
+Wants=network-online.target
+PartOf=kpatrol.service
+
+[Service]
+Type=simple
+User=khoavd
+Group=video
+WorkingDirectory=/home/khoavd/kpatrol/pi-controller
+EnvironmentFile=-/home/khoavd/kpatrol/pi-controller/config.env
+EnvironmentFile=-/home/khoavd/kpatrol/pi-controller/mqtt.env
+Environment=PYTHONUNBUFFERED=1
+# Resource ceiling — keep detection under one core so the controller's
+# PID loop on the other core isn't preempted on a busy frame.
+CPUQuota=80%
+MemoryMax=512M
+ExecStart=/usr/bin/python3 -u -m detection.alert_bridge
+Restart=on-failure
+RestartSec=15
+# Drop privileges that the bridge doesn't need.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/home/khoavd/kpatrol/pi-controller/detection
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
