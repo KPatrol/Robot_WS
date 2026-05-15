@@ -384,12 +384,17 @@ class AnomalyDetector:
     def _resolve_yolo_model_path(self) -> str:
         """Pick the best available weights path.
 
-        When `yolo_model_prefer_onnx` is set and the configured weights point
-        at a .pt, prefer the sibling .onnx for CPU inference (~2× faster on
-        Pi 4). If the .onnx is missing but the .pt is present, export it
-        once via ultralytics' built-in exporter so subsequent runs reuse it.
-        Falls back to the original path on any failure — the caller still
-        gets a working model, just on the slower backend.
+        Preference order when `yolo_model_prefer_onnx` is True and the config
+        points at a .pt:
+            1. <stem>_int8.onnx — quantized via tools/quantize_yolo.py
+               (~3× smaller, ~1.5–2× faster on Pi 4 CPU)
+            2. <stem>.onnx — FP32 export (~2× faster than .pt)
+            3. <stem>.pt — original PyTorch weights (slowest backend)
+
+        The int8 variant is opt-in: it only exists after running
+        `python -m tools.quantize_yolo --auto` once on the Pi. Falls back to
+        the original path on any failure — the caller still gets a working
+        model, just on the slower backend.
         """
         configured = self.config.yolo_model
         if not self.config.yolo_model_prefer_onnx:
@@ -397,7 +402,13 @@ class AnomalyDetector:
         if not configured.endswith(".pt"):
             return configured
 
-        onnx_path = configured[:-3] + ".onnx"
+        stem = configured[:-3]
+        int8_path = f"{stem}_int8.onnx"
+        if os.path.exists(int8_path):
+            log.info("[detector] using INT8-quantized ONNX: %s", int8_path)
+            return int8_path
+
+        onnx_path = stem + ".onnx"
         if os.path.exists(onnx_path):
             return onnx_path
         if not os.path.exists(configured):
