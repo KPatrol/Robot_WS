@@ -39,7 +39,7 @@ import sys
 import os
 import re
 import threading
-from typing import Optional, Dict, Any, Tuple, List, Callable, ClassVar
+from typing import Optional, Dict, Any, Tuple, List, Callable, ClassVar, Union
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 
@@ -625,6 +625,10 @@ class MotorController:
         self._last_reconnect_attempt = 0
         self._reconnect_interval = 3
         self.imu_data = IMUData()
+        # Dedicated IMU lock so consumers can snapshot yaw/pitch/roll without
+        # contending with the serial-I/O critical section (self.lock). Writes
+        # land in _parse_imu_line; reads must go through get_imu_snapshot().
+        self._imu_lock = threading.Lock()
         # V5.2: optional sink for NMEA frames forwarded by ESP32 firmware
         # (lines prefixed with "NMEA:" arrive on the motor UART0).
         self._gps_sink = None
@@ -643,7 +647,11 @@ class MotorController:
         try:
             if self.serial and self.serial.is_open:
                 self.serial.close()
-            self.serial = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=1.0)
+            # timeout=0.1: short read deadline so readline() cannot stall the
+            # main 20Hz loop when a partial frame is in the buffer. With the
+            # previous 1.0s timeout, a fragmented IMU/BAT/NMEA line could
+            # freeze the bridge for up to a full second.
+            self.serial = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=0.1)
             self.connected = True
             logger.info(f"[Motor] Connected to {self.port}")
             time.sleep(2)
@@ -734,21 +742,81 @@ class MotorController:
                 self.connected = False
         return None
 
+    def drain_responses(self, max_lines: int = 32) -> Optional[str]:
+        """Read up to ``max_lines`` frames from the motor UART in one call.
+
+        The main loop only ticks at 20Hz, but the ESP32 streams IMU/BAT/NMEA
+        frames faster than that. Reading a single line per tick lets the
+        kernel buffer back up and starves downstream consumers (telemetry,
+        GPS). This drains everything currently buffered and returns the last
+        non-IMU/NMEA line for log forwarding.
+        """
+        last_log_line: Optional[str] = None
+        if not self.connected or not self.serial:
+            self._try_reconnect()
+            return None
+        for _ in range(max_lines):
+            with self.lock:
+                if not self.serial or not self.serial.in_waiting:
+                    break
+                try:
+                    line = self.serial.readline().decode(errors="ignore").strip()
+                except (OSError, serial.SerialException) as e:
+                    logger.error(f"[Motor] Read error: {e}")
+                    self.connected = False
+                    break
+            if not line:
+                continue
+            if line.startswith("NMEA:") and self._gps_sink is not None:
+                try:
+                    self._gps_sink(line[5:])
+                except Exception as e:
+                    logger.error(f"[Motor] GPS sink error: {e}")
+                continue
+            self._parse_imu_line(line)
+            self._parse_battery_line(line)
+            if not line.startswith("IMU:") and not line.startswith("BAT:"):
+                last_log_line = line
+        return last_log_line
+
     def _parse_imu_line(self, line: str):
-        if line.startswith("IMU:"):
-            try:
-                parts = line[4:].split(',')
-                if len(parts) >= 4:
-                    self.imu_data.yaw = float(parts[0])
-                    self.imu_data.pitch = float(parts[1])
-                    self.imu_data.roll = float(parts[2])
-                    self.imu_data.accuracy = float(parts[3])
-                    self.imu_data.timestamp = int(time.time() * 1000)
-            except (ValueError, IndexError):
-                pass
+        if not line.startswith("IMU:"):
+            return
+        try:
+            parts = line[4:].split(',')
+            if len(parts) >= 4:
+                yaw = float(parts[0])
+                pitch = float(parts[1])
+                roll = float(parts[2])
+                accuracy = float(parts[3])
+                ts = int(time.time() * 1000)
+        except (ValueError, IndexError):
+            return
+        with self._imu_lock:
+            self.imu_data.yaw = yaw
+            self.imu_data.pitch = pitch
+            self.imu_data.roll = roll
+            self.imu_data.accuracy = accuracy
+            self.imu_data.timestamp = ts
+
+    def get_imu_snapshot(self) -> IMUData:
+        """Return a consistent copy of the latest IMU sample.
+
+        Callers from other threads MUST use this rather than touching
+        ``self.imu_data.*`` directly, otherwise they can read a torn frame
+        (yaw from sample N, pitch from sample N+1).
+        """
+        with self._imu_lock:
+            return IMUData(
+                yaw=self.imu_data.yaw,
+                pitch=self.imu_data.pitch,
+                roll=self.imu_data.roll,
+                accuracy=self.imu_data.accuracy,
+                timestamp=self.imu_data.timestamp,
+            )
 
     def get_imu_status(self) -> Dict:
-        return self.imu_data.to_dict()
+        return self.get_imu_snapshot().to_dict()
 
     def request_imu(self):
         self.send_command("IMU")
@@ -1168,10 +1236,26 @@ class KPatrolMQTTV5:
         self._alert_store: Optional["AlertStore"]     = None
         self._alert_drain_thread: Optional[threading.Thread] = None
         self._alert_drain_stop = threading.Event()
+        # Track long-running threads so shutdown() can wait for cv2 capture
+        # releases (otherwise /dev/video0 stays locked across systemd restarts).
+        self._nav_thread: Optional[threading.Thread] = None
+        self._lf_thread: Optional[threading.Thread] = None
         if self._det_enabled:
             try:
-                _det_cam_idx = int(os.environ.get("KPATROL_DETECTION_CAMERA", "1"))
-                if _det_cam_idx == self._camera_index and self._camera_enabled:
+                # Accept either an integer V4L2 index or a URL string
+                # (e.g. http://127.0.0.1:8080/stream — needed on Pi where
+                # kpatrol-mjpeg.service owns /dev/video0 exclusively).
+                _det_cam_raw = os.environ.get("KPATROL_DETECTION_CAMERA", "1")
+                try:
+                    _det_cam_idx: Union[int, str] = int(_det_cam_raw)
+                except ValueError:
+                    _det_cam_idx = _det_cam_raw
+                _conflicts = (
+                    isinstance(_det_cam_idx, int)
+                    and _det_cam_idx == self._camera_index
+                    and self._camera_enabled
+                )
+                if _conflicts:
                     logger.warning(f"[DETECT] WARNING: detector camera idx ({_det_cam_idx}) "
                           f"clashes with LINE_FOLLOW camera — disabling detection")
                     self._det_enabled = False
@@ -1185,7 +1269,7 @@ class KPatrolMQTTV5:
                     )
                     self._alert_store = AlertStore("data/alerts.db")
                     self._detector = AnomalyDetector(det_cfg, on_event=self._on_detection_event)
-                    logger.info(f"[DETECT] AnomalyDetector ready (camera idx {_det_cam_idx})")
+                    logger.info(f"[DETECT] AnomalyDetector ready (camera={_det_cam_idx!r})")
             except Exception as exc:
                 logger.error(f"[DETECT] init failed: {exc} — detection disabled")
                 self._det_enabled = False
@@ -1881,13 +1965,13 @@ class KPatrolMQTTV5:
         # zero-angle into the watcher.
         if self._tipover_watcher is None:
             return
-        if not self.motor_controller.imu_data.timestamp:
+        snap = self.motor_controller.get_imu_snapshot()
+        if not snap.timestamp:
             return
-        status = self.motor_controller.get_imu_status()
         try:
             self._tipover_watcher.tick(
-                roll_deg=float(status.get("roll", 0.0)),
-                pitch_deg=float(status.get("pitch", 0.0)),
+                roll_deg=float(snap.roll),
+                pitch_deg=float(snap.pitch),
             )
         except Exception as exc:
             logger.error(f"[TIPOVER] tick error: {exc}")
@@ -1956,9 +2040,9 @@ class KPatrolMQTTV5:
                 "BR": int(counts_raw.get("BR_count", 0)),
                 "BL": int(counts_raw.get("BL_count", 0)),
             }
-            imu_yaw = self.motor_controller.imu_data.yaw
+            imu_snap = self.motor_controller.get_imu_snapshot()
             # Skip IMU when stale/uninitialized (timestamp 0 → encoder-only fallback)
-            yaw_arg = float(imu_yaw) if self.motor_controller.imu_data.timestamp else None
+            yaw_arg = float(imu_snap.yaw) if imu_snap.timestamp else None
             pose = self._odom.update(counts, imu_yaw_deg=yaw_arg)
             self._pub(self.T.ODOM, pose.to_dict())
         except Exception as exc:
@@ -2070,6 +2154,13 @@ class KPatrolMQTTV5:
             vx, vy, wz, spd = result.vx, result.vy, result.wz, result.spd
             twist = (vx, vy, wz, spd)
 
+            # Detection→nav safety bridge: when on_alert("person") opens a
+            # pause window, NavController.tick() returns zero twist — but
+            # line-follow runs in its own thread and never calls tick().
+            # Mirror the gate here so the pause actually stops the robot.
+            if hasattr(self._nav, "is_alert_paused") and self._nav.is_alert_paused():
+                twist = (0, 0, 0, spd)
+
             # Safety veto: stop forward motion if obstacle in danger zone
             fwd_dist = self.safety_controller.direction_distances.get("forward", 9999)
             if self.safety_controller.config.enabled and vx > 0:
@@ -2120,7 +2211,7 @@ class KPatrolMQTTV5:
             t0 = time.time()
 
             tof_dict = self.safety_controller.tof_data.to_float_dict()
-            imu_yaw  = self.motor_controller.imu_data.yaw
+            imu_yaw  = self.motor_controller.get_imu_snapshot().yaw
 
             # Encoder closed-loop feedback for move_distance steps. The
             # encoder reader uses "FR_count"/"FL_count"/... keys; executor
@@ -2235,13 +2326,13 @@ class KPatrolMQTTV5:
         self.client.loop_start()
 
         # Start navigation loop thread
-        nav_thread = threading.Thread(target=self._nav_loop, name="nav_loop", daemon=True)
-        nav_thread.start()
+        self._nav_thread = threading.Thread(target=self._nav_loop, name="nav_loop", daemon=True)
+        self._nav_thread.start()
 
         # Start LINE_FOLLOW camera thread (no-op if cv2 absent or KPATROL_CAMERA=-1)
         if self._camera_enabled:
-            lf_thread = threading.Thread(target=self._line_follow_loop, name="lf_loop", daemon=True)
-            lf_thread.start()
+            self._lf_thread = threading.Thread(target=self._line_follow_loop, name="lf_loop", daemon=True)
+            self._lf_thread.start()
             logger.info(f"[LF] Camera thread started (device {self._camera_index})")
         else:
             logger.info("[LF] Camera disabled — LINE_FOLLOW mode will not move motors")
@@ -2382,8 +2473,11 @@ class KPatrolMQTTV5:
                     self.publish_odom()
                     last_odom = current_time
 
-                response = self.motor_controller.read_response()
-                if response and not response.startswith("IMU:"):
+                # Drain everything queued on the motor UART so IMU/BAT
+                # frames don't pile up between 20Hz ticks. Returns the last
+                # non-IMU/BAT line for log forwarding.
+                response = self.motor_controller.drain_responses()
+                if response:
                     logger.info(f"[Motor] {response}")
 
                 time.sleep(0.05)
@@ -2405,6 +2499,19 @@ class KPatrolMQTTV5:
                 self._detector.stop()
             except Exception as exc:
                 logger.error(f"[DETECT] stop error: {exc}")
+
+        # Wait for nav + line-follow loops to exit so cv2.VideoCapture.release()
+        # actually runs. Without this, daemon threads die mid-loop and the
+        # camera (/dev/video0) can remain locked across systemd restarts.
+        for thread, label in (
+            (self._lf_thread, "lf_loop"),
+            (self._nav_thread, "nav_loop"),
+            (self._alert_drain_thread, "alert_drain"),
+        ):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    logger.warning(f"[Main] {label} did not exit within 2s")
 
         if self.client and self.client.is_connected():
             self.send_heartbeat("offline")
