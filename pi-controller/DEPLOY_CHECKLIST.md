@@ -167,3 +167,62 @@ Common pitfalls:
 - Nếu fault theo lane → trace SDA/SCL CH2 ở TCA9548A.
 
 Không patch firmware lần 4 cùng dạng — đây là hardware test, không phải software.
+
+## 10. Cài đặt `kpatrol-detection.service` (detection bridge → MQTT)
+
+Service publish person/fire alert lên `kpatrol/{serial}/alert`. Phải cài SAU khi `kpatrol.service` đã chạy ổn định (detection phụ thuộc camera, chia sẻ `mqtt.env`).
+
+```bash
+# Pi đã có file repo tại /home/khoavd/kpatrol (rsync từ Mac hoặc git pull)
+cd /home/khoavd/kpatrol/pi-controller
+
+# 1. Cài model + deps detection (nếu chưa)
+pip3 install --user onnxruntime opencv-python-headless paho-mqtt
+ls detection/models/yolov8n_int8.onnx   # phải tồn tại (~3.2 MB)
+
+# 2. Install unit
+sudo cp kpatrol-detection.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable kpatrol-detection.service
+sudo systemctl start kpatrol-detection.service
+
+# 3. Verify
+sudo systemctl status kpatrol-detection.service --no-pager
+sudo journalctl -u kpatrol-detection.service -f -o cat
+```
+
+**Expected logs:**
+- `[bridge] connecting to 103.81.84.43:1883`
+- `[bridge] mqtt connected`
+- `[bridge] kpatrol/KPATROL-001/alert -> {…}` mỗi khi detect
+
+**End-to-end smoke (từ Mac):**
+```bash
+mosquitto_sub -h 103.81.84.43 -p 1883 \
+  -u alphaasimov2024 -P gvB3DtGfus6U \
+  -t "kpatrol/+/alert" -v
+```
+→ Bật một vật thể người/lửa trước camera Pi → tin nhắn JSON với `kind=person|fire`, `confidence`, `bbox`, `snapshot_b64` xuất hiện.
+
+**Backend verify (VPS):**
+```bash
+ssh khoavd@10.8.0.7 'docker compose -f /home/khoavd/kpatrol/docker-compose.yml logs --tail=50 backend | grep -i mqttingest'
+```
+→ Mỗi alert: `[MqttIngestService] Ingested alert from KPATROL-001: kind=person id=<DB-id>`.
+
+**Web verify (mobile-app):**
+- Đăng nhập https://monitor.khoavd.online với owner của KPATROL-001
+- Trigger detection trên Pi → toast `robot:alert` event hiện tức thì
+- Vào trang Alerts → hàng mới với snapshot inline.
+
+**Resource budget:**
+- `CPUQuota=80%` + `MemoryMax=512M` để không bóp nghẹt `kpatrol.service`.
+- YOLOv8n INT8 + onnxruntime CPU: ~5–10 FPS trên Pi 4 (đã đo trên Mac, expect tương đương trên Pi 5).
+- SQLite WAL drainer cap 10k row, vacuum 24h — không lo disk grow.
+
+**Stop / rollback:**
+```bash
+sudo systemctl stop kpatrol-detection.service
+sudo systemctl disable kpatrol-detection.service
+```
+`PartOf=kpatrol.service` đảm bảo: stop kpatrol → detection cũng stop. Restart kpatrol → detection KHÔNG auto-restart (chỉ `Wants`, không `Requires`); chạy lại bằng `systemctl restart kpatrol-detection`.
