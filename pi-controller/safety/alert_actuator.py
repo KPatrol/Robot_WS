@@ -153,13 +153,19 @@ class AlertActuator:
         Called from kpatrol_mqtt_v5._on_emergency_clear() (and equivalents).
         Idempotent: a clear when already clear is a no-op.
         """
+        pending: list[str] = []
         with self._lock:
-            need_light = self._light not in (None, "OFF")
-            need_buzz = self._buzzer not in (None, "OFF")
-        if need_light:
-            self._write_light("OFF")
-        if need_buzz:
-            self._write_buzzer("OFF")
+            now = time.monotonic()
+            if self._light not in (None, "OFF"):
+                self._light = "OFF"
+                self._light_ts = now
+                pending.append("LP:OFF")
+            if self._buzzer not in (None, "OFF"):
+                self._buzzer = "OFF"
+                self._buzzer_ts = now
+                pending.append("BUZZ:OFF")
+        for line in pending:
+            self._enqueue(line)
 
     def state(self) -> Dict[str, str]:
         with self._lock:
@@ -169,48 +175,45 @@ class AlertActuator:
     # Internals
     # ------------------------------------------------------------------
 
-    def _apply(self, light: str, buzzer: str, source: str) -> Tuple[Dict[str, str], None] | Dict[str, str]:
+    def _apply(self, light: str, buzzer: str, source: str) -> Dict[str, str]:
         """Send light + buzzer if they actually differ from current state.
 
         For one-shot buzzer patterns (BEEP) we re-arm if the cooldown has
         elapsed; otherwise we coalesce to no-op so flickery detectors don't
-        flood the UART.
+        flood the UART. The full decision-and-update path runs under a
+        single lock so two concurrent callers cannot both observe a stale
+        snapshot and double-emit the same pattern.
         """
-        now = time.monotonic()
+        pending: list[str] = []
         with self._lock:
-            cur_light, cur_buzz = self._light, self._buzzer
-            light_ts, buzz_ts = self._light_ts, self._buzzer_ts
+            now = time.monotonic()
 
-        # Light: continuous patterns latch — only re-issue on change.
-        if light != cur_light:
-            self._write_light(light)
-        elif light not in _CONTINUOUS_LIGHT and now - light_ts > self.config.beep_repeat_min_sec:
-            # One-shot light pattern that may have already faded — re-issue.
-            self._write_light(light)
+            # Light: continuous patterns latch — re-issue only on change or
+            # when a one-shot pattern has aged past the cooldown.
+            if light != self._light or (
+                light not in _CONTINUOUS_LIGHT
+                and now - self._light_ts > self.config.beep_repeat_min_sec
+            ):
+                self._light = light
+                self._light_ts = now
+                pending.append(f"LP:{light}")
 
-        # Buzzer: same logic, separate state.
-        if buzzer != cur_buzz:
-            self._write_buzzer(buzzer)
-        elif buzzer not in _CONTINUOUS_BUZZER and now - buzz_ts > self.config.beep_repeat_min_sec:
-            self._write_buzzer(buzzer)
+            # Buzzer: same logic, separate state.
+            if buzzer != self._buzzer or (
+                buzzer not in _CONTINUOUS_BUZZER
+                and now - self._buzzer_ts > self.config.beep_repeat_min_sec
+            ):
+                self._buzzer = buzzer
+                self._buzzer_ts = now
+                pending.append(f"BUZZ:{buzzer}")
+
+        # Enqueue OUTSIDE the lock — the bounded queue's put_nowait is fast
+        # but we don't want to hold the state lock across any I/O primitive.
+        for line in pending:
+            self._enqueue(line)
 
         log.info("[actuator] %s → light=%s buzzer=%s", source, light, buzzer)
         return {"light": light, "buzzer": buzzer}
-
-    def _write_light(self, pattern: str) -> None:
-        # Optimistically update local state — the UART write is queued and
-        # drained off-thread so callers don't block on serial. Worker logs
-        # failures; coalescing in _apply already prevents loops on errors.
-        with self._lock:
-            self._light = pattern
-            self._light_ts = time.monotonic()
-        self._enqueue(f"LP:{pattern}")
-
-    def _write_buzzer(self, pattern: str) -> None:
-        with self._lock:
-            self._buzzer = pattern
-            self._buzzer_ts = time.monotonic()
-        self._enqueue(f"BUZZ:{pattern}")
 
     def _enqueue(self, line: str) -> None:
         try:

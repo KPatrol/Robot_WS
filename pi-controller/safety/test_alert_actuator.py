@@ -25,6 +25,7 @@ class FireAlert(unittest.TestCase):
         rec = _Recorder()
         a = AlertActuator(rec)
         a.on_detection("fire", 0.92)
+        a._drain_for_tests()
         self.assertIn("LP:WARN_STROBE", rec.calls)
         self.assertIn("BUZZ:ALARM", rec.calls)
 
@@ -32,8 +33,10 @@ class FireAlert(unittest.TestCase):
         rec = _Recorder()
         a = AlertActuator(rec)
         a.on_detection("fire", 0.92)
+        a._drain_for_tests()
         n_first = len(rec.calls)
         a.on_detection("fire", 0.93)
+        a._drain_for_tests()
         # Continuous patterns latch — second call must be a no-op.
         self.assertEqual(len(rec.calls), n_first)
 
@@ -43,6 +46,7 @@ class PersonAlert(unittest.TestCase):
         rec = _Recorder()
         a = AlertActuator(rec)
         a.on_detection("person", 0.7)
+        a._drain_for_tests()
         self.assertIn("LP:WARN_BLINK", rec.calls)
         self.assertIn("BUZZ:BEEP", rec.calls)
 
@@ -51,11 +55,13 @@ class PersonAlert(unittest.TestCase):
         cfg = ActuatorConfig(beep_repeat_min_sec=0.0)
         a = AlertActuator(rec, cfg)
         a.on_detection("person", 0.7)
+        a._drain_for_tests()
         n1 = len(rec.calls)
         # Force a tiny sleep so the monotonic clock advances past the 0.0
         # threshold; this is a one-shot, so the actuator must re-arm.
         time.sleep(0.01)
         a.on_detection("person", 0.71)
+        a._drain_for_tests()
         self.assertGreater(len(rec.calls), n1)
 
 
@@ -64,6 +70,7 @@ class TipOverAndBattery(unittest.TestCase):
         rec = _Recorder()
         a = AlertActuator(rec)
         a.on_tipover("roll", 45.0)
+        a._drain_for_tests()
         self.assertIn("LP:SOS", rec.calls)
         self.assertIn("BUZZ:SOS", rec.calls)
 
@@ -71,6 +78,7 @@ class TipOverAndBattery(unittest.TestCase):
         rec = _Recorder()
         a = AlertActuator(rec)
         a.on_battery("critical", 7.0)
+        a._drain_for_tests()
         self.assertIn("LP:WARN_STROBE", rec.calls)
         self.assertIn("BUZZ:ALARM", rec.calls)
 
@@ -80,8 +88,10 @@ class FireToOffSequence(unittest.TestCase):
         rec = _Recorder()
         a = AlertActuator(rec)
         a.on_detection("fire", 0.95)
+        a._drain_for_tests()
         rec.calls.clear()
         a.clear()
+        a._drain_for_tests()
         self.assertIn("LP:OFF", rec.calls)
         self.assertIn("BUZZ:OFF", rec.calls)
 
@@ -89,6 +99,7 @@ class FireToOffSequence(unittest.TestCase):
         rec = _Recorder()
         a = AlertActuator(rec)
         a.clear()
+        a._drain_for_tests()
         # Initial state was already OFF — must not write anything.
         self.assertEqual(rec.calls, [])
 
@@ -98,6 +109,7 @@ class UnknownKind(unittest.TestCase):
         rec = _Recorder()
         a = AlertActuator(rec)
         result = a.on_detection("ufo", 0.5)
+        a._drain_for_tests()
         self.assertEqual(rec.calls, [])
         self.assertEqual(result, {"light": "OFF", "buzzer": "OFF"})
 

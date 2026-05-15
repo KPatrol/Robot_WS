@@ -33,9 +33,15 @@ log = logging.getLogger("kpatrol.safety.tipover")
 
 @dataclass
 class TipOverConfig:
-    # Threshold beyond which we consider the robot to be tipping over.
-    # 30° is well past "going up a ramp" and well short of "fully fallen".
+    # Upper threshold — must be exceeded to start the dwell timer that can
+    # fire on_tipover. 30° is well past "going up a ramp" and well short of
+    # "fully fallen".
     angle_deg: float = 30.0
+    # Lower threshold — must fall below this to clear the tipped state and
+    # call on_recover. The gap (angle_deg − angle_recover_deg) is the
+    # hysteresis band that prevents flapping when the IMU oscillates near
+    # the trigger angle on rough surfaces or ramp transitions.
+    angle_recover_deg: float = 22.0
     # Sustained duration above the threshold required to fire — filters out
     # encoder noise and single-frame IMU spikes.
     min_dwell_sec: float = 0.4
@@ -71,23 +77,32 @@ class TipOverWatcher:
             pitch = float(pitch_deg)
         except (TypeError, ValueError):
             return None
-        thr = self.config.angle_deg
+        # Sanitize hysteresis band: recover threshold must sit strictly under
+        # the fire threshold or we lose the dead zone entirely.
+        upper = self.config.angle_deg
+        lower = min(self.config.angle_recover_deg, upper - 1e-3)
         worst_axis: Optional[str] = None
         worst_mag = 0.0
-        if abs(roll) >= thr:
-            worst_axis = "roll"
-            worst_mag = abs(roll)
-        if abs(pitch) >= thr and abs(pitch) > worst_mag:
-            worst_axis = "pitch"
-            worst_mag = abs(pitch)
+        # Worst magnitude across both axes — drives both the upper trigger
+        # decision and (when not above upper) the lower recover decision.
+        for axis_name, val in (("roll", abs(roll)), ("pitch", abs(pitch))):
+            if val > worst_mag:
+                worst_axis = axis_name
+                worst_mag = val
 
         now = self._clock()
         with self._lock:
-            if worst_axis is None:
-                # Recovered — clear dwell tracker so a future tip starts fresh.
-                if self._above_since is not None:
-                    self._above_since = None
-                if self._tipped:
+            above_upper = worst_mag >= upper
+            below_lower = worst_mag <= lower
+
+            if not above_upper:
+                # Cancel any in-flight dwell so a future tip starts fresh —
+                # we are no longer in firing territory.
+                self._above_since = None
+                # Hysteresis: only clear `_tipped` when we drop fully under
+                # the lower threshold. Between lower and upper we stay armed
+                # but do not re-fire.
+                if below_lower and self._tipped:
                     self._tipped = False
                     if self.on_recover:
                         try:
@@ -108,7 +123,7 @@ class TipOverWatcher:
                 return None
             self._last_fire_ts = now
             self._tipped = True
-            axis = worst_axis
+            axis = worst_axis or "unknown"
             angle = worst_mag
 
         log.warning("[tipover] firing: axis=%s angle=%.1f° dwell=%.2fs", axis, angle, dwell)

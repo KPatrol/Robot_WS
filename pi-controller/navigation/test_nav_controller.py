@@ -139,6 +139,25 @@ class ModeTransitions(unittest.TestCase):
         nav.clear_emergency()
         self.assertEqual(nav.get_mode(), Mode.MANUAL.value)
 
+    def test_tick_in_emergency_dominates_pause_window(self):
+        # Even if a person-pause window is somehow still armed when we enter
+        # EMERGENCY (e.g. set_mode bypass), tick() must report EMERGENCY in
+        # status — never leak `alert_pause_remaining_s` instead.
+        clock = _Clock(9000.0)
+        from . import nav_controller as nc_mod
+        with mock.patch.object(nc_mod.time, "monotonic", clock):
+            nav = _make_nav()
+            nav.set_mode("AUTO_FREE_COVERAGE")
+            nav.on_alert("person", confidence=0.7)
+            # Force EMERGENCY directly without going through trigger_emergency
+            # so the pause state isn't scrubbed by that path.
+            nav._mode = Mode.EMERGENCY  # type: ignore[attr-defined]
+            cmd, _, twist, status = nav.tick({"front": 9999, "left": 9999, "right": 9999}, 0.0)
+            self.assertEqual(cmd, "S")
+            self.assertEqual(twist, (0, 0, 0, 0))
+            self.assertEqual(status["mode"], Mode.EMERGENCY.value)
+            self.assertNotIn("alert_pause_remaining_s", status)
+
     def test_estop_clears_pending_pause_window(self):
         clock = _Clock(5000.0)
         from . import nav_controller as nc_mod

@@ -83,7 +83,8 @@ class Thresholds(unittest.TestCase):
         events: list = []
         w = BatteryWatcher(
             on_event=lambda lvl, pct: events.append((lvl, pct)),
-            config=BatteryConfig(refire_interval_sec=30.0),
+            config=BatteryConfig(low_pct=25.0, critical_pct=10.0,
+                                 refire_interval_sec=30.0),
             clock=clock,
         )
         w.tick(20.0)

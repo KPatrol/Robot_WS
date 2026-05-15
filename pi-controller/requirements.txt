@@ -24,6 +24,13 @@ opencv-python==4.10.0.84
 # Pin a CPU-friendly version that works on Pi 4 / aarch64.
 ultralytics==8.2.103
 
+# ONNX runtime for the YOLO model. Ultralytics consumes .onnx weights
+# transparently when the file path ends in .onnx (see
+# anomaly_detector.py::_resolve_yolo_model_path). On Pi 4 CPU the ONNX
+# backend is ≈2× faster than the default torch backend; if onnxruntime
+# is missing, the detector silently falls back to the .pt weights.
+onnxruntime==1.17.3
+
 # Gamepad / joystick input (only used by kpatrol_gamepad.py)
 inputs==0.5
 

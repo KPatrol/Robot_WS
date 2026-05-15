@@ -150,6 +150,9 @@ class AlertBridge:
 
     def publish(self, event: DetectionEvent) -> None:
         # Always persist first — durable record regardless of MQTT state.
+        # snapshot_b64 lives in extra_json so the drainer can replay it later
+        # without re-reading the JPEG from disk (which may be rotated by then).
+        extra = {"snapshot_b64": event.snapshot_b64} if event.snapshot_b64 else None
         alert_id = self.store.insert(
             kind=event.kind,
             confidence=event.confidence,
@@ -159,10 +162,12 @@ class AlertBridge:
             frame_w=event.frame_width,
             frame_h=event.frame_height,
             ts=event.timestamp,
+            extra=extra,
         )
         if self._publish_row(alert_id, event.kind, event.confidence, tuple(event.bbox),
                              event.timestamp, event.snapshot_path,
-                             event.frame_width, event.frame_height):
+                             event.frame_width, event.frame_height,
+                             snapshot_b64=event.snapshot_b64):
             self.store.mark_synced(alert_id)
 
     def _publish_row(
@@ -175,6 +180,7 @@ class AlertBridge:
         snapshot: str,
         frame_w: int,
         frame_h: int,
+        snapshot_b64: str = "",
     ) -> bool:
         payload = {
             "id": alert_id,
@@ -186,6 +192,8 @@ class AlertBridge:
             "robot": self.serial,
             "frame_size": [frame_w, frame_h],
         }
+        if snapshot_b64:
+            payload["snapshot_b64"] = snapshot_b64
         body = json.dumps(payload, separators=(",", ":"))
         if self.client is None or not self.client.is_connected():
             log.info("[bridge] offline, queued id=%d kind=%s", alert_id, kind)
@@ -214,7 +222,31 @@ class AlertBridge:
         self._drain_thread.start()
 
     def _drain_loop(self, interval_sec: float) -> None:
+        # Run maintenance on a longer cadence than the drain tick — pruning the
+        # synced backlog and capping the unsynced one is cheap but pointless to
+        # do every 5 s. VACUUM is reclaim-only and slower, so it runs daily.
+        maintenance_period_sec = 600.0
+        vacuum_period_sec = 24 * 3600.0
+        last_maintenance = 0.0
+        last_vacuum = 0.0
         while not self._drain_stop.wait(interval_sec):
+            now = time.time()
+            if now - last_maintenance >= maintenance_period_sec:
+                try:
+                    do_vacuum = (now - last_vacuum) >= vacuum_period_sec
+                    stats = self.store.maintenance(vacuum=do_vacuum)
+                    if stats["pruned"] or stats["capped"] or do_vacuum:
+                        log.info(
+                            "[bridge] maintenance pruned=%d capped=%d vacuum=%s",
+                            stats["pruned"], stats["capped"], do_vacuum,
+                        )
+                    last_maintenance = now
+                    if do_vacuum:
+                        last_vacuum = now
+                except Exception as exc:
+                    log.warning("[bridge] maintenance failed: %s", exc)
+                    last_maintenance = now  # don't hammer a broken store
+
             # Cold-start retry: if the initial connect failed, keep poking the
             # broker. We do this before the connectedness check so a successful
             # reconnect is acted on in the same tick.
@@ -232,10 +264,18 @@ class AlertBridge:
                     bbox = tuple(json.loads(row["bbox_json"]))
                 except Exception:
                     bbox = (0, 0, 0, 0)
+                snapshot_b64 = ""
+                extra_raw = row["extra_json"] if "extra_json" in row.keys() else None
+                if extra_raw:
+                    try:
+                        snapshot_b64 = json.loads(extra_raw).get("snapshot_b64", "") or ""
+                    except Exception:
+                        snapshot_b64 = ""
                 try:
                     ok = self._publish_row(
                         row["id"], row["kind"], row["confidence"], bbox,
                         row["ts"], row["snapshot"], row["frame_w"], row["frame_h"],
+                        snapshot_b64=snapshot_b64,
                     )
                 except Exception as exc:
                     # Belt-and-braces: never let one bad row kill the drainer.

@@ -159,29 +159,30 @@ class VelocityController:
                 st.integral = 0.0
                 err = 0.0
 
-            # PI term
+            # Tentative integration; gets corrected by back-calc below if the
+            # resulting PWM saturates. Doing it this way (rather than only
+            # integrating when unsaturated) also handles the FF-only
+            # saturation case where pwm_ff alone exceeds the PWM range —
+            # otherwise the integral would keep growing while the wheel is
+            # already pinned at max.
+            tentative_int = st.integral + err * dt
+            pwm_ff = self.cfg.kff * tgt
+            pwm_unsat = pwm_ff + self.cfg.kp * err + self.cfg.ki * tentative_int
+
+            pwm = int(round(max(self.cfg.pwm_min, min(self.cfg.pwm_max, pwm_unsat))))
+
+            # Back-calculation anti-windup: subtract the excess PWM from the
+            # integral so it never accumulates what the actuator could not
+            # deliver. Covers PI-induced AND FF-induced saturation uniformly.
+            if self.cfg.ki > 0:
+                excess = pwm_unsat - pwm
+                if excess != 0.0:
+                    tentative_int -= excess / self.cfg.ki
+
             st.integral = max(
                 -self.cfg.integral_clamp,
-                min(self.cfg.integral_clamp, st.integral + err * dt),
+                min(self.cfg.integral_clamp, tentative_int),
             )
-            pwm_pi = self.cfg.kp * err + self.cfg.ki * st.integral
-
-            # Feed-forward — open-loop estimate; PI corrects residual.
-            pwm_ff = self.cfg.kff * tgt
-
-            pwm = int(round(pwm_ff + pwm_pi))
-            pwm = max(self.cfg.pwm_min, min(self.cfg.pwm_max, pwm))
-
-            # Back-calculate integral on saturation to prevent further wind-up.
-            if pwm == self.cfg.pwm_max or pwm == self.cfg.pwm_min:
-                # Roll back the latest integration step if it pushed us into saturation.
-                if (pwm == self.cfg.pwm_max and err > 0) or \
-                   (pwm == self.cfg.pwm_min and err < 0):
-                    st.integral -= err * dt
-                    st.integral = max(
-                        -self.cfg.integral_clamp,
-                        min(self.cfg.integral_clamp, st.integral),
-                    )
 
             st.last_error = err
             st.last_pwm   = pwm
