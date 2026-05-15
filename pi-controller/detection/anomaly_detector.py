@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from queue import Queue, Empty
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 from .temporal_smoother import TemporalSmoother
 
@@ -48,13 +48,22 @@ class DetectionConfig:
     """Runtime configuration for the detector."""
 
     # Camera
-    camera_index: int = 0
+    # Accepts either an integer device index (V4L2) or a URL string (e.g.
+    # `http://127.0.0.1:8080/stream` for the MJPEG sidecar that owns
+    # /dev/video0 on the Pi). cv2.VideoCapture handles both natively.
+    camera_index: Union[int, str] = 0
     frame_width: int = 640
     frame_height: int = 480
     fps: int = 10
 
-    # YOLO — V10 spec §5.5: 416×416 input for YOLOv8n int8
+    # YOLO — V10 spec §5.5: 416×416 input for YOLOv8n int8.
+    # Prefer ONNX on Pi (≈2× faster CPU inference vs the PyTorch backend
+    # ultralytics ships with). If only the .pt is present at startup,
+    # `_ensure_yolo` exports an .onnx beside it the first time, then uses
+    # the .onnx for subsequent runs. Set `yolo_model_prefer_onnx=False`
+    # to force the .pt path (debug / dev laptop).
     yolo_model: str = "yolov8n.pt"
+    yolo_model_prefer_onnx: bool = True
     yolo_confidence: float = 0.55
     yolo_imgsz: int = 416
 
@@ -364,12 +373,56 @@ class AnomalyDetector:
         if self._yolo_cls is None:
             return False
         try:
-            log.info("[detector] loading YOLO model: %s", self.config.yolo_model)
-            self._yolo_model = self._yolo_cls(self.config.yolo_model)
+            model_path = self._resolve_yolo_model_path()
+            log.info("[detector] loading YOLO model: %s", model_path)
+            self._yolo_model = self._yolo_cls(model_path)
             return True
         except Exception as exc:
             log.error("[detector] failed to load YOLO: %s", exc)
             return False
+
+    def _resolve_yolo_model_path(self) -> str:
+        """Pick the best available weights path.
+
+        When `yolo_model_prefer_onnx` is set and the configured weights point
+        at a .pt, prefer the sibling .onnx for CPU inference (~2× faster on
+        Pi 4). If the .onnx is missing but the .pt is present, export it
+        once via ultralytics' built-in exporter so subsequent runs reuse it.
+        Falls back to the original path on any failure — the caller still
+        gets a working model, just on the slower backend.
+        """
+        configured = self.config.yolo_model
+        if not self.config.yolo_model_prefer_onnx:
+            return configured
+        if not configured.endswith(".pt"):
+            return configured
+
+        onnx_path = configured[:-3] + ".onnx"
+        if os.path.exists(onnx_path):
+            return onnx_path
+        if not os.path.exists(configured):
+            # Ultralytics will auto-download well-known names like
+            # "yolov8n.pt"; let it handle that on the .pt path. ONNX
+            # export needs the local .pt anyway, so deferring is correct.
+            return configured
+
+        try:
+            log.info("[detector] exporting %s → ONNX (one-time)", configured)
+            tmp_model = self._yolo_cls(configured)
+            exported = tmp_model.export(
+                format="onnx",
+                imgsz=self.config.yolo_imgsz,
+                opset=12,
+                simplify=True,
+            )
+            exported_path = str(exported) if exported else onnx_path
+            if os.path.exists(exported_path):
+                log.info("[detector] ONNX export ready: %s", exported_path)
+                return exported_path
+            log.warning("[detector] ONNX export reported success but file missing; using .pt")
+        except Exception as exc:
+            log.warning("[detector] ONNX export failed (%s); falling back to .pt", exc)
+        return configured
 
     def _detect_persons(self, frame):
         """Run YOLO and yield (bbox, confidence) for class=person."""
