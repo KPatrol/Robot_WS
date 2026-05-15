@@ -73,13 +73,28 @@ class NavController:
             new_mode = Mode(str(mode).upper())
         except ValueError:
             return False
-        # Tear down any active autonomous behaviour when leaving its mode.
-        if self._mode == Mode.AUTO_GPS_WAYPOINT and new_mode != Mode.AUTO_GPS_WAYPOINT:
-            self._gps_navigator.stop()
-        if self._mode == Mode.AUTO_FREE_COVERAGE and new_mode != Mode.AUTO_FREE_COVERAGE:
-            self._free_coverage.reset()
+        if new_mode == self._mode:
+            return True
+        # Tear down whichever autonomous behaviour we are leaving so a later
+        # re-entry starts from a clean state (no stale PID integral, no
+        # stale waypoint progress, no stale free-coverage frontier list).
+        self._teardown_mode(self._mode)
+        # EMERGENCY also needs the person-pause window cleared so a stale
+        # pause cannot survive an operator-initiated mode change.
+        if new_mode == Mode.EMERGENCY:
+            self._alert_pause_until = 0.0
+            self._mode_before_pause = None
         self._mode = new_mode
         return True
+
+    def _teardown_mode(self, mode: Mode) -> None:
+        """Best-effort cleanup of per-mode navigator state on mode exit."""
+        if mode == Mode.AUTO_GPS_WAYPOINT:
+            self._gps_navigator.stop()
+        elif mode == Mode.AUTO_FREE_COVERAGE:
+            self._free_coverage.reset()
+        elif mode == Mode.AUTO_LINE_FOLLOW:
+            self._line_follower.reset_pid()
 
     def set_speed(self, speed_pct: int) -> None:
         self._speed = max(0, min(100, int(speed_pct)))
@@ -216,8 +231,11 @@ class NavController:
         if kind == "fire":
             self._mode_before_pause = None
             self._alert_pause_until = 0.0
+            # Tear down whichever autonomous behaviour was active before
+            # flipping to EMERGENCY — otherwise PID integrals / route
+            # progress survive into the next session.
+            self._teardown_mode(self._mode)
             self._mode              = Mode.EMERGENCY
-            self._gps_navigator.stop()
             return {
                 "ok":         True,
                 "action":     "emergency_stop",
@@ -246,12 +264,22 @@ class NavController:
     def get_last_alert(self) -> Optional[Dict[str, Any]]:
         return self._last_alert
 
+    def is_alert_paused(self) -> bool:
+        """True while the person-detection pause window is still open.
+
+        Loop callers that drive motors *outside* of tick() — currently
+        only AUTO_LINE_FOLLOW (camera-thread `_line_follow_loop`) — must
+        gate their MEC: emission on this. EMERGENCY is reflected in
+        get_mode() directly and does not need to be checked here.
+        """
+        return self._alert_pause_until > time.monotonic()
+
     def trigger_emergency(self, source: str = "operator") -> Dict[str, Any]:
         """External hard-stop entry-point (physical e-stop, remote relay, MQTT)."""
         self._mode_before_pause = None
         self._alert_pause_until = 0.0
+        self._teardown_mode(self._mode)
         self._mode              = Mode.EMERGENCY
-        self._gps_navigator.stop()
         self._last_alert = {
             "kind":       "estop",
             "confidence": 1.0,
@@ -360,7 +388,9 @@ class NavController:
             status["gps_state"] = gnav.state
             status["gps"]       = self._gps_navigator.diagnostics()
             if gnav.done:
-                # Route complete — drop back to MANUAL.
+                # Route complete — drop back to MANUAL via the proper exit
+                # path so navigator state is reset.
+                self._teardown_mode(Mode.AUTO_GPS_WAYPOINT)
                 self._mode = Mode.MANUAL
             return None, None, (gnav.vx, gnav.vy, gnav.wz, gnav.spd), status
 
