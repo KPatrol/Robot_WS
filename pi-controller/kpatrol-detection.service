@@ -12,11 +12,14 @@ WorkingDirectory=/home/khoavd/kpatrol/pi-controller
 EnvironmentFile=-/home/khoavd/kpatrol/pi-controller/config.env
 EnvironmentFile=-/home/khoavd/kpatrol/pi-controller/mqtt.env
 Environment=PYTHONUNBUFFERED=1
+# The mjpeg_server sidecar owns /dev/video0; consume its MJPEG stream rather
+# than fighting the camera handle. Override with KPATROL_CAMERA_URL if needed.
+Environment=KPATROL_CAMERA_URL=http://127.0.0.1:8080/stream
 # Resource ceiling — keep detection under one core so the controller's
 # PID loop on the other core isn't preempted on a busy frame.
 CPUQuota=80%
 MemoryMax=512M
-ExecStart=/usr/bin/python3 -u -m detection.alert_bridge
+ExecStart=/usr/bin/python3 -u -m detection.alert_bridge --db detection/alerts.db --snapshots detection/snapshots
 Restart=on-failure
 RestartSec=15
 # Drop privileges that the bridge doesn't need.

@@ -292,6 +292,12 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--env", default="mqtt.env")
     ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument(
+        "--camera-url",
+        default=os.environ.get("KPATROL_CAMERA_URL"),
+        help="MJPEG stream URL (overrides --camera; e.g. http://127.0.0.1:8080/stream). "
+             "On Pi the mjpeg_server sidecar owns /dev/video0, so consume its stream.",
+    )
     ap.add_argument("--snapshots", default="snapshots")
     ap.add_argument("--db", default="alerts.db", help="SQLite write-ahead log path")
     args = ap.parse_args(argv)
@@ -308,7 +314,7 @@ def main(argv=None) -> int:
 
     cfg = DetectionConfig(
         dry_run=args.dry_run,
-        camera_index=args.camera,
+        camera_index=args.camera_url if args.camera_url else args.camera,
         snapshot_dir=args.snapshots,
         robot_serial=env.get("ROBOT_SERIAL", "KPATROL-001"),
     )
