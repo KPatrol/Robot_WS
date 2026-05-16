@@ -254,6 +254,16 @@ class Topics:
 MOTOR_POSITIONS = ['FR', 'FL', 'BR', 'BL']
 MOTOR_INVERTED = {'FR': False, 'FL': True, 'BR': False, 'BL': True}
 
+# Hardware bypass: front-right VL53L0X (TCA9548A channel 2) is physically
+# faulty on this build — its readings fluctuate between min-range and 9999
+# regardless of obstacles, which would otherwise wedge the safety controller
+# into permanent DANGER. We force-clear bit2 of the firmware valid_mask and
+# zero its raw distance so downstream `_valid_or_far` treats the lane as
+# "unknown" instead of "in your face". Remove this once the physical sensor
+# is replaced.
+DISABLED_TOF_BIT_MASK = 0b111011  # clear bit2 = front_right
+DISABLED_TOF_LANES = ('front_right',)
+
 
 # ==================== SAFETY (Directional) ====================
 
@@ -1100,6 +1110,10 @@ class EncoderReader:
                 # 0x3F (all lanes valid) when the firmware is older so
                 # SafetyController.update_tof preserves prior behaviour.
                 valid_mask = int(parts[6]) if len(parts) >= 7 else 0x3F
+                # Mask out lanes flagged by DISABLED_TOF_BIT_MASK (currently
+                # front_right / CH2 — see module-level comment).
+                valid_mask &= DISABLED_TOF_BIT_MASK
+                vals[2] = 9999  # front_right raw → "far" sentinel
                 if self.tof_callback:
                     self.tof_callback(*vals, valid_mask=valid_mask)
         except (ValueError, IndexError):
