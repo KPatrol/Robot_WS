@@ -44,7 +44,8 @@
  *   - PPR (Pulses Per Revolution): 11 PPR (encoder disk)
  *   - Gear Ratio: 1:34
  *   - Effective PPR at output shaft: 11 * 34 = 374 PPR
- *   - With quadrature (x4): 374 * 4 = 1496 counts per revolution
+ *   - Channel-A x2 decoding (CHANGE edges, single ISR): 374 * 2 = 748 counts per revolution
+ *   - (Full quadrature x4 = 1496 would require a second ISR on channel B; not used here.)
  * 
  * Serial Output Format (for Pi parsing):
  *   ENC:fr_cnt,fl_cnt,br_cnt,bl_cnt,fr_rpm,fl_rpm,br_rpm,bl_rpm
@@ -190,7 +191,13 @@ uint16_t minFrontDistance = 9999;
 // ============================================================================
 #define ENCODER_PPR         11    // Pulses per revolution (encoder disk)
 #define GEAR_RATIO          34    // Gear ratio (1:34)
-#define COUNTS_PER_REV      (ENCODER_PPR * GEAR_RATIO * 4)  // 1496 with quadrature
+// We only attach an ISR to channel A (CHANGE edges), which counts BOTH
+// edges of A → x2 decoding, not full quadrature x4. Earlier the multiplier
+// was *4 to match a planned dual-channel ISR upgrade, but the upgrade
+// never landed and the result was a 50%-under-reported RPM (telemetry
+// said ~110 RPM at 60% PWM; actual was ~220 RPM measured by tachometer).
+// 11 PPR * 34 gear * 2 edges = 748 counts/rev.
+#define COUNTS_PER_REV      (ENCODER_PPR * GEAR_RATIO * 2)  // 748 (x2 decoding on channel A only)
 
 // ============================================================================
 // GLOBAL VARIABLES - Encoder Counts (volatile for ISR)
