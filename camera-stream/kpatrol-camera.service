@@ -1,0 +1,24 @@
+[Unit]
+Description=K-Patrol MJPEG Camera Streamer (picamera2 + Flask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=khoavd
+# `video` is required for /dev/video* + libcamera ioctls on Raspberry Pi OS.
+SupplementaryGroups=video
+WorkingDirectory=/home/khoavd/kpatrol/camera-stream
+# Single env file holds STREAM_TOKEN_SECRET (must match backend's value so
+# signed JWTs verify). Leading `-` keeps the unit startable in dev when the
+# file is missing (server logs a loud warning and runs unauthenticated).
+EnvironmentFile=-/home/khoavd/kpatrol/camera-stream/camera.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /home/khoavd/kpatrol/camera-stream/mjpeg_server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
