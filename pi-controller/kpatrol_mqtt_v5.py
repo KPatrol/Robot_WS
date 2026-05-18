@@ -340,31 +340,41 @@ class ToFData:
     }
 
     def to_dict(self) -> Dict:
-        return {
-            "front": self.front, "front_left": self.front_left,
-            "front_right": self.front_right, "left": self.left,
-            "right": self.right, "back": self.back,
-            "valid_mask": self.valid_mask,
-            "timestamp": self.timestamp
-        }
+        # Publish sanitized lane values (9999 for invalid) so downstream
+        # consumers (PWA radar, dashboards) don't see raw 1mm garbage when
+        # the firmware spams uninitialized registers. The bitmask is also
+        # rebuilt so a lane below MIN_VALID_MM has its valid bit cleared.
+        sanitized: Dict[str, int] = {}
+        rebuilt_mask = self.valid_mask
+        for lane, raw in (
+            ("front", self.front), ("front_left", self.front_left),
+            ("front_right", self.front_right), ("left", self.left),
+            ("right", self.right), ("back", self.back),
+        ):
+            bit = self._MASK_BITS[lane]
+            clean = self._valid_or_far(raw, bit)
+            sanitized[lane] = clean
+            if clean == 9999:
+                rebuilt_mask &= ~(1 << bit)
+        sanitized["valid_mask"] = rebuilt_mask
+        sanitized["timestamp"] = self.timestamp
+        return sanitized
 
     def _valid_or_far(self, v: int, mask_bit: int = -1) -> int:
         """Return v if it's a real measurement; else 9999 (far).
 
         Honours the firmware valid_mask: if the bit for this lane is clear,
         the reading is rejected regardless of value (sensor on that mux
-        channel never reported status==0). Sub-MIN_VALID_MM readings other
-        than the explicit v==1 sentinel are treated as VL53L0X near-field
-        noise — common when a sensor is partially blocked or not properly
-        attached to the multiplexer. v == 1 is preserved so a blocked lens
-        still trips DANGER.
+        channel never reported status==0). Anything below MIN_VALID_MM —
+        including the legacy v==1 "min-range fail" sentinel — is treated
+        as VL53L0X/firmware garbage rather than a real obstacle, because
+        observed Pi traffic shows multiple lanes simultaneously latched on
+        v==1 from uninitialized/stale registers (physically impossible).
         """
         if mask_bit >= 0 and not (self.valid_mask & (1 << mask_bit)):
             return 9999
         if v <= 0 or v >= 9999:
             return 9999
-        if v == 1:
-            return v
         if v < self.MIN_VALID_MM:
             return 9999
         if v > self.VALID_MAX_MM:
@@ -406,16 +416,24 @@ class ToFData:
     def to_float_dict(self) -> Dict[str, float]:
         """Convert to float dict for navigation use.
 
+        Returns sanitized distances (9999 for any lane flagged invalid by
+        firmware mask, sub-MIN_VALID_MM noise, or pre-init zeros), so
+        navigation map-builders never see physically impossible 1mm readings
+        that would force endless DANGER stops.
+
         `timestamp` (ms since epoch) is included so consumers like FreeCoverage
         can detect stale ToF samples and throttle forward speed when the I2C
         mux read loop falls behind. Navigation map-builders ignore unknown
         keys.
         """
         return {
-            "front": float(self.front), "front_left": float(self.front_left),
-            "front_right": float(self.front_right), "left": float(self.left),
-            "right": float(self.right), "back": float(self.back),
-            "timestamp": float(self.timestamp),
+            "front":       float(self._valid_or_far(self.front,        self._MASK_BITS["front"])),
+            "front_left":  float(self._valid_or_far(self.front_left,   self._MASK_BITS["front_left"])),
+            "front_right": float(self._valid_or_far(self.front_right,  self._MASK_BITS["front_right"])),
+            "left":        float(self._valid_or_far(self.left,         self._MASK_BITS["left"])),
+            "right":       float(self._valid_or_far(self.right,        self._MASK_BITS["right"])),
+            "back":        float(self._valid_or_far(self.back,         self._MASK_BITS["back"])),
+            "timestamp":   float(self.timestamp),
         }
 
 
