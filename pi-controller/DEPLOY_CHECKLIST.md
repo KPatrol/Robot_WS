@@ -178,7 +178,12 @@ cd /home/khoavd/kpatrol/pi-controller
 
 # 1. Cài model + deps detection (nếu chưa)
 pip3 install --user onnxruntime opencv-python-headless paho-mqtt
-ls detection/models/yolov8n_int8.onnx   # phải tồn tại (~3.2 MB)
+
+# 1a. Quantize YOLO sang INT8 (3.2 MB, ~1.5-2× nhanh hơn FP32 trên Pi 4 CPU)
+#     Lần đầu cần yolov8n.pt → ultralytics auto-export ONNX → quantize_dynamic.
+#     AnomalyDetector._resolve_yolo_model_path() tự pick <stem>_int8.onnx.
+python3 -m tools.quantize_yolo --auto
+ls yolov8n_int8.onnx   # phải tồn tại (~3.2 MB) bên cạnh pi-controller/
 
 # 2. Install unit
 sudo cp kpatrol-detection.service /etc/systemd/system/
