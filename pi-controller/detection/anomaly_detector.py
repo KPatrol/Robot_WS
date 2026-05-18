@@ -69,18 +69,30 @@ class DetectionConfig:
 
     # Person detection
     person_enabled: bool = True
-    person_cooldown_sec: float = 8.0     # min gap between person alerts (>5s spec)
+    # Cooldown gates how fast the web sees a new alert. 8s was conservative
+    # for early field testing; bring it down so the PWA refreshes promptly
+    # while still throttling noise. Per-event cooldown still wins over
+    # smoothing latency (~0.2s at fps=10).
+    person_cooldown_sec: float = 3.0
     person_min_area_ratio: float = 0.02  # bbox must cover >=2% of frame
 
-    # Fire detection (HSV-based) — V10 spec §5.5: ≥2% area, 3-frame consensus
+    # Fire detection (HSV-based)
+    # Flame appearance covers three HSV regions: low-red wrap (0-15), high-red
+    # wrap (160-179), and the yellow-orange core (15-35). Earlier config only
+    # included the two red wraps which missed the brightest part of most real
+    # flames — hence "fire chưa tốt" reports. min_area_ratio dropped from 2%
+    # to 0.5% so small/distant flames register; smoothing dropped from 3 to 2
+    # frames to react ~100ms faster.
     fire_enabled: bool = True
     fire_cooldown_sec: float = 5.0
-    fire_min_area_ratio: float = 0.02
-    # HSV ranges for flame: low-red and high-red
+    fire_min_area_ratio: float = 0.005
+    # HSV ranges for flame: low-red, high-red, and yellow-orange core
     fire_hsv_low_red1: tuple = (0, 120, 180)
     fire_hsv_high_red1: tuple = (15, 255, 255)
     fire_hsv_low_red2: tuple = (160, 120, 180)
     fire_hsv_high_red2: tuple = (179, 255, 255)
+    fire_hsv_low_yellow: tuple = (15, 120, 200)
+    fire_hsv_high_yellow: tuple = (35, 255, 255)
 
     # Snapshots — V10 spec §5.5: JPEG quality 70, base64-encoded inline payload
     snapshot_dir: str = "snapshots"
@@ -101,9 +113,10 @@ class DetectionConfig:
 
     # Temporal smoothing (N-of-M consensus before emitting an event).
     # Suppresses single-frame flickers from YOLO/HSV noise.
-    # V10 spec §5.5: fire requires 3 consecutive frames, person requires 2.
+    # Fire dropped from 3-of-5 to 2-of-5 for faster reaction; broadened HSV
+    # range below compensates for the looser consensus by lifting recall.
     smoothing_window: int = 5
-    fire_smoothing_required: int = 3
+    fire_smoothing_required: int = 2
     person_smoothing_required: int = 2
 
     # Runtime
@@ -467,10 +480,14 @@ class AnomalyDetector:
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         c = self.config
-        mask1 = cv2.inRange(hsv, c.fire_hsv_low_red1, c.fire_hsv_high_red1)
-        mask2 = cv2.inRange(hsv, c.fire_hsv_low_red2, c.fire_hsv_high_red2)
-        mask = cv2.bitwise_or(mask1, mask2)
+        mask_red1 = cv2.inRange(hsv, c.fire_hsv_low_red1, c.fire_hsv_high_red1)
+        mask_red2 = cv2.inRange(hsv, c.fire_hsv_low_red2, c.fire_hsv_high_red2)
+        mask_yellow = cv2.inRange(hsv, c.fire_hsv_low_yellow, c.fire_hsv_high_yellow)
+        mask = cv2.bitwise_or(cv2.bitwise_or(mask_red1, mask_red2), mask_yellow)
+        # OPEN removes salt-noise from sensor grain; CLOSE knits the flame
+        # blob back together when motion blur splits it into fragments.
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, None, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, None, iterations=2)
 
         h, w = frame.shape[:2]
         total = h * w
