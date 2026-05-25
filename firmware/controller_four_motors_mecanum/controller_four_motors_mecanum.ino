@@ -115,6 +115,8 @@
  */
 
 #include <Adafruit_BNO08x.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <esp_task_wdt.h>
@@ -274,29 +276,48 @@ void IRAM_ATTR estopISR();
 #define ESTOP_DEBOUNCE_MS           30   // ignore re-triggers within this window
 
 // ============================================================================
-// BATTERY VOLTAGE MONITORING (V10.2)
-// 3S LiPo (12V nominal, 12.6V full, ~9.9V empty) is read through a resistor
-// divider into ADC1_CH2 (GPIO 3). The pin is left free in the V10.1 pinout —
-// confirmed against motor / IMU / GPS / safety allocations above.
+// BATTERY VOLTAGE MONITORING (V10.3 — LFP 4S 10,000 mAh)
+// Primary path: INA219 over I2C (SDA/SCL shared with VL53L0X via TCA9548A —
+// but INA219 lives on bus root, NOT behind the mux, at addr 0x40). Reports
+// bus voltage in mV with 4 mV LSB, no shunt math (we don't measure current).
+// Fallback path: legacy resistor divider into ADC1_CH2 (GPIO 3), kept so the
+// firmware boots cleanly if the INA219 is missing or fails I2C handshake.
 //
-// Wiring (recommended values keep ADC input ≤3.3V and divider current <0.4 mA):
+// LFP 4S battery thresholds (per pack, NOT per cell — LFP curve is shape-of):
+//   Full      4 × 3.65V = 14.60 V    (resting after full charge)
+//   Nominal   4 × 3.30V = 13.20 V    (mid plateau, ~50% SoC)
+//   Low alert 4 × 3.20V = 12.80 V    (≈30% SoC — request return-to-dock)
+//   Critical  4 × 3.00V = 12.00 V    (≈10% — hard-stop motion, alarm fires)
+//   Empty     4 × 2.50V = 10.00 V    (BMS cutoff; never reach in service)
+// LFP plateaus hard between 13.0–13.4V so SoC% derived from voltage alone is
+// approximate near the middle of the curve and accurate at the cliffs.
+//
+// Wiring (divider only used when INA219 absent):
 //   BATTERY_VBAT ─── R_TOP (100kΩ) ─┬── BATTERY_PIN
 //                                   │
 //                                   R_BOT (22kΩ)
 //                                   │
 //   GND ────────────────────────────┘
 // Vadc = Vbat × R_BOT / (R_TOP + R_BOT) ≈ Vbat × 0.1803
-//   12.6V → 2.27V (within ADC FS @ 11dB attenuation)
-//    9.9V → 1.78V
+//   14.6V → 2.63V — under ADC FS @ 11dB, but headroom is thin; INA219 preferred
+//   10.0V → 1.80V
 // ============================================================================
-#define BATTERY_PIN              3       // GPIO 3 — ESP32-S3 ADC1_CH2
+#define BATTERY_PIN              3       // GPIO 3 — ESP32-S3 ADC1_CH2 (fallback)
 #define BATTERY_R_TOP_OHM        100000  // top resistor (battery+ → ADC pin)
 #define BATTERY_R_BOT_OHM        22000   // bottom resistor (ADC pin → GND)
-#define BATTERY_CELLS            3       // 3S LiPo / Li-ion pack
+#define BATTERY_CELLS            4       // 4S LFP pack (LiFePO4, 10,000 mAh)
 #define BATTERY_EMA_ALPHA_NUM    1       // exponential moving avg numerator
 #define BATTERY_EMA_ALPHA_DEN    8       // EMA denom — α = 1/8 → ~5s settle @1Hz
 #define BATTERY_EMIT_INTERVAL_MS 1000UL  // BAT line cadence — ~1Hz, well under
                                          // the IMU rate so it never drowns UART
+// I2C bus that the INA219 sits on. ESP32-S3 default Wire is GPIO 8/9 normally,
+// but GPIO 8/9 are taken by BR motor PWM — we explicitly route I2C to free
+// pins. SDA=GPIO19, SCL=GPIO20 are unused after motor + IMU + GPS allocation.
+#define I2C_SDA_PIN              19
+#define I2C_SCL_PIN              20
+#define I2C_FREQ_HZ              100000UL  // INA219 is fine up to 1MHz, 100kHz
+                                            // for safety with long jumper wires
+#define INA219_ADDR              0x40       // default A0=A1=GND
 
 // ============================================================================
 // MOTOR DIRECTION INVERSION
@@ -382,6 +403,13 @@ uint32_t batteryFilteredMv = 0;        // 0 = "no sample yet"
 uint32_t lastBatteryEmitMs = 0;
 bool     batteryAdcReady   = false;
 
+// V10.3: INA219 over I2C is the preferred bus-voltage source. When present it
+// drives batteryFilteredMv directly (no divider math needed). If begin() fails
+// we silently fall back to the legacy resistor divider on GPIO 3.
+Adafruit_INA219 ina219(INA219_ADDR);
+bool ina219Ready = false;
+uint32_t ina219FailCount = 0;          // increments on consecutive read NaNs
+
 // ============================================================================
 // GPS NEO-6M GLOBAL STATE
 // gpsEnabled is toggled at boot — if Serial2 init fails the task self-disables.
@@ -392,6 +420,16 @@ volatile bool gpsEnabled = false;
 TaskHandle_t gpsTaskHandle = nullptr;
 volatile uint32_t gpsLinesForwarded = 0;
 volatile uint32_t gpsBytesRead = 0;       // total raw bytes from UART2 (debug)
+
+// V7: handles for the Core 0 sensor tasks. These let setup verify the tasks
+// were created and allow future code to inspect / suspend them at runtime.
+TaskHandle_t imuTaskHandle     = nullptr;
+TaskHandle_t batteryTaskHandle = nullptr;
+
+// Forward declarations — implementations live near updateIMU() and
+// updateBattery() to keep the related code together.
+void imuTask(void* arg);
+void batteryTask(void* arg);
 
 // ============================================================================
 // GPS TASK (Core 0) — read NMEA sentences from UART2 and forward to Pi
@@ -442,6 +480,16 @@ void gpsTask(void *param) {
 void setup() {
   // Serial initialization (UART mode - USB CDC must be OFF)
   Serial.begin(115200);
+  // CRITICAL — cap Stream::readStringUntil('\n') timeout at 50 ms instead of
+  // the Arduino default 1000 ms. Without this, a stream that's mid-frame
+  // when readStringUntil is invoked (very common when Pi telemetry runs
+  // alongside command sends) can stall the main loop for a full second
+  // per call. That's what made physical LIGHT_ON / motor commands feel
+  // "a few seconds late" while D1 R32 relay — which uses a non-blocking
+  // byte-by-byte parser — felt instant on the same broker. 50 ms is well
+  // above the worst-case USB-CDC frame jitter (~5 ms) and still small
+  // enough that the loop's 20 Hz IMU/odom cadence is unaffected.
+  Serial.setTimeout(50);
   delay(1000);
 
   // Hardware task-watchdog: panic-reset chip if loop() stalls > HW_WDT_TIMEOUT_S.
@@ -538,16 +586,44 @@ void setup() {
   DBG_PRINTF("✓ Buzzer GPIO%d, Remote-relay GPIO%d, E-Stop GPIO%d (FALLING ISR)\n",
              BUZZER_PIN, REMOTE_RELAY_PIN, ESTOP_PIN);
 
-  // ===== BATTERY ADC SETUP (V10.2) =====
+  // ===== I2C BUS + INA219 BATTERY MONITOR (V10.3) =====
+  // We share the I2C bus with future sensors (the VL53L0X mux lives behind
+  // its own TCA9548A, so INA219 sits on the root bus at 0x40 without
+  // collisions). 100 kHz keeps the bus tolerant of long jumper wires that
+  // the prototype harness uses.
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_FREQ_HZ);
+  // V7.1: 100 ms transaction timeout. A stuck SDA on the BNO08x or INA219
+  // (loose dupont jumper, EMI brown-out mid-byte) would otherwise hang
+  // Wire.read*() forever — the dual-core imu/battery tasks each block on
+  // their first I2C call after the fault, the main loop keeps petting
+  // its WDT, and the chip sits in a "USB present, firmware silent" zombie
+  // state. With a timeout, the call returns NACK and the task resumes,
+  // self-healing on the very next sample once the bus settles.
+  Wire.setTimeOut(100);
+  ina219Ready = ina219.begin(&Wire);
+  if (ina219Ready) {
+    // 32V bus range, 320mV shunt. We don't read current, but the calibration
+    // affects bus-voltage register update rate; this preset is plenty fast.
+    ina219.setCalibration_32V_2A();
+    DBG_PRINTF("✓ INA219 @0x%02X on I2C(SDA=%d, SCL=%d) — pack voltage primary\n",
+               INA219_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+  } else {
+    DBG_PRINTF("⚠ INA219 not found @0x%02X — falling back to ADC divider\n",
+               INA219_ADDR);
+  }
+
+  // ===== BATTERY ADC FALLBACK (V10.2 legacy path, V10.3 fallback) =====
   // 11dB attenuation maps the divider's 0-2.3V into the ADC's full-scale
   // range. analogReadMilliVolts() then applies eFuse calibration so we get
-  // reasonable absolute mV out of the box.
+  // reasonable absolute mV out of the box. Always init the ADC even when
+  // INA219 is healthy — it auto-recovers if INA219 misreads 5× in a row.
   analogReadResolution(12);
   analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
   batteryAdcReady = true;
   // Prime the EMA so the first BAT line is meaningful instead of 0%.
   for (int i = 0; i < 4; ++i) updateBattery();
-  DBG_PRINTF("✓ Battery ADC GPIO%d (R_top=%dΩ, R_bot=%dΩ, %d cells)\n",
+  DBG_PRINTF("✓ Battery ADC GPIO%d (R_top=%dΩ, R_bot=%dΩ, %d cells, LFP)\n",
              BATTERY_PIN, BATTERY_R_TOP_OHM, BATTERY_R_BOT_OHM,
              BATTERY_CELLS);
   
@@ -590,6 +666,22 @@ void setup() {
     gpsEnabled = false;
     DBG_PRINTLN("✗ GPS task creation FAILED — outdoor mode disabled");
   }
+
+  // V7: dedicated Core 0 tasks for blocking I²C sensors. Earlier these ran
+  // inline in loop() on Core 1 and blocked the serial command parser 1-5 ms
+  // (IMU) or 1-3 ms (INA219) per iteration. With both moved to Core 0,
+  // loop() lands well under 2 ms steady state — matching the D1 R32
+  // peripheral hub's snappy feel.
+  //
+  // Cadence chosen for each:
+  //   * IMU at 50 Hz — enough resolution for the line-follow PD controller
+  //     and the tipover watcher; faster wastes I²C bandwidth.
+  //   * Battery at 5 Hz — INA219 is slow-moving; the EMA filter on the Pi
+  //     wouldn't see anything new past this rate.
+  xTaskCreatePinnedToCore(
+      imuTask,     "imuTask",     4096, NULL, 2, &imuTaskHandle,     0);
+  xTaskCreatePinnedToCore(
+      batteryTask, "batteryTask", 4096, NULL, 1, &batteryTaskHandle, 0);
 
   // Hardware WDT subscribe — from now on loop() must reset within HW_WDT_TIMEOUT_S.
   esp_task_wdt_add(NULL);
@@ -1128,6 +1220,57 @@ void updateIMU() {
   }
 }
 
+// V7: Core 0 IMU pump. Hosts the blocking BNO08x I²C read so the Arduino
+// loop on Core 1 doesn't stall 1-5 ms per iteration (worst 50 ms on SH2
+// reset). Shared state (imuYaw/imuPitch/imuRoll/imuAccuracy) is written
+// here and read freely by the main loop — ESP32 32-bit aligned float
+// reads/writes are atomic across cores so a mutex would just add jitter
+// for no correctness gain.
+//
+// Auto-emits the compact IMU line at 10 Hz so the Pi no longer has to ask
+// for it ("REQUEST_IMU" used to poll at 5 Hz and flood the UART). The Pi
+// parser already accepts unsolicited IMU: lines — see _parse_imu_line in
+// kpatrol_mqtt_v5.py.
+void imuTask(void* arg) {
+  (void)arg;
+  // V7.1: subscribe Core 0 task to the same hardware WDT main loop uses.
+  // If BNO08x I2C blocks longer than HW_WDT_TIMEOUT_S (2 s) the chip
+  // resets, breaking out of the silent-firmware zombie state. updateIMU()
+  // returns quickly under normal load (~1 ms), and Wire.setTimeOut(100)
+  // bounds the worst case so this WDT only fires on a genuinely wedged
+  // bus that needs a full reboot anyway.
+  esp_task_wdt_add(NULL);
+  uint32_t lastEmit = 0;
+  for (;;) {
+    esp_task_wdt_reset();
+    updateIMU();
+    uint32_t now = millis();
+    if (imuInitialized && (now - lastEmit) >= 100) {
+      lastEmit = now;
+      Serial.printf("IMU:%.2f,%.2f,%.2f,%.1f\n",
+                    imuYaw, imuPitch, imuRoll, imuAccuracy);
+    }
+    // 50 Hz update is the line-follow PD controller's effective sample
+    // rate; the BNO08x itself runs the rotation-vector report at ~100 Hz.
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// V7: Core 0 battery pump. INA219 over I²C takes 1-3 ms; not catastrophic
+// alone but on a 1-2 ms target loop budget it doubles the worst-case
+// iteration time. 5 Hz is far above what the EMA filter on the Pi can
+// distinguish — LFP voltage barely moves second-to-second.
+void batteryTask(void* arg) {
+  (void)arg;
+  // V7.1: WDT subscribe — same rationale as imuTask.
+  esp_task_wdt_add(NULL);
+  for (;;) {
+    esp_task_wdt_reset();
+    updateBattery();
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
 // Print current IMU values (human readable)
 void printIMU() {
   if (!imuInitialized) {
@@ -1175,29 +1318,35 @@ float getHeading() {
 }
 
 // ============================================================================
-// BATTERY VOLTAGE MONITORING (V10.2)
-// Uses analogReadMilliVolts() which applies the per-chip eFuse ADC calibration
-// table, so we get reasonable absolute mV without per-board tuning. EMA filter
-// suppresses motor-current ripple (PWM commutation injects mV-level noise on
-// the divider node).
+// BATTERY VOLTAGE MONITORING (V10.3 — LFP 4S 10,000 mAh + INA219)
+// Primary path: INA219 bus-voltage register. 12-bit ADC, 4 mV LSB, ±0.5% typ.
+// No shunt math (we don't need current); we just need pack_mv to feed the SoC
+// estimator and the AlarmRule engine on the Pi.
+// Fallback: legacy 100k/22k resistor divider into GPIO 3 (ADC1_CH2) via
+// analogReadMilliVolts() which applies per-chip eFuse calibration. Either way
+// the EMA filter swallows PWM ripple from the 4 motor drivers.
+//
+// LFP cell discharge curve is flat — most of the capacity lives between 3.20V
+// and 3.35V per cell. The anchor points below are tuned for "low / critical"
+// alerting under light load (≈1–2 A draw, robot patrolling indoors).
 // ============================================================================
 
 // Convert measured cell voltage (mV) to a state-of-charge percent. Linear
 // interpolation across a small piecewise table that matches a lightly loaded
-// LiPo discharge curve — accurate enough for "low / critical" alerting.
+// LFP discharge curve — accurate enough for "low / critical" alerting.
 static int batteryCellMvToPct(uint32_t cellMv) {
   // Anchor points: { mV per cell, % SoC }. Sorted from full → empty.
+  // LFP plateau: 80%→30% lives in the narrow 3.30–3.25V band, so the % drops
+  // fast as soon as voltage breaks below 3.25V. This is intentional — it
+  // makes "low" alerts trigger early enough to RTH before the BMS cuts off.
   static const struct { uint16_t mv; uint8_t pct; } CURVE[] = {
-    { 4200, 100 },
-    { 4100,  90 },
-    { 4000,  80 },
-    { 3900,  70 },
-    { 3800,  55 },
-    { 3700,  40 },
-    { 3600,  25 },
-    { 3500,  15 },
-    { 3400,   8 },
-    { 3300,   0 },
+    { 3650, 100 },   // freshly off charger, surface charge
+    { 3400,  90 },   // rests here after a few minutes idle
+    { 3300,  80 },   // top of plateau
+    { 3250,  50 },   // mid plateau
+    { 3200,  30 },   // bottom of plateau — LOW alert window
+    { 3000,  10 },   // knee — CRITICAL alert window
+    { 2500,   0 },   // BMS cutoff
   };
   if (cellMv >= CURVE[0].mv)                        return 100;
   if (cellMv <= CURVE[sizeof(CURVE)/sizeof(CURVE[0]) - 1].mv) return 0;
@@ -1217,16 +1366,37 @@ static int batteryCellMvToPct(uint32_t cellMv) {
   return 0;
 }
 
-// Sample the divider one-shot and feed the EMA filter. Returns true if a fresh
-// sample was incorporated; false if the ADC isn't ready (e.g. before setup()).
+// Read one pack-voltage sample. Returns 0 if no source is available, else
+// pack voltage in millivolts. Caller is responsible for EMA filtering.
+//   1. INA219 (preferred — direct, no divider tolerance drift)
+//   2. Resistor divider on GPIO 3 (fallback)
+static uint32_t readPackMv() {
+  if (ina219Ready) {
+    float busV = ina219.getBusVoltage_V();
+    // The INA219 returns 0 V if VIN+ is unpowered; treat <2V as garbage so we
+    // don't latch an empty-pack alarm on a wiring mistake.
+    if (!isnan(busV) && busV > 2.0f) {
+      ina219FailCount = 0;
+      return (uint32_t)(busV * 1000.0f);
+    }
+    ++ina219FailCount;
+    // 5 consecutive misreads → mark unhealthy and fall through to ADC.
+    if (ina219FailCount > 5) ina219Ready = false;
+  }
+  if (batteryAdcReady) {
+    uint32_t adc_mv = (uint32_t)analogReadMilliVolts(BATTERY_PIN);
+    // Reverse divider: pack_mv = adc_mv * (R_TOP + R_BOT) / R_BOT
+    return (adc_mv * (BATTERY_R_TOP_OHM + BATTERY_R_BOT_OHM))
+           / BATTERY_R_BOT_OHM;
+  }
+  return 0;
+}
+
+// Sample a voltage source and feed the EMA filter. Returns true if a fresh
+// sample was incorporated; false if no source is available yet.
 static bool updateBattery() {
-  if (!batteryAdcReady) return false;
-  // analogReadMilliVolts is calibrated; no manual ADC ref math needed.
-  uint32_t adc_mv = (uint32_t)analogReadMilliVolts(BATTERY_PIN);
-  // Reverse the divider to get the pack voltage at the battery+ terminal.
-  // pack_mv = adc_mv * (R_TOP + R_BOT) / R_BOT
-  uint32_t pack_mv = (adc_mv * (BATTERY_R_TOP_OHM + BATTERY_R_BOT_OHM))
-                     / BATTERY_R_BOT_OHM;
+  uint32_t pack_mv = readPackMv();
+  if (pack_mv == 0) return false;
   if (batteryFilteredMv == 0) {
     batteryFilteredMv = pack_mv;  // seed: avoid a multi-second ramp on boot
   } else {
@@ -1242,7 +1412,7 @@ static bool updateBattery() {
 // Print compact battery line for Pi parsing.
 // Format: BAT:<pct>,<pack_mv>   (matches kpatrol_mqtt_v5._parse_battery_line)
 void printBatteryCompact() {
-  if (!batteryAdcReady || batteryFilteredMv == 0) {
+  if ((!batteryAdcReady && !ina219Ready) || batteryFilteredMv == 0) {
     Serial.println("BAT:ERROR");
     return;
   }
@@ -1253,15 +1423,18 @@ void printBatteryCompact() {
 
 // Human-readable diagnostic dump (BAT_FULL command).
 void printBattery() {
-  Serial.println("\n=== Battery ===");
-  if (!batteryAdcReady) {
-    Serial.println("ADC not initialized");
-    Serial.println("===============\n");
+  Serial.println("\n=== Battery (LFP 4S) ===");
+  Serial.printf("  Source: %s%s\n",
+                ina219Ready ? "INA219" : "(none)",
+                batteryAdcReady ? (ina219Ready ? "+ADC-fallback" : "ADC-divider") : "");
+  if (!batteryAdcReady && !ina219Ready) {
+    Serial.println("  No voltage source initialized");
+    Serial.println("========================\n");
     return;
   }
   if (batteryFilteredMv == 0) {
-    Serial.println("No sample yet");
-    Serial.println("===============\n");
+    Serial.println("  No sample yet");
+    Serial.println("========================\n");
     return;
   }
   uint32_t cell_mv = batteryFilteredMv / BATTERY_CELLS;
@@ -1272,7 +1445,10 @@ void printBattery() {
   Serial.printf("  Cell:  %lu mV  (%d cells)\n",
                 (unsigned long)cell_mv, BATTERY_CELLS);
   Serial.printf("  SoC:   %d%%\n", pct);
-  Serial.println("===============\n");
+  if (ina219Ready) {
+    Serial.printf("  INA219 misreads: %lu\n", (unsigned long)ina219FailCount);
+  }
+  Serial.println("========================\n");
 }
 
 // ============================================================================
@@ -1543,21 +1719,58 @@ void loop() {
   // throw / block — but after we have a chance to abort if WDT is unhealthy.
   esp_task_wdt_reset();
 
-  // Update IMU data continuously
-  updateIMU();
+  // V7: IMU read moved to imuTask on Core 0 (see setup). Earlier this called
+  // updateIMU() in the hot loop, which blocked 1-5 ms (worst case 50 ms when
+  // BNO08x renegotiated SH2). On a 1-2 ms target loop budget that's the
+  // single biggest source of command latency. Now the IMU snapshot lives in
+  // volatile shared state and the main loop reads it freely.
 
   // Safety ticks (V10.1) — non-blocking, run every loop iteration.
   handleEstopIfTriggered();
   tickBuzzerPattern();
   tickLightPattern();
 
-  if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    command.toUpperCase();
+  // Non-blocking byte-by-byte command parser. Replaces the previous
+  // `readStringUntil('\n')` which — even with `setTimeout(50)` — would stall
+  // the loop up to 50 ms if Pi flushed only part of a frame. Reading single
+  // bytes guarantees the parser returns instantly when no more bytes are
+  // ready, matching the D1 R32 peripheral hub's "instant" feel.
+  //
+  // Buffer is `static` so partial frames survive between loop iterations,
+  // letting the next iteration finish parsing a command that arrived
+  // mid-transmission.
+  static char cmdBuf[96];
+  static uint8_t cmdLen = 0;
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') {
+      if (cmdLen < sizeof(cmdBuf) - 1) {
+        cmdBuf[cmdLen++] = c;
+      } else {
+        // Overflow — drop the frame to resync.
+        cmdLen = 0;
+      }
+      continue;
+    }
+    // Got '\n' — finalise the buffer into a command line.
+    cmdBuf[cmdLen] = '\0';
+    while (cmdLen > 0 && (cmdBuf[cmdLen - 1] == ' ' || cmdBuf[cmdLen - 1] == '\t')) {
+      cmdBuf[--cmdLen] = '\0';
+    }
+    for (uint8_t i = 0; i < cmdLen; i++) {
+      if (cmdBuf[i] >= 'a' && cmdBuf[i] <= 'z') cmdBuf[i] -= 32;  // toUpper
+    }
+    String command(cmdBuf);   // 1 alloc/command — handler logic unchanged
+    cmdLen = 0;
 
-    Serial.print("\n> Command: ");
-    Serial.println(command);
+    if (command.length() == 0) continue;
+
+    // No debug echo here. The old `Serial.print("> Command: ")` flushed
+    // 20–30 bytes back to the Pi for every received frame, which fought
+    // for the same USB-CDC pipe the Pi was using to send. Removing the
+    // echo measurably tightens the round-trip on physical actuators
+    // (light / horn / motor) at the cost of one log line.
 
     // Safety gate: while e-stop or remote cutoff is active, refuse all motion
     // commands so a runaway Pi cannot bypass the lock. Telemetry commands
@@ -1964,12 +2177,12 @@ void loop() {
     Serial.println(millis() - lastCommandTime);
   }
 
-  // Battery: sample fast (every loop) into the EMA, but only emit on the
-  // BAT_EMIT_INTERVAL_MS cadence so we don't drown the 115200-baud UART.
-  // Runs after the command parser so a manual `BAT` reply is not duplicated
-  // by the periodic line in the same iteration.
-  updateBattery();
-  if (batteryAdcReady &&
+  // V7: battery sampling moved to batteryTask on Core 0 (see setup). The
+  // INA219 I²C read previously blocked the loop 1-3 ms on every iteration;
+  // it now ticks at 5 Hz on the other core. The periodic BAT: line still
+  // fires here (cheap Serial print) so cadence stays under the operator's
+  // control via BATTERY_EMIT_INTERVAL_MS.
+  if ((batteryAdcReady || ina219Ready) &&
       (millis() - lastBatteryEmitMs) >= BATTERY_EMIT_INTERVAL_MS) {
     lastBatteryEmitMs = millis();
     printBatteryCompact();
