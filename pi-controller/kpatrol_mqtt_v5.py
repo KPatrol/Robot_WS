@@ -32,6 +32,7 @@ Hardware (V5.3):
   ESP32     → /dev/ttyKPATROL_ENCODER (4 encoders + 6x VL53L0X ToF)
 """
 
+import glob
 import json
 import logging
 import time
@@ -60,6 +61,7 @@ except ImportError:
 # Add parent directory to path so navigation package resolves
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from peripheral_hub import PeripheralHub, PeripheralState  # type: ignore
 from navigation import (
     NavController, Mode, LineFollowerConfig, HSVRange, CoverageConfig,
     Odometry, VelocityController, VelocityPIDConfig,
@@ -109,6 +111,11 @@ try:
         AlertActuator, ActuatorConfig,
         TipOverWatcher, TipOverConfig,
         BatteryWatcher, BatteryConfig,
+        AlarmController, AlarmRule,
+        EVENT_PERSON, EVENT_FIRE,
+        EVENT_BATTERY_LOW, EVENT_BATTERY_CRITICAL,
+        EVENT_TIPOVER, EVENT_SCHEDULE,
+        EVENT_SYSTEM_ERROR, EVENT_ANY_SAFETY,
     )
     _SAFETY_AVAILABLE = True
 except ImportError as _saf_err:
@@ -119,6 +126,16 @@ except ImportError as _saf_err:
     TipOverConfig = None      # type: ignore
     BatteryWatcher = None     # type: ignore
     BatteryConfig = None      # type: ignore
+    AlarmController = None    # type: ignore
+    AlarmRule = None          # type: ignore
+    EVENT_PERSON = "person"
+    EVENT_FIRE = "fire"
+    EVENT_BATTERY_LOW = "battery_low"
+    EVENT_BATTERY_CRITICAL = "battery_critical"
+    EVENT_TIPOVER = "tipover"
+    EVENT_SCHEDULE = "schedule"
+    EVENT_SYSTEM_ERROR = "system_error"
+    EVENT_ANY_SAFETY = "any_safety"
     _SAFETY_AVAILABLE = False
 
 
@@ -152,6 +169,10 @@ class MQTTConfig:
 class SerialConfig:
     motor_port: str = "/dev/ttyKPATROL_MOTOR"
     encoder_port: str = "/dev/ttyKPATROL_ENCODER"
+    # V5.6: D1 R32 peripheral hub (OLED + DHT11 + relay light/horn).
+    # Non-essential — if the port is missing / disabled, the rest of the
+    # stack runs unaffected.
+    periph_port: Optional[str] = "/dev/kpatrol-periph"
     baudrate: int = 115200
     timeout: float = 1.0
 
@@ -242,6 +263,21 @@ class Topics:
         # V5.3: Mecanum odometry (encoder + IMU complementary filter) at 20Hz
         self.ODOM          = f"{p}/odom"
         self.ODOM_RESET    = f"{p}/odom_reset"
+        # V5.5: Operator-configured alarm rules (Web → Pi) + fire reports (Pi → Web)
+        # Rule payload: JSON list of AlarmRule dicts (id/name/event_type/enabled/
+        # windows[start,end,weekdays]/continuous_duration_s/cooldown_s/light_pattern/
+        # buzzer_pattern). Pi pushes a trigger record back on /alarm/triggered when
+        # the dwell threshold has been satisfied inside the rule's time window.
+        self.ALARM_RULES     = f"{p}/alarm/rules"
+        self.ALARM_TRIGGERED = f"{p}/alarm/triggered"
+        # V5.6: D1 R32 peripheral hub (OLED + DHT11 + relay).
+        # PERIPH_STATE: Pi publishes the latest hub snapshot (relay, temp,
+        #               humidity, watchdog_armed, fw, heap) every 5 s + on change.
+        # PERIPH_CMD:   Web publishes commands (relay on/off/toggle, oled text,
+        #               polarity flip, manual time push) for the Pi to forward
+        #               down the UART to the D1 R32.
+        self.PERIPH_STATE = f"{p}/peripherals/state"
+        self.PERIPH_CMD   = f"{p}/peripherals/cmd"
         # Wildcard for subscribing all topics of this robot
         self.WILDCARD      = f"{p}/#"
 
@@ -254,15 +290,245 @@ class Topics:
 MOTOR_POSITIONS = ['FR', 'FL', 'BR', 'BL']
 MOTOR_INVERTED = {'FR': False, 'FL': True, 'BR': False, 'BL': True}
 
-# Hardware bypass: front-right VL53L0X (TCA9548A channel 2) is physically
-# faulty on this build — its readings fluctuate between min-range and 9999
-# regardless of obstacles, which would otherwise wedge the safety controller
-# into permanent DANGER. We force-clear bit2 of the firmware valid_mask and
-# zero its raw distance so downstream `_valid_or_far` treats the lane as
-# "unknown" instead of "in your face". Remove this once the physical sensor
-# is replaced.
-DISABLED_TOF_BIT_MASK = 0b111011  # clear bit2 = front_right
-DISABLED_TOF_LANES = ('front_right',)
+
+# ==================== NETWORK GEOLOCATION ====================
+# V5.13: hardware NEO-6M can't see satellites indoor, so we synthesize a
+# position three different ways with steeply decreasing accuracy:
+#
+#   1. Manual override (env KPATROL_GPS_OVERRIDE_LAT/LON) — operator pins
+#      the exact lat/lon of the demo location. ~0 m error, but requires
+#      knowing the spot in advance.
+#   2. WiFi triangulation via BeaconDB (https://beacondb.net) — open-data
+#      successor of Mozilla Location Service. POST nearby BSSIDs + RSSI,
+#      get back a fix accurate to ~20-200 m. No API key needed.
+#   3. IP geolocation via ip-api.com — ISP exit point, ~5-50 km off. Last
+#      resort so the dashboard at least shows a city.
+#
+# Sources are tried in that order at every refresh; the highest-accuracy
+# result wins. If WiFi scan fails (no permission, no nmcli) BeaconDB is
+# silently skipped — the operator only sees IP-level accuracy, same as
+# V5.12. Refresh cadence stays at 5 min so we don't hammer the public
+# beacondb instance.
+class NetworkGeolocator:
+    REFRESH_S = 300            # 5 min between successful refreshes
+    BACKOFF_S = 30             # short retry when a fetch fails
+    HTTP_TIMEOUT_S = 6
+    BEACONDB_URL = "https://api.beacondb.net/v1/geolocate"
+    IPAPI_URL    = "http://ip-api.com/json/?fields=status,country,countryCode,city,lat,lon,query,timezone"
+
+    def __init__(self):
+        self._cache: Optional[Dict[str, Any]] = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        # Manual override: parsed once at init so env tweaks need a
+        # service restart — that matches the existing config pattern
+        # and avoids a thread reading os.environ on every refresh.
+        self._override: Optional[Tuple[float, float]] = None
+        lat_s = os.environ.get("KPATROL_GPS_OVERRIDE_LAT", "").strip()
+        lon_s = os.environ.get("KPATROL_GPS_OVERRIDE_LON", "").strip()
+        if lat_s and lon_s:
+            try:
+                self._override = (float(lat_s), float(lon_s))
+                logger.info(f"[NetGPS] Manual override active: {self._override[0]:.6f}, {self._override[1]:.6f}")
+            except ValueError:
+                logger.warning(f"[NetGPS] Bad override coords: lat={lat_s!r}, lon={lon_s!r}")
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._fetch_once()
+        self._thread = threading.Thread(target=self._loop, name="netgps", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _loop(self) -> None:
+        while self._running:
+            ok = self._fetch_once()
+            time.sleep(self.REFRESH_S if ok else self.BACKOFF_S)
+
+    # ─── BSSID scan ────────────────────────────────────────────────────
+    def _scan_wifi(self) -> List[Dict[str, Any]]:
+        """Return a list of nearby APs in the BeaconDB request schema.
+
+        Uses NetworkManager's cached scan via ``nmcli`` — no sudo, no
+        ``CAP_NET_ADMIN`` needed. NetworkManager refreshes the scan
+        every ~30 s on its own, so calling this every 5 min always
+        gets a fresh list. Empty list on any failure (nmcli missing,
+        no WiFi adapter, escape parsing edge case).
+        """
+        try:
+            import subprocess
+            # -t for terse, -e for escape backslashes (BSSID octets use ':'
+            # which nmcli would otherwise treat as field separators). We
+            # pull BSSID + SIGNAL (0-100) + FREQ; SIGNAL gets converted
+            # to dBm with NetworkManager's documented mapping.
+            out = subprocess.run(
+                ["nmcli", "-t", "-e", "yes", "-f", "BSSID,SIGNAL,FREQ", "dev", "wifi", "list"],
+                capture_output=True, text=True, timeout=4,
+            )
+            if out.returncode != 0:
+                return []
+            aps: List[Dict[str, Any]] = []
+            for line in out.stdout.splitlines():
+                # nmcli escapes ':' inside the BSSID as '\:' so we re-join
+                # the first six hex pairs by splitting on UN-escaped ':'.
+                parts = re.split(r"(?<!\\):", line.strip())
+                if len(parts) < 3:
+                    continue
+                bssid = parts[0].replace("\\:", ":").upper()
+                if not re.match(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$", bssid):
+                    continue
+                try:
+                    signal_pct = int(parts[1])
+                    freq_mhz = int(parts[2].split()[0])
+                except (ValueError, IndexError):
+                    continue
+                # NetworkManager: 100% ≈ -50 dBm, 0% ≈ -100 dBm linear.
+                signal_dbm = (signal_pct // 2) - 100
+                aps.append({
+                    "macAddress": bssid,
+                    "signalStrength": signal_dbm,
+                    "frequency": freq_mhz,
+                })
+            return aps
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.debug(f"[NetGPS] WiFi scan unavailable: {exc}")
+            return []
+        except Exception as exc:
+            logger.warning(f"[NetGPS] WiFi scan failed: {exc}")
+            return []
+
+    # ─── Resolver tier 2: BeaconDB ─────────────────────────────────────
+    def _resolve_beacondb(self) -> Optional[Dict[str, Any]]:
+        aps = self._scan_wifi()
+        if len(aps) < 2:
+            # BeaconDB needs at least two beacons for a meaningful fix —
+            # one AP yields a useless circle the size of the AP's range.
+            return None
+        try:
+            import urllib.request as _ur
+            body = json.dumps({"wifiAccessPoints": aps}).encode("utf-8")
+            req = _ur.Request(
+                self.BEACONDB_URL,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "kpatrol-pi/5.13",
+                },
+                method="POST",
+            )
+            with _ur.urlopen(req, timeout=self.HTTP_TIMEOUT_S) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+            loc = data.get("location") or {}
+            if "lat" not in loc or "lng" not in loc:
+                return None
+            entry = {
+                "latitude": float(loc["lat"]),
+                "longitude": float(loc["lng"]),
+                "accuracy_m": float(data.get("accuracy", 0) or 0),
+                "city": "",      # BeaconDB doesn't reverse-geocode
+                "country": "",
+                "country_code": "",
+                "timezone": "",
+                "public_ip": "",
+                "source_tier": "wifi",
+                "ap_count": len(aps),
+                "fetched_at_ms": int(time.time() * 1000),
+            }
+            logger.info(
+                f"[NetGPS] BeaconDB fix ({entry['latitude']:.6f}, "
+                f"{entry['longitude']:.6f}) ±{entry['accuracy_m']:.0f}m "
+                f"from {len(aps)} APs"
+            )
+            return entry
+        except Exception as exc:
+            logger.warning(f"[NetGPS] BeaconDB lookup failed: {exc}")
+            return None
+
+    # ─── Resolver tier 3: IP geolocation ───────────────────────────────
+    def _resolve_ipapi(self) -> Optional[Dict[str, Any]]:
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(self.IPAPI_URL, headers={"User-Agent": "kpatrol-pi/5.13"})
+            with _ur.urlopen(req, timeout=self.HTTP_TIMEOUT_S) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+            if data.get("status") != "success":
+                logger.warning(f"[NetGPS] ip-api error: {data!r}")
+                return None
+            entry = {
+                "latitude": float(data["lat"]),
+                "longitude": float(data["lon"]),
+                "accuracy_m": 5000.0,   # ISP-exit point: city-block, not meters
+                "city": data.get("city", ""),
+                "country": data.get("country", ""),
+                "country_code": data.get("countryCode", ""),
+                "timezone": data.get("timezone", ""),
+                "public_ip": data.get("query", ""),
+                "source_tier": "ip",
+                "ap_count": 0,
+                "fetched_at_ms": int(time.time() * 1000),
+            }
+            logger.info(
+                f"[NetGPS] IP fix {entry['city']}, {entry['country']} "
+                f"({entry['latitude']:.4f}, {entry['longitude']:.4f}) "
+                f"via {entry['public_ip']}"
+            )
+            return entry
+        except Exception as exc:
+            logger.warning(f"[NetGPS] ip-api fetch failed: {exc}")
+            return None
+
+    # ─── Resolver entry point ──────────────────────────────────────────
+    def _fetch_once(self) -> bool:
+        # Tier 1: manual override (no network round-trip needed). We
+        # still refresh the cache so the timestamp stays fresh.
+        if self._override is not None:
+            entry = {
+                "latitude": self._override[0],
+                "longitude": self._override[1],
+                "accuracy_m": 1.0,        # operator pinned it — assume sub-meter
+                "city": "",
+                "country": "",
+                "country_code": "",
+                "timezone": "",
+                "public_ip": "",
+                "source_tier": "manual",
+                "ap_count": 0,
+                "fetched_at_ms": int(time.time() * 1000),
+            }
+            with self._lock:
+                self._cache = entry
+            return True
+
+        # Tier 2: BeaconDB WiFi triangulation.
+        entry = self._resolve_beacondb()
+        # Tier 3: IP geolocation as last resort.
+        if entry is None:
+            entry = self._resolve_ipapi()
+        if entry is None:
+            return False
+        with self._lock:
+            self._cache = entry
+        return True
+
+    def get_fix(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return dict(self._cache) if self._cache else None
+
+# V5.10: front-right VL53L0X back online after the hardware replacement —
+# 2026-05-23 raw serial showed valid distance readings on lane 2 (`TOF:.,.,
+# <val>,...`). Mask is now all-bits-set so every lane the firmware emits is
+# honoured. Keep the constants in place so re-disabling a faulty lane in
+# the future is a one-line change rather than re-introducing the dead-code
+# path through `_parse_tof_line`.
+DISABLED_TOF_BIT_MASK = 0b111111  # 0 disabled lanes — all six honoured
+DISABLED_TOF_LANES: tuple = ()
 
 
 # ==================== SAFETY (Directional) ====================
@@ -477,9 +743,14 @@ class SafetyController:
     direction so the watchdog cuts motion just as if obstacles appeared.
     """
 
-    # Allow ~3× ESP ToF cycle (worst-case ~200ms × 3 + slack) before declaring
-    # data stale. ESP currently runs ~5–20Hz depending on preset.
-    STALE_TOF_THRESHOLD_MS: int = 700
+    # V5.14: relaxed from 700 ms → 3000 ms. The encoder Dev firmware
+    # occasionally drops to ~1 Hz emit rate when the TCA9548A I²C mux
+    # is mid-recovery (tca_fail count climbing) — at the old threshold
+    # the safety gate would briefly fail-closed and block every command
+    # until the bus settled, even though the underlying ToF lanes were
+    # still trustworthy from the previous read. 3 s tolerates two missed
+    # frames while still latching DANGER when the firmware truly hangs.
+    STALE_TOF_THRESHOLD_MS: int = 3000
 
     def __init__(self, config: SafetyConfig = None):
         self.config = config or SafetyConfig()
@@ -641,7 +912,16 @@ class MotorController:
         self.port = port
         self.baudrate = baudrate
         self.serial: Optional[serial.Serial] = None
-        self.lock = threading.Lock()
+        # V5.7: split the read/write critical sections so a main-loop
+        # `drain_responses()` cannot block an inbound MQTT motor command.
+        # Linux tty drivers handle concurrent read+write on the same fd
+        # natively (full-duplex), so two locks are safe — they each only
+        # need to serialise their own direction. Before this split a single
+        # drain pass at 32 lines could hold the lock 20-100 ms, which is
+        # why joystick frames felt sluggish while D1 R32 / peripheral hub
+        # (separate UART, separate locks) felt instant.
+        self.write_lock = threading.Lock()
+        self.read_lock = threading.Lock()
         self.connected = False
         self.current_speed = 150
         self.light_state = False
@@ -654,8 +934,8 @@ class MotorController:
         self._reconnect_interval = 3
         self.imu_data = IMUData()
         # Dedicated IMU lock so consumers can snapshot yaw/pitch/roll without
-        # contending with the serial-I/O critical section (self.lock). Writes
-        # land in _parse_imu_line; reads must go through get_imu_snapshot().
+        # contending with the serial-I/O critical sections (write_lock/read_lock).
+        # Writes land in _parse_imu_line; reads must go through get_imu_snapshot().
         self._imu_lock = threading.Lock()
         # V5.2: optional sink for NMEA frames forwarded by ESP32 firmware
         # (lines prefixed with "NMEA:" arrive on the motor UART0).
@@ -663,7 +943,11 @@ class MotorController:
         # V5.4: latest battery percentage reported by firmware (BAT:<pct>).
         # None means firmware hasn't sent a reading yet — telemetry uses a
         # placeholder until the first valid sample arrives.
+        # V5.5: also stash voltage in mV (firmware format `BAT:<pct>,<pack_mv>`)
+        # so the alarm/socket payload can show LFP volts (more reliable than %
+        # on the flat plateau of the discharge curve).
         self.battery_pct: Optional[float] = None
+        self.battery_voltage_mv: Optional[int] = None
         self.battery_ts: int = 0
 
     def set_gps_sink(self, sink) -> None:
@@ -671,18 +955,54 @@ class MotorController:
         sentences forwarded by the motor firmware via shared-mode pass-through."""
         self._gps_sink = sink
 
+    def _rediscover_port(self) -> str:
+        """Pick the best motor port available right now. Re-evaluated on
+        every (re)connect so the bridge survives the case where the
+        ESP32-S3 brown-outs and re-enumerates *after* the service started.
+
+        Order: udev symlink → content sniff (looks for ``IMU:`` / ``BAT:`` /
+        ``GPS_HB:`` signatures on each free ttyACM*/ttyUSB*) → keep the old
+        guess so the next attempt still has somewhere to try.
+        """
+        if os.path.exists("/dev/ttyKPATROL_MOTOR"):
+            return "/dev/ttyKPATROL_MOTOR"
+        for cand in sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")):
+            if _classify_serial_port(cand) == "motor":
+                return cand
+        return self.port
+
     def connect(self) -> bool:
         try:
             if self.serial and self.serial.is_open:
                 self.serial.close()
-            # timeout=0.1: short read deadline so readline() cannot stall the
-            # main 20Hz loop when a partial frame is in the buffer. With the
-            # previous 1.0s timeout, a fragmented IMU/BAT/NMEA line could
-            # freeze the bridge for up to a full second.
-            self.serial = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=0.1)
+            new_port = self._rediscover_port()
+            if new_port != self.port:
+                logger.info(f"[Motor] Port changed: {self.port} -> {new_port}")
+                self.port = new_port
+            # V5.10: open with DTR / RTS held LOW so we don't bounce-reset the
+            # ESP32-S3. The K-Patrol motor board uses a WCH CH9102 USB-Serial
+            # bridge whose DTR line is wired straight to the S3's EN pin —
+            # pyserial's default `dtr=None` lets the kernel default kick in
+            # (HIGH on Linux), which pulses on every Serial() open and resets
+            # the firmware. Setting them False on the unopened serial object
+            # makes the kernel ioctl set the lines BEFORE the first byte
+            # crosses the wire, so the S3 keeps running uninterrupted across
+            # Pi service restarts. timeout=0.1: short read deadline so
+            # readline() cannot stall the main 20 Hz loop when a partial
+            # frame is in the buffer.
+            ser = serial.Serial()
+            ser.port = self.port
+            ser.baudrate = self.baudrate
+            ser.timeout = 0.1
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+            self.serial = ser
             self.connected = True
-            logger.info(f"[Motor] Connected to {self.port}")
-            time.sleep(2)
+            logger.info(f"[Motor] Connected to {self.port} (DTR/RTS held low)")
+            # 0.5 s is plenty for the firmware's own boot drain; we used to
+            # wait 2 s only because every open USED to reset the chip.
+            time.sleep(0.5)
             return True
         except serial.SerialException as e:
             logger.error(f"[Motor] Connection failed: {e}")
@@ -707,7 +1027,9 @@ class MotorController:
             self._try_reconnect()
             if not self.connected:
                 return False
-        with self.lock:
+        # write_lock only — read paths use read_lock so a long drain pass
+        # can't queue an inbound motor command.
+        with self.write_lock:
             try:
                 self.serial.write(f"{command}\n".encode())
                 self.serial.flush()
@@ -749,7 +1071,7 @@ class MotorController:
         if not self.connected or not self.serial:
             self._try_reconnect()
             return None
-        with self.lock:
+        with self.read_lock:
             try:
                 if self.serial.in_waiting:
                     line = self.serial.readline().decode(errors="ignore").strip()
@@ -784,7 +1106,7 @@ class MotorController:
             self._try_reconnect()
             return None
         for _ in range(max_lines):
-            with self.lock:
+            with self.read_lock:
                 if not self.serial or not self.serial.in_waiting:
                     break
                 try:
@@ -810,14 +1132,21 @@ class MotorController:
     def _parse_imu_line(self, line: str):
         if not line.startswith("IMU:"):
             return
+        # V5.10: defensive parse. Earlier code only set locals inside the
+        # `if len(parts) >= 4` branch but committed them unconditionally
+        # in a later `with` block — a partial frame (USB CDC stalled
+        # mid-line) would slip past the length check and crash the read
+        # thread with UnboundLocalError, taking down the whole service.
+        # Now: bail out of the function on any short/malformed payload.
         try:
             parts = line[4:].split(',')
-            if len(parts) >= 4:
-                yaw = float(parts[0])
-                pitch = float(parts[1])
-                roll = float(parts[2])
-                accuracy = float(parts[3])
-                ts = int(time.time() * 1000)
+            if len(parts) < 4:
+                return
+            yaw = float(parts[0])
+            pitch = float(parts[1])
+            roll = float(parts[2])
+            accuracy = float(parts[3])
+            ts = int(time.time() * 1000)
         except (ValueError, IndexError):
             return
         with self._imu_lock:
@@ -850,24 +1179,44 @@ class MotorController:
         self.send_command("IMU")
 
     def _parse_battery_line(self, line: str) -> None:
-        """Parse `BAT:<pct>` (or `BAT:<pct>,<voltage>`) telemetry from firmware."""
+        """Parse `BAT:<pct>,<pack_mv>` telemetry from motor firmware.
+
+        Older firmware sent only `BAT:<pct>`; we still accept that form. The
+        voltage half is optional but lets the UI show LFP volts directly
+        (more useful than % near the flat plateau of the LiFePO4 curve).
+        """
         if not line.startswith("BAT:"):
             return
+        parts = line[4:].split(",")
         try:
-            payload = line[4:].split(",", 1)[0]
-            pct = float(payload)
+            pct = float(parts[0])
         except (ValueError, IndexError):
             return
-        # Drop pct<=0 / pct>100 — uncalibrated ADC or no battery plugged.
-        # Without this guard, BatteryWatcher would fire CRITICAL on bench runs
-        # where the firmware reports BAT:0,XXX before the ADC is calibrated.
-        if pct <= 0.0 or pct > 100.0:
+        # Drop negative / pct>100 — uncalibrated ADC or no battery plugged.
+        # We allow exactly 0.0% so the last warning before firmware cutoff is
+        # still reported (LFP 4S below 10.0V is real, not a sensor glitch).
+        # Older guard `pct <= 0.0` dropped this; that was unsafe on a real
+        # near-empty pack.
+        if pct < 0.0 or pct > 100.0:
             return
         self.battery_pct = pct
+        if len(parts) >= 2:
+            try:
+                mv = int(parts[1])
+                # LFP 4S sane envelope: 8.0V (deep cutoff w/ sag) .. 15.0V
+                # (charger peak). Anything outside is sensor error — drop
+                # rather than poison the UI with bogus volts.
+                if 8000 <= mv <= 15000:
+                    self.battery_voltage_mv = mv
+            except ValueError:
+                pass
         self.battery_ts = int(time.time() * 1000)
 
     def get_battery_pct(self) -> Optional[float]:
         return self.battery_pct
+
+    def get_battery_voltage_mv(self) -> Optional[int]:
+        return self.battery_voltage_mv
 
 
 class EncoderReader:
@@ -896,7 +1245,12 @@ class EncoderReader:
         self.tca_fail_count: int = 0
         self._last_tca_fail_warned: int = 0  # avoid spamming logs
 
-    HEARTBEAT_STALE_SEC = 3.0
+    # V5.14: relaxed from 3 → 8 s. Encoder Dev's main loop occasionally
+    # stalls 2–4 s during VL53L0X cluster recovery on a stuck SDA, which
+    # would otherwise trip `_is_link_dead` and force-close the safety
+    # gate. 8 s still catches a genuine firmware hang within one screen
+    # refresh while tolerating the worst-case I²C recovery latency.
+    HEARTBEAT_STALE_SEC = 8.0
 
     def is_heartbeat_stale(self) -> bool:
         """True if firmware's 1-Hz heartbeat hasn't arrived in ~3 s.
@@ -911,10 +1265,26 @@ class EncoderReader:
     def set_tof_callback(self, callback):
         self.tof_callback = callback
 
+    def _rediscover_port(self) -> str:
+        """Re-evaluate encoder port at every (re)connect. udev symlink first,
+        then content sniff (``ENC_HB:`` / ``ENC:`` / ``TOF:``) — that way the
+        encoder is found even if the user swaps the encoder and the peripheral
+        hub between USB-hub slots."""
+        if os.path.exists("/dev/ttyKPATROL_ENCODER"):
+            return "/dev/ttyKPATROL_ENCODER"
+        for cand in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
+            if _classify_serial_port(cand) == "encoder":
+                return cand
+        return self.port
+
     def connect(self) -> bool:
         try:
             if self.serial and self.serial.is_open:
                 self.serial.close()
+            new_port = self._rediscover_port()
+            if new_port != self.port:
+                logger.info(f"[Encoder] Port changed: {self.port} -> {new_port}")
+                self.port = new_port
             self.serial = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=1.0)
             self.connected = True
             logger.info(f"[Encoder] Connected to {self.port}")
@@ -1000,6 +1370,14 @@ class EncoderReader:
                 return False
 
     def _read_loop(self):
+        # V5.14: periodic mode re-lock. If the encoder firmware boots into
+        # JSON / HUMAN (or some external monitor toggled it), the read loop
+        # detects the wrong leading characters and queues a re-lock at most
+        # once every 10 s. COMPACT lines start with `ENC:` / `TOF:` /
+        # `ENC_HB:` / `STATUS:` / `OK:` / `ERR:` — anything else (e.g. `{`
+        # for JSON, `===` banner for HUMAN) is a wrong-mode signal.
+        last_relock_attempt = 0.0
+        recent_wrong_mode = 0  # count consecutive wrong-mode lines
         while self.running:
             if not self.connected:
                 self._try_reconnect()
@@ -1010,6 +1388,24 @@ class EncoderReader:
                     with self.lock:
                         line = self.serial.readline().decode().strip()
                         self._parse_line(line)
+                    if line:
+                        is_compact = (
+                            line.startswith(("ENC:", "TOF:", "ENC_HB:",
+                                              "STATUS:", "OK:", "ERR:", "MIN:")) )
+                        if is_compact:
+                            recent_wrong_mode = 0
+                        else:
+                            recent_wrong_mode += 1
+                            now = time.monotonic()
+                            if (recent_wrong_mode >= 3
+                                    and now - last_relock_attempt > 10.0):
+                                last_relock_attempt = now
+                                logger.info(
+                                    "[Encoder] Detected non-COMPACT output "
+                                    f"({line[:24]!r}…) — re-locking mode"
+                                )
+                                self._ensure_compact_mode(max_cycles=6)
+                                recent_wrong_mode = 0
             except (OSError, serial.SerialException) as e:
                 if self.running:
                     logger.error(f"[Encoder] Read error: {e}")
@@ -1128,10 +1524,11 @@ class EncoderReader:
                 # 0x3F (all lanes valid) when the firmware is older so
                 # SafetyController.update_tof preserves prior behaviour.
                 valid_mask = int(parts[6]) if len(parts) >= 7 else 0x3F
-                # Mask out lanes flagged by DISABLED_TOF_BIT_MASK (currently
-                # front_right / CH2 — see module-level comment).
+                # Apply the module-level disable mask. With V5.10 this is a
+                # no-op (DISABLED_TOF_BIT_MASK = 0b111111) — left in place
+                # so re-disabling a future faulty lane is a constant edit
+                # rather than touching this parser.
                 valid_mask &= DISABLED_TOF_BIT_MASK
-                vals[2] = 9999  # front_right raw → "far" sentinel
                 if self.tof_callback:
                     self.tof_callback(*vals, valid_mask=valid_mask)
         except (ValueError, IndexError):
@@ -1181,6 +1578,41 @@ class KPatrolMQTTV5:
         self.client: Optional[mqtt.Client] = None
         self.running = False
 
+        # V5.6: D1 R32 peripheral hub (OLED + DHT11 + relay). Initialised here
+        # but `.start()` is called from run() so the read thread doesn't spin
+        # before the MQTT topics object exists. Disabled if periph_port is
+        # falsy in SerialConfig (operator can override via env / CLI).
+        self.periph_hub: Optional[PeripheralHub] = None
+        self._periph_state_dirty = False
+        self._t_last_periph_pub = 0.0
+        if serial_config.periph_port:
+            self.periph_hub = PeripheralHub(
+                port=serial_config.periph_port,
+                baudrate=serial_config.baudrate,
+                logger=logger,
+                port_rediscover_fn=self._rediscover_periph_port,
+            )
+            # Hub callbacks → mark snapshot dirty so the publish loop pushes
+            # immediately on the next tick. Keep callbacks cheap; they run
+            # on the hub's read thread.
+            self.periph_hub.on_state_change = lambda _s: self._mark_periph_dirty()
+            self.periph_hub.on_dht = lambda _t, _h: self._mark_periph_dirty()
+            self.periph_hub.on_watchdog_fired = self._on_periph_watchdog
+            self.periph_hub.on_boot = lambda _line: self._mark_periph_dirty()
+
+        # V5.12: network geolocator. Polled in a background thread; used by
+        # publish_gps() as the *primary* position source whenever the NEO-6M
+        # has no satellite fix (indoor demo). Toggle off with
+        # KPATROL_NET_GPS_ENABLED=0 if running fully outdoor and you only
+        # want hardware GPS.
+        self.network_geolocator: Optional[NetworkGeolocator] = None
+        _net_gps_enabled = (
+            os.environ.get("KPATROL_NET_GPS_ENABLED", "1") not in ("0", "false", "False")
+        )
+        if _net_gps_enabled:
+            self.network_geolocator = NetworkGeolocator()
+            logger.info("[NetGPS] Network geolocation provider enabled (fallback for indoor demo)")
+
         # V5.2: GPS reader (NEO-6M) for outdoor patrol
         self.gps_reader: Optional["GPSReader"] = None
         if _GPS_AVAILABLE and self.gps_config.enabled:
@@ -1226,7 +1658,44 @@ class KPatrolMQTTV5:
             except OSError as exc:
                 logger.error(f"[FC] map persistence init failed: {exc} — running without persistence")
                 _fc_cfg = None
-        self._nav = NavController(fc_config=_fc_cfg)
+        # V5.14: optional TwinLiteNet+ deep lane segmentation, env-gated so
+        # Pis without the ONNX model file (or the onnxruntime wheel) keep
+        # using the rule-based HSV pipeline. Enable with:
+        #   KPATROL_LANE_SEG_ENABLED=1
+        #   KPATROL_LANE_SEG_MODEL=/abs/path/to/twinlitenet_nano_192x320.onnx
+        # The provider is built once here and re-used by every
+        # LineFollower instance (auto_line_follow_start rebuilds the LF
+        # but we keep the same provider — ONNX session is heavy to
+        # construct).
+        _lf_cfg: Optional[LineFollowerConfig] = None
+        if os.environ.get("KPATROL_LANE_SEG_ENABLED", "0") not in ("0", "false", "False"):
+            try:
+                from navigation.lane_seg import LaneSegConfig, LaneSegProvider
+                _model_path = os.environ.get(
+                    "KPATROL_LANE_SEG_MODEL",
+                    "/home/khoavd/kpatrol/pi-controller/models/twinlitenet_nano_192x320.onnx",
+                )
+                _seg_size_env = os.environ.get("KPATROL_LANE_SEG_SIZE", "192x320")
+                try:
+                    _h, _w = (int(x) for x in _seg_size_env.lower().split("x"))
+                except ValueError:
+                    _h, _w = 192, 320
+                _seg_cfg = LaneSegConfig(
+                    model_path=_model_path,
+                    input_size=(_h, _w),
+                )
+                _seg_provider = LaneSegProvider(_seg_cfg)
+                if _seg_provider.available:
+                    _lf_cfg = LineFollowerConfig(lane_seg_provider=_seg_provider)
+                    logger.info("[LF] TwinLiteNet+ lane segmentation active — "
+                                "HSV branch disabled while provider is up")
+                else:
+                    logger.warning("[LF] KPATROL_LANE_SEG_ENABLED=1 but provider "
+                                   "failed to initialise — falling back to HSV")
+            except ImportError as exc:
+                logger.warning(f"[LF] navigation.lane_seg import failed ({exc}) — using HSV")
+
+        self._nav = NavController(fc_config=_fc_cfg, lf_config=_lf_cfg)
         self._last_nav_cmd = ""
         self._nav_lock = threading.Lock()
 
@@ -1253,6 +1722,23 @@ class KPatrolMQTTV5:
         self._camera_enabled: bool = _CV2_AVAILABLE and _cam_idx >= 0
         self._camera_index:   int  = _cam_idx
         self._lf_last_twist: Optional[Tuple[int, int, int, int]] = None
+        # V5.15c5: optional simple line follower. When KPATROL_SIMPLE_LF is
+        # truthy (default ON because the full BEV pipeline keeps dropping
+        # to LOST on demo tape), the LF camera loop dispatches via this
+        # centroid-only controller — joystick verbs F/SL/SR/DL/DR/S, no
+        # MEC kinematics, no PD. Stripped down for the thesis demo where
+        # "robot driving forward along a line" is the only requirement.
+        self._simple_lf = None
+        if os.environ.get("KPATROL_SIMPLE_LF", "1") not in ("0", "false", "False"):
+            try:
+                from navigation.simple_line_follower import (
+                    SimpleLineConfig, SimpleLineFollower,
+                )
+                self._simple_lf = SimpleLineFollower(SimpleLineConfig())
+                logger.info("[LF] Simple centroid follower enabled (KPATROL_SIMPLE_LF=1)")
+            except ImportError as exc:
+                logger.warning(f"[LF] simple_line_follower import failed: {exc}")
+        self._lf_last_simple: Optional[Tuple[str, int]] = None
 
         # FREE_COVERAGE dedup cache — avoids resending identical MEC: commands
         self._fc_last_twist: Optional[Tuple[int, int, int, int]] = None
@@ -1358,6 +1844,13 @@ class KPatrolMQTTV5:
         self._alert_actuator: Optional["AlertActuator"]   = None
         self._tipover_watcher: Optional["TipOverWatcher"] = None
         self._battery_watcher: Optional["BatteryWatcher"] = None
+        # V5.5: Operator-configurable alarm rule engine. Sits next to the
+        # legacy alert_actuator (which still owns the immediate person/fire
+        # cooldown reflex) but applies higher-level policy: event-type X
+        # inside time-window W continuously for D seconds → pattern P.
+        # The MQTT trigger publish lambda is bound lazily because self._pub
+        # exists already on the instance.
+        self._alarm_controller: Optional["AlarmController"] = None
         if _SAFETY_AVAILABLE:
             self._alert_actuator = AlertActuator(self.motor_controller.send_command)
             self._tipover_watcher = TipOverWatcher(
@@ -1365,6 +1858,10 @@ class KPatrolMQTTV5:
                 on_recover=self._on_tipover_recover,
             )
             self._battery_watcher = BatteryWatcher(on_event=self._on_battery_event)
+            self._alarm_controller = AlarmController(
+                send_cmd=self.motor_controller.send_command,
+                publish_trigger=lambda rec: self._pub(self.T.ALARM_TRIGGERED, rec, qos=1),
+            )
 
     def setup_mqtt(self):
         try:
@@ -1404,12 +1901,32 @@ class KPatrolMQTTV5:
             if not self.gps_reader.connect():
                 logger.warning("[GPS] Initial connect failed — will retry in background")
 
-        try:
-            self.client.connect(self.mqtt_config.host, self.mqtt_config.port, self.mqtt_config.keepalive)
-            return True
-        except Exception as e:
-            logger.error(f"[MQTT] Connection failed: {e}")
-            return False
+        # V5.10: in-process retry instead of letting the systemd unit recycle
+        # us. Every full process exit triggered another DTR pulse on
+        # /dev/ttyKPATROL_MOTOR (CH9102 wires DTR→EN on the S3 dev board), so
+        # the operator saw the robot "come up but not respond" for ~90 s
+        # while the broker was unreachable — five restart loops, five
+        # forced ESP32-S3 reboots. Retrying inline keeps the serial port
+        # open across broker outages so the firmware boots exactly once.
+        #
+        # Backoff schedule: 1, 2, 4, 8, 15, 15 … seconds (capped). Aggressive
+        # at the start so a transient broker blip recovers in ~1 s, then
+        # backs off so a longer outage doesn't burn CPU on tight retries.
+        # No upper retry cap — systemd will SIGTERM us if it really wants
+        # us gone, which `time.sleep()` honours.
+        attempt = 0
+        backoff_seconds = [1, 2, 4, 8, 15]
+        while True:
+            try:
+                self.client.connect(self.mqtt_config.host, self.mqtt_config.port, self.mqtt_config.keepalive)
+                if attempt > 0:
+                    logger.info(f"[MQTT] Connected after {attempt + 1} attempt(s)")
+                return True
+            except Exception as e:
+                delay = backoff_seconds[min(attempt, len(backoff_seconds) - 1)]
+                logger.warning(f"[MQTT] Connection failed ({e}); retry in {delay}s")
+                time.sleep(delay)
+                attempt += 1
 
     # ── GPS callbacks ───────────────────────────────────────────────
 
@@ -1469,7 +1986,25 @@ class KPatrolMQTTV5:
             with self._metrics_lock:
                 self._msg_in_count += 1
                 self._msg_in_bytes += len(msg.payload) if msg.payload else 0
-            payload = json.loads(msg.payload.decode())
+            # V5.15: skip our own binary publishes. We subscribe wildcard
+            # `kpatrol/<serial>/#` so the camera JPEG topic gets echoed
+            # back to us — its payload is raw bytes (0xff JPEG SOI), not
+            # JSON, and trying to json.loads() it spams the log with
+            # `utf-8 codec can't decode 0xff in position 0` once per
+            # frame. Cheap check: JSON payloads always start with a
+            # whitespace or `{`, `[`, `"`, `-`, `0-9`, `t/f/n` — bail
+            # out fast on anything else.
+            raw = msg.payload
+            if not raw:
+                return
+            first = raw[0:1]
+            if first not in (b"{", b"[", b'"', b"-", b" ", b"\t", b"\n",
+                             b"\r", b"t", b"f", b"n") and not (b"0" <= first <= b"9"):
+                return
+            try:
+                payload = json.loads(raw.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return
             T = self.T
             if topic == T.COMMAND:
                 self.handle_command(payload)
@@ -1495,6 +2030,17 @@ class KPatrolMQTTV5:
                 self.handle_light_pattern(payload)
             elif topic == T.ODOM_RESET:
                 self.handle_odom_reset(payload)
+            elif topic == T.ALARM_RULES:
+                # Backend pushes the full rule set as a JSON array. The
+                # controller does its own validation and drops malformed
+                # entries silently — the operator sees that via the trigger
+                # echo or the backend admin endpoint.
+                if self._alarm_controller is not None:
+                    self._alarm_controller.update_rules(payload)
+                    logger.info(f"[ALARM] Updated rules: {len(payload) if isinstance(payload, list) else 1}")
+            elif topic == T.PERIPH_CMD:
+                # V5.6: peripheral-hub command (relay / oled / polarity / time).
+                self.handle_periph_command(payload)
         except json.JSONDecodeError:
             logger.info(f"[MQTT] Invalid JSON: {msg.payload}")
         except Exception as e:
@@ -1560,6 +2106,11 @@ class KPatrolMQTTV5:
                 if cmd_type == "LIGHT_ON": self.motor_controller.light_state = True
                 elif cmd_type == "LIGHT_OFF": self.motor_controller.light_state = False
                 elif cmd_type == "LIGHT_T": self.motor_controller.light_state = not self.motor_controller.light_state
+                # V5.7: discrete-state event → push STATUS immediately so the
+                # PWA button flips within ~100 ms instead of waiting for the
+                # 2-s steady-state cadence (which is what made light toggles
+                # feel laggy even though the UART write was instant).
+                self.publish_status()
 
     def handle_main_light(self, payload: Dict[str, Any]):
         cmd_type = payload.get("type", "")
@@ -1568,6 +2119,7 @@ class KPatrolMQTTV5:
                 if cmd_type == "MAIN_ON": self.motor_controller.main_light_state = True
                 elif cmd_type == "MAIN_OFF": self.motor_controller.main_light_state = False
                 elif cmd_type == "MAIN_T": self.motor_controller.main_light_state = not self.motor_controller.main_light_state
+                self.publish_status()
 
     def handle_safety_config(self, payload: Dict[str, Any]):
         enabled = payload.get("enabled")
@@ -1579,6 +2131,14 @@ class KPatrolMQTTV5:
             self.safety_controller.config.caution_distance = payload["caution_distance"]
         if "slow_distance" in payload:
             self.safety_controller.config.slow_distance = payload["slow_distance"]
+        # V5.7: discrete-state change → immediate STATUS push so the safety
+        # toggle button in the PWA flips right away instead of waiting up
+        # to 2 s for the next steady-state telemetry cycle.
+        self.publish_status()
+        try:
+            self.publish_safety()
+        except AttributeError:
+            pass
 
     # ── Navigation command handler ─────────────────────────────────
 
@@ -1596,7 +2156,10 @@ class KPatrolMQTTV5:
         if "speed" in payload:
             self._nav.set_speed(int(payload["speed"]))
 
-        action = payload.get("action", "")
+        # Accept `action` as primary path, but also tolerate clients that
+        # accidentally put the action verb in `mode` (older dashboards used
+        # to send {"mode":"clear_emergency"}). Either lands here cleanly.
+        action = str(payload.get("action") or payload.get("mode") or "").lower()
         if action == "clear_emergency":
             self._nav.clear_emergency()
             # V5.4: silence light + buzzer alongside nav-level clear so the
@@ -1610,6 +2173,13 @@ class KPatrolMQTTV5:
 
         if "mode" in payload:
             mode_str = str(payload["mode"]).upper()
+            # Older dashboards sent verb-style strings like
+            # "AUTO_LINE_FOLLOW_START" or "MANUAL_STOP". Strip the trailing
+            # action suffix so they land in the alias map below.
+            for suffix in ("_START", "_STOP", "_BEGIN", "_RESUME"):
+                if mode_str.endswith(suffix):
+                    mode_str = mode_str[: -len(suffix)]
+                    break
             # Backwards-compat aliases for older dashboards
             mode_str = {
                 "LINE_FOLLOW":   "AUTO_LINE_FOLLOW",
@@ -1871,6 +2441,17 @@ class KPatrolMQTTV5:
             except Exception as exc:
                 logger.error(f"[ALERT→ACT] on_detection error: {exc}")
 
+        # V5.5: feed alarm controller. The controller will only act on rules
+        # the operator has armed; detection on its own is a no-op here.
+        if self._alarm_controller is not None:
+            try:
+                self._alarm_controller.on_event(
+                    kind,
+                    {"confidence": float(event.confidence), "bbox": list(event.bbox)},
+                )
+            except Exception as exc:
+                logger.error(f"[ALARM] on_detection error: {exc}")
+
         alert_id: Optional[int] = None
         if self._alert_store is not None:
             try:
@@ -2024,6 +2605,13 @@ class KPatrolMQTTV5:
                 self._alert_actuator.on_tipover(axis, float(angle_deg))
             except Exception as exc:
                 logger.error(f"[TIPOVER→ACT] on_tipover error: {exc}")
+        if self._alarm_controller is not None:
+            try:
+                self._alarm_controller.on_event(
+                    EVENT_TIPOVER, {"axis": axis, "angle_deg": float(angle_deg)}
+                )
+            except Exception as exc:
+                logger.error(f"[ALARM] on_tipover error: {exc}")
         self.publish_log(f"Tip-over detected: {axis}={angle_deg:.1f}°")
 
     def _on_tipover_recover(self) -> None:
@@ -2034,22 +2622,134 @@ class KPatrolMQTTV5:
         self.publish_log("Tip-over recovered")
 
     def _on_battery_event(self, level: str, pct: float) -> None:
-        """Fired when battery crosses LOW or CRITICAL with hysteresis."""
+        """Fired when battery crosses LOW or CRITICAL with hysteresis.
+
+        Publishes a `BatterySnapshot`-shaped payload to T.BATTERY so the mobile
+        app's AlarmRulesView can show LFP volts + state without needing a
+        separate channel. Backend forwards the raw body via Socket.IO.
+        """
         logger.info(f"[BATTERY] level={level} pct={pct:.1f}")
         if self._alert_actuator is not None:
             try:
                 self._alert_actuator.on_battery(level, float(pct))
             except Exception as exc:
                 logger.error(f"[BATTERY→ACT] on_battery error: {exc}")
-        # Best-effort publish so the dashboard / mobile-app can pop a banner
-        # in addition to the actuator's local light + buzzer.
-        self._pub(self.T.BATTERY, {
-            "level": level,
-            "pct": round(pct, 1),
+        if self._alarm_controller is not None:
+            kind = EVENT_BATTERY_CRITICAL if level == "critical" else EVENT_BATTERY_LOW
+            try:
+                self._alarm_controller.on_event(kind, {"pct": float(pct), "level": level})
+            except Exception as exc:
+                logger.error(f"[ALARM] on_battery error: {exc}")
+
+        # Compose BatterySnapshot-shaped payload (matches mobile-app
+        # useAlarmSocket.BatterySnapshot). `voltage` is included only when the
+        # firmware reported a pack voltage (newer BAT:<pct>,<mv> format) —
+        # frontend filter drops payloads without a numeric voltage.
+        voltage_mv = self.motor_controller.get_battery_voltage_mv()
+        payload: Dict[str, Any] = {
+            "level": level,                         # backward-compat
+            "pct": round(pct, 1),                   # backward-compat
+            "percent": round(pct, 1),
+            "state": level,                         # "low" | "critical"
+            "source": "ina219",
             "robot": self.mqtt_config.robot_serial,
             "ts": int(time.time() * 1000),
-        }, qos=1, retain=True)
+        }
+        if voltage_mv is not None:
+            payload["voltage"] = round(voltage_mv / 1000.0, 2)
+            payload["voltage_mv"] = voltage_mv
+        # NOTE: retain=False — battery threshold events are transitions, not
+        # steady state. With retain=True a recovered pack would still serve a
+        # "critical" payload to any client that reconnects, firing false
+        # alarms after the operator returns the robot to the dock. Steady-
+        # state battery % lives in T.STATUS (already retained) instead.
+        self._pub(self.T.BATTERY, payload, qos=1, retain=False)
         self.publish_log(f"Battery {level}: {pct:.1f}%")
+
+    # ── V5.6 Peripheral hub bridge ─────────────────────────────────────────
+    def _rediscover_periph_port(self) -> Optional[str]:
+        """Hook the PeripheralHub calls when its pinned port disappears.
+        Falls back to udev symlink, then content-sniff for the periph hub
+        signature (``STATE:relay=`` / ``META:fw=periph-hub``). Returns None
+        if nothing convincing is plugged in right now — the hub will keep
+        retrying its current path."""
+        if os.path.exists("/dev/kpatrol-periph"):
+            return "/dev/kpatrol-periph"
+        for cand in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
+            if _classify_serial_port(cand) == "periph":
+                return cand
+        return None
+
+    def _mark_periph_dirty(self) -> None:
+        """Set the dirty flag so the next main-loop tick publishes immediately
+        instead of waiting up to 5 s for the cadence-based push."""
+        self._periph_state_dirty = True
+
+    def _on_periph_watchdog(self, reason: str) -> None:
+        """Called from the hub's read thread when the on-board 5-s watchdog
+        forces relay OFF. Push a banner so the dashboard can highlight it,
+        and log it locally."""
+        logger.warning(f"[PERIPH] watchdog: {reason}")
+        self.publish_log(f"Peripheral watchdog fired: {reason}")
+        self._mark_periph_dirty()
+
+    def handle_periph_command(self, payload: Dict[str, Any]) -> None:
+        """Dispatch a Web → Pi peripheral command onto the UART. Schema:
+
+            {"action": "relay",     "state": "on"|"off"|"toggle"|"test"}
+            {"action": "polarity",  "active_low": <bool>}
+            {"action": "oled",      "text": "<str>"}
+            {"action": "time_sync"}                              (force immediate push)
+            {"action": "request_status"}                         (request META + STATE)
+
+        Silently no-ops if the hub isn't configured. Returns no value — the
+        observable effect is the next STATE: / META: line streamed back from
+        the MCU, which the read thread fans out via on_state_change.
+        """
+        if self.periph_hub is None:
+            return
+        if not isinstance(payload, dict):
+            return
+        action = str(payload.get("action", "")).lower()
+        try:
+            if action == "relay":
+                state = str(payload.get("state", "")).lower()
+                if state == "on":
+                    self.periph_hub.relay_on()
+                elif state == "off":
+                    self.periph_hub.relay_off()
+                elif state == "toggle":
+                    self.periph_hub.relay_toggle()
+                elif state == "test":
+                    self.periph_hub.relay_click_test()
+                else:
+                    logger.warning(f"[PERIPH] bad relay state: {state!r}")
+            elif action == "polarity":
+                self.periph_hub.set_relay_polarity(bool(payload.get("active_low", False)))
+            elif action == "oled":
+                self.periph_hub.set_oled_text(str(payload.get("text", "")))
+            elif action == "time_sync":
+                self.periph_hub.push_time_now()
+            elif action == "request_status":
+                self.periph_hub.request_status()
+            elif action == "keepalive":
+                self.periph_hub.keepalive()
+            else:
+                logger.warning(f"[PERIPH] unknown action: {action!r}")
+        except Exception as exc:
+            logger.error(f"[PERIPH] handle_periph_command error: {exc}")
+
+    def publish_peripherals_state(self) -> None:
+        """Push the latest hub snapshot to MQTT (retained=True so a fresh
+        dashboard connection sees the last-known state). Skipped if the hub
+        isn't configured. The payload schema lines up with the backend's
+        MqttIngestService expectation on `kpatrol/<serial>/peripherals/state`."""
+        if self.periph_hub is None:
+            return
+        snap = self.periph_hub.to_dict()
+        snap["timestamp"] = int(time.time() * 1000)
+        snap["serial"] = self.mqtt_config.robot_serial
+        self._pub(self.T.PERIPH_STATE, snap, qos=1, retain=True)
 
     def publish_encoders(self):
         data = self.encoder_reader.get_encoder_status()
@@ -2104,21 +2804,71 @@ class KPatrolMQTTV5:
         })
 
     def publish_gps(self):
-        """Publish latest GPS fix (NEO-6M) — outdoor patrol mode.
+        """Publish latest GPS fix with hardware → network fallback.
 
-        Skipped when the GPS module is disabled or unavailable. We always
-        publish even without a fix so the dashboard can show "searching…"
-        status; the `hasFix` flag distinguishes usable vs. stale data.
+        Three-stage source resolution (V5.12):
+          1. Hardware NEO-6M with satellite fix → publish as ``source=hardware``
+             (best accuracy; activates the moment robot goes outdoor).
+          2. Hardware module present but no fix + NetworkGeolocator has
+             a cached IP-geolocation result → publish that as
+             ``source=network`` (city-block accuracy, ~5-50 km). This is
+             the indoor-demo path.
+          3. Neither available → publish ``hasFix=false`` so dashboard
+             can show "searching…".
 
-        QoS 0 is intentional: GPS is high-frequency telemetry and a missed
-        sample is replaced by the next 1Hz update — retransmit cost is not
-        worth the bandwidth.
+        QoS 0 is intentional: GPS is steady 1 Hz telemetry, a missed
+        sample is replaced by the next tick — retransmit cost not worth it.
         """
-        if self.gps_reader is None:
-            return
-        data = self.gps_reader.get_data()
-        payload = data.to_dict()
-        payload["connected"] = self.gps_reader.connected
+        payload: Dict[str, Any]
+        if self.gps_reader is not None:
+            data = self.gps_reader.get_data()
+            payload = data.to_dict()
+            payload["connected"] = self.gps_reader.connected
+        else:
+            # No hardware reader configured at all — synthesize an empty fix
+            # so the network path below has a payload skeleton to fill in.
+            payload = {
+                "hasFix": False, "fixQuality": 0, "satellites": 0,
+                "hdop": 99.99, "latitude": 0.0, "longitude": 0.0,
+                "altitude": 0.0, "speedKmh": 0.0, "heading": 0.0,
+                "utcTime": "", "fixTimestamp": 0,
+                "timestamp": int(time.time() * 1000),
+                "rxCount": 0, "lastSentence": "", "connected": False,
+            }
+
+        if payload.get("hasFix"):
+            # Hardware wins — keep payload exactly as-is, just tag it.
+            payload["source"] = "hardware"
+        elif self.network_geolocator is not None:
+            net_fix = self.network_geolocator.get_fix()
+            if net_fix is not None:
+                # Network fallback: mark the fix as valid and overwrite the
+                # lat/lon while leaving the hardware fields (satellites,
+                # hdop, fixQuality) at their "no signal" sentinels — that
+                # way the operator UI can still surface "NEO-6M searching"
+                # next to the network-derived position.
+                payload["hasFix"] = True
+                payload["latitude"] = net_fix["latitude"]
+                payload["longitude"] = net_fix["longitude"]
+                payload["source"] = "network"
+                payload["network_tier"] = net_fix.get("source_tier", "ip")
+                payload["network_accuracy_m"] = net_fix.get("accuracy_m", 0.0)
+                payload["network_ap_count"] = net_fix.get("ap_count", 0)
+                payload["network_city"] = net_fix.get("city", "")
+                payload["network_country"] = net_fix.get("country", "")
+                payload["network_country_code"] = net_fix.get("country_code", "")
+                payload["network_public_ip"] = net_fix.get("public_ip", "")
+                payload["network_fetched_at_ms"] = net_fix.get("fetched_at_ms", 0)
+                # Network-side fix is not a real GPS quality; flag fixQuality=8
+                # (NMEA "manual / network" value, well outside the 0-2 set
+                # the hardware emits) so consumers don't confuse it with a
+                # real satellite fix.
+                payload["fixQuality"] = 8
+            else:
+                payload["source"] = "none"
+        else:
+            payload["source"] = "none"
+
         self._pub(self.T.GPS, payload, qos=0)
 
     # ── LINE_FOLLOW camera loop (separate thread) ─────────────────
@@ -2138,16 +2888,23 @@ class KPatrolMQTTV5:
         # picamera2 first, cv2.VideoCapture fallback. Threaded latest-frame
         # grabber: PD always reads the freshest frame, never replays a stale
         # one (replaying inflates D-term spuriously).
+        #
+        # V5.15b: bumped capture resolution 640×480 → 960×540 to match the
+        # MJPEG broadcast resolution used by the inspector scripts (and
+        # what the BEV homography in line_follower.py is calibrated for).
+        # Mismatched resolutions silently broke the warp: BEV src points
+        # at x=860 / y=250 fell outside a 640×480 frame, so warpPerspective
+        # produced a near-black BEV and tick() returned `lost` every cycle.
         cam = open_camera(
             index=self._camera_index,
-            width=640, height=480, framerate=30,
+            width=960, height=540, framerate=30,
             threaded=True,
         )
         if cam is None:
             logger.error(f"[LF] No camera backend opened (index={self._camera_index}) — LINE_FOLLOW disabled")
             return
 
-        logger.info(f"[LF] Camera ready via {cam.backend} (640×480 @ 30fps)")
+        logger.info(f"[LF] Camera ready via {cam.backend} (960×540 @ 30fps)")
         interval      = 0.05  # 20 Hz control loop
         cam_pub_interval = 0.20  # 5 Hz JPEG stream (MQTT bandwidth friendly)
         last_cam_pub  = 0.0
@@ -2174,6 +2931,73 @@ class KPatrolMQTTV5:
                 continue
             consecutive_misses = 0
 
+            # V5.15c5: simple line follower path. Bypasses the BEV / PD /
+            # heading-hold stack and uses a centroid-only controller that
+            # emits joystick verbs (F/SL/SR/DL/DR/S). Enabled by the
+            # KPATROL_SIMPLE_LF env flag — fall back to the full pipeline
+            # otherwise. The simple branch is what we ship for the thesis
+            # demo because the full pipeline kept dropping into LOST
+            # mode on a thin demo tape, while joystick-grade verbs are
+            # already proven to drive the wheels on this build.
+            if self._simple_lf is not None:
+                try:
+                    s_result = self._simple_lf.tick(frame, produce_overlay=True)
+                except Exception as exc:
+                    logger.exception(f"[LF-simple] tick error: {exc}")
+                    time.sleep(interval)
+                    continue
+                cmd  = s_result.command
+                spd  = s_result.speed
+                found = s_result.found
+                if getattr(self, "_lf_last_found", None) != found:
+                    self._lf_last_found = found
+                    logger.info(
+                        f"[LF-simple] line {'FOUND' if found else 'LOST'}: "
+                        f"cmd={cmd} spd={spd} err={s_result.error_px:.0f}px "
+                        f"cov={s_result.coverage_pct:.2f}%"
+                    )
+                # V5.15c6: resend the current command EVERY tick (~50 ms).
+                # The earlier dedup-only-on-change scheme starved the
+                # firmware's 241 ms motor watchdog: when the controller
+                # held the same verb for a few seconds (typical mid-track),
+                # nothing was sent at all and S3 force-stopped the wheels.
+                # V5.15c9: dispatch branches on cmd —
+                #   "MEC" → Mecanum twist (vx,vy=0,wz,spd) — true steering.
+                #   "S"   → hard stop, resend only on transition.
+                #   verb  → legacy joystick F/DL/DR/SL/SR.
+                # Safety veto identical to the full pipeline below.
+                if cmd == "MEC" and s_result.twist is not None:
+                    vx, vy, wz, spd_t = s_result.twist
+                    # Safety: forward TOF in danger zone ⇒ stop forward.
+                    if self.safety_controller.config.enabled and vx > 0:
+                        fwd_dist = self.safety_controller.direction_distances.get("forward", 9999)
+                        if fwd_dist < self.safety_controller.config.danger_distance:
+                            vx, vy, wz = 0, 0, 0
+                    self.motor_controller.send_command(f"MEC:{vx},{vy},{wz},{spd_t}")
+                    self._lf_last_simple = "MEC"
+                elif cmd == "S":
+                    # Only resend STOP on transition — once the firmware
+                    # is stopped it stays stopped, no WDT issue.
+                    if getattr(self, "_lf_last_simple", None) != "S":
+                        self.motor_controller.send_command("S")
+                        self._lf_last_simple = "S"
+                else:
+                    # Verb mode: speed update only on change, verb sent every tick.
+                    if spd != getattr(self, "_lf_last_simple_spd", None):
+                        self.motor_controller.set_speed(int(spd))
+                        self._lf_last_simple_spd = spd
+                    self.motor_controller.send_command(cmd)
+                    self._lf_last_simple = cmd
+                # JPEG overlay publish (same path as full pipeline below).
+                if s_result.overlay is not None and t0 - last_cam_pub >= cam_pub_interval:
+                    ok, jpg = _cv2.imencode(".jpg", s_result.overlay, [_cv2.IMWRITE_JPEG_QUALITY, 70])
+                    if ok:
+                        self._pub_raw(self.T.CAMERA, jpg.tobytes())
+                        last_cam_pub = t0
+                elapsed = time.time() - t0
+                time.sleep(max(0.0, interval - elapsed))
+                continue
+
             # Per-tick try/except: any vision/PD bug logs once and resumes
                 # next frame instead of silently killing the LF thread.
             try:
@@ -2185,6 +3009,17 @@ class KPatrolMQTTV5:
 
             vx, vy, wz, spd = result.vx, result.vy, result.wz, result.spd
             twist = (vx, vy, wz, spd)
+            # V5.15b: log only when the lost / found state flips, so the
+            # operator gets a single line per state change instead of a
+            # 20 Hz flood. Useful for diagnosing "robot doesn't move"
+            # post-mortem (was it stuck in lost=True the whole time?).
+            line_found_now = getattr(result, "line_found", True)
+            if getattr(self, "_lf_last_found", None) != line_found_now:
+                self._lf_last_found = line_found_now
+                logger.info(
+                    f"[LF] line {'FOUND' if line_found_now else 'LOST'}: "
+                    f"vx={vx} vy={vy} wz={wz} spd={spd}"
+                )
 
             # Detection→nav safety bridge: when on_alert("person") opens a
             # pause window, NavController.tick() returns zero twist — but
@@ -2361,6 +3196,18 @@ class KPatrolMQTTV5:
         self._nav_thread = threading.Thread(target=self._nav_loop, name="nav_loop", daemon=True)
         self._nav_thread.start()
 
+        # V5.6: Start the D1 R32 peripheral hub. Non-blocking — the driver
+        # spins its own read + time-sync threads and silently keeps retrying
+        # the serial open if /dev/kpatrol-periph isn't present yet.
+        if self.periph_hub is not None:
+            self.periph_hub.start()
+
+        # V5.12: kick the network geolocator. First fetch runs synchronously
+        # inside start(), so by the time the first publish_gps() tick fires
+        # the dashboard already has a coarse city-level fix.
+        if self.network_geolocator is not None:
+            self.network_geolocator.start()
+
         # Start LINE_FOLLOW camera thread (no-op if cv2 absent or KPATROL_CAMERA=-1)
         if self._camera_enabled:
             self._lf_thread = threading.Thread(target=self._line_follow_loop, name="lf_loop", daemon=True)
@@ -2393,8 +3240,15 @@ class KPatrolMQTTV5:
         gps_interval = self.gps_config.publish_interval   # V5.2 default 1Hz
         odom_interval = 0.05      # V5.3 odometry at 20Hz
         battery_tick_interval = 0.2   # V10: 5Hz battery sampling for LFP cliff
-        imu_request_interval = 0.05   # V10: 20Hz IMU poll for tipover safety
-        tipover_tick_interval = 0.05  # V10: 20Hz tipover watcher
+        # V9: Pi no longer polls "REQUEST_IMU" — firmware v7+ runs the IMU
+        # read on its own Core 0 task and auto-emits "IMU:" lines at 10 Hz.
+        # Setting interval to 0 disables the poll branch below; left as a
+        # variable in case we ever need to re-enable polling against an
+        # older firmware build. Tipover watcher still ticks at 20 Hz
+        # against the cached IMU snapshot.
+        imu_request_interval = 0.0    # disabled — firmware streams IMU
+        tipover_tick_interval = 0.05  # V10: 20Hz tipover watcher (cached IMU)
+        alarm_tick_interval = 1.0     # V5.5: 1Hz alarm rule engine sweep
 
         last_heartbeat = 0
         last_status = 0
@@ -2408,6 +3262,15 @@ class KPatrolMQTTV5:
         last_odom = 0.0
         last_battery_tick = 0.0
         last_tipover_tick = 0.0
+        last_alarm_tick = 0.0
+        periph_pub_interval = 5.0  # V5.6: peripheral hub steady-state cadence
+        # V5.7: send KEEPALIVE to D1 R32 every 2 s. Firmware arms a 5-s
+        # safety watchdog the moment any output (relay / horn / light) goes
+        # ON and force-clears them all if no UART traffic arrives within
+        # that window. Without this scheduled ping the user sees lights /
+        # horn switch off ~5 s after pressing ON in the web UI.
+        periph_keepalive_interval = 2.0
+        last_periph_keepalive = 0.0
 
         logger.info("\n" + "=" * 60)
         logger.info("    K-PATROL MQTT CLIENT V5.0")
@@ -2416,6 +3279,10 @@ class KPatrolMQTTV5:
         logger.info(f"MQTT Broker: {self.mqtt_config.host}:{self.mqtt_config.port}")
         logger.info(f"Motor Port:  {self.serial_config.motor_port} ({'OK' if self.motor_controller.connected else 'FAIL'})")
         logger.info(f"Encoder Port: {self.serial_config.encoder_port} ({'OK' if self.encoder_reader.connected else 'FAIL'})")
+        if self.periph_hub is not None:
+            logger.info(f"Periph Port: {self.serial_config.periph_port} (started, retries every 5s)")
+        else:
+            logger.info("Periph Port: disabled (set SerialConfig.periph_port to enable)")
         if self.gps_reader is not None:
             gps_state = "OK" if self.gps_reader.connected else "FAIL"
             if self.gps_config.mode == "shared":
@@ -2484,13 +3351,27 @@ class KPatrolMQTTV5:
                     self.publish_imu()
                     last_imu = current_time
 
-                if current_time - last_imu_request >= imu_request_interval:
+                # V9: poll branch disabled when imu_request_interval == 0
+                # (firmware streams IMU). Kept guarded for backward compat
+                # if older firmware revisions need explicit polling.
+                if imu_request_interval > 0 and current_time - last_imu_request >= imu_request_interval:
                     self.motor_controller.request_imu()
                     last_imu_request = current_time
 
                 if current_time - last_tipover_tick >= tipover_tick_interval:
                     self._tick_tipover_watcher()
                     last_tipover_tick = current_time
+
+                # V5.5: alarm rule engine tick (1Hz). Drives schedule rules
+                # and the stale-event self-clear; on_event() pushes for
+                # detector / battery / tipover events as they arrive.
+                if current_time - last_alarm_tick >= alarm_tick_interval:
+                    if self._alarm_controller is not None:
+                        try:
+                            self._alarm_controller.tick()
+                        except Exception as exc:
+                            logger.error(f"[ALARM] tick error: {exc}")
+                    last_alarm_tick = current_time
 
                 if current_time - last_metrics >= metrics_interval:
                     self.publish_metrics()
@@ -2504,6 +3385,22 @@ class KPatrolMQTTV5:
                 if current_time - last_odom >= odom_interval:
                     self.publish_odom()
                     last_odom = current_time
+
+                # V5.6: peripheral hub state. Push immediately on any change
+                # (relay flip / DHT sample / boot / watchdog) and at the 5-s
+                # cadence regardless so the dashboard knows the link is alive.
+                if self.periph_hub is not None:
+                    if (
+                        self._periph_state_dirty
+                        or current_time - self._t_last_periph_pub >= periph_pub_interval
+                    ):
+                        self.publish_peripherals_state()
+                        self._t_last_periph_pub = current_time
+                        self._periph_state_dirty = False
+                    # V5.7: keep firmware safety watchdog at bay.
+                    if current_time - last_periph_keepalive >= periph_keepalive_interval:
+                        self.periph_hub.keepalive()
+                        last_periph_keepalive = current_time
 
                 # Drain everything queued on the motor UART so IMU/BAT
                 # frames don't pile up between 20Hz ticks. Returns the last
@@ -2523,6 +3420,17 @@ class KPatrolMQTTV5:
         self.running = False
         self.motor_controller.send_command("S")
         time.sleep(0.3)
+
+        # V5.6: turn relay OFF before tearing down — same intent as the
+        # safety watchdog on the MCU, but driven from the Pi so we don't
+        # rely on UART silence to trigger it.
+        if self.periph_hub is not None:
+            try:
+                self.periph_hub.relay_off()
+                time.sleep(0.1)
+                self.periph_hub.stop()
+            except Exception as exc:
+                logger.error(f"[PERIPH] shutdown error: {exc}")
 
         # V5.3: stop detector + drainer before tearing down MQTT
         self._alert_drain_stop.set()
@@ -2565,47 +3473,138 @@ class KPatrolMQTTV5:
 
 # ==================== MAIN ====================
 
-def find_serial_ports():
-    """Locate the three USB-serial devices the Pi expects.
+# Per-board UART signatures used by content-based discovery. Each board
+# emits at least one of these substrings within ~1 s of being opened, even
+# when the firmware is idle, because every sketch has a heartbeat / status
+# emitter on its main loop. We probe a port by reading ~1.5 s of bytes and
+# pattern-matching against these — that way two CH340 boards with identical
+# VID/PID (encoder + peripheral hub) can be told apart without locking each
+# one to a specific USB-hub slot.
+_SIGNATURE_ENCODER = (b"ENC_HB:", b"ENC:", b"TOF:", b"STATUS:TOF_INIT")
+_SIGNATURE_PERIPH  = (b"META:fw=periph-hub", b"STATE:relay=", b"DHT:", b"BOOT:periph-hub")
+_SIGNATURE_MOTOR   = (b"IMU:", b"BAT:", b"GPS_HB:", b"NMEA:")
 
-    Order of preference: udev symlink (stable) → numeric fallback (dev box).
 
-    GPS is the trickiest because both the encoder ESP32 and the GPS adapter
-    enumerate as /dev/ttyUSB*. Without the udev rule, we pick the *highest*
-    numbered port for GPS so a freshly-plugged adapter does not steal the
-    encoder's slot.
+def _classify_serial_port(port: str, timeout_s: float = 1.5) -> str:
+    """Sniff a port and return one of {'encoder','periph','motor','unknown'}.
+
+    Opens the device at 115200 baud, optionally pokes it with a harmless
+    line ('PING\\n' is recognised by the peripheral hub, ignored by every
+    other board), then reads up to `timeout_s` seconds looking for any of
+    the per-board signatures. Returns as soon as a match is found so the
+    common case (encoder + periph live, motor cable unplugged) takes ~1 s,
+    not 4.5 s. On any I/O failure returns 'unknown' so the caller can fall
+    back to the udev symlink.
     """
-    motor_port   = "/dev/ttyACM0"
-    encoder_port = "/dev/ttyUSB0"
-    gps_port     = "/dev/ttyUSB1"
+    try:
+        with serial.Serial(port, 115200, timeout=0.2) as s:
+            try:
+                s.write(b"PING\n")
+                s.flush()
+            except (OSError, serial.SerialException):
+                pass
+            end = time.monotonic() + timeout_s
+            buf = b""
+            while time.monotonic() < end:
+                try:
+                    chunk = s.read(256)
+                except (OSError, serial.SerialException):
+                    break
+                if not chunk:
+                    continue
+                buf += chunk
+                # Keep the window bounded so a long banner can't outpace the
+                # signature scan — 4 KB is plenty for any one-frame pattern.
+                if len(buf) > 4096:
+                    buf = buf[-4096:]
+                if any(sig in buf for sig in _SIGNATURE_ENCODER):
+                    return "encoder"
+                if any(sig in buf for sig in _SIGNATURE_PERIPH):
+                    return "periph"
+                if any(sig in buf for sig in _SIGNATURE_MOTOR):
+                    return "motor"
+    except (OSError, serial.SerialException):
+        pass
+    return "unknown"
 
-    # Stable udev symlinks (preferred — install 99-kpatrol-serial.rules)
+
+def find_serial_ports():
+    """Locate motor / encoder / peripheral-hub UARTs robustly.
+
+    Strategy (in order):
+      1. Honour stable udev symlinks (``/dev/ttyKPATROL_MOTOR`` etc.) — these
+         are populated by 99-kpatrol-serial.rules and remain valid across
+         reboots when wiring is unchanged.
+      2. For any role still missing, sniff every unclaimed ``/dev/ttyUSB*``
+         and ``/dev/ttyACM*`` and match the data stream against per-board
+         signatures (``ENC_HB:`` ⇒ encoder, ``STATE:relay=`` ⇒ periph hub,
+         ``IMU:`` / ``GPS_HB:`` ⇒ motor S3).
+      3. Last resort: ttyACM0 for motor, the lowest unclaimed ttyUSB* for
+         encoder / periph so the bridge can at least *try* to talk.
+
+    This means the user can swap the two CH340 boards (encoder vs periph)
+    between USB slots without editing the udev rule — Pi figures it out at
+    every (re)connect.
+    """
+    motor_port: Optional[str]   = None
+    encoder_port: Optional[str] = None
+    periph_port: Optional[str]  = None
+
+    # 1) Stable udev symlinks (the strongest hint we have).
     if os.path.exists("/dev/ttyKPATROL_MOTOR"):
         motor_port = "/dev/ttyKPATROL_MOTOR"
-    else:
-        for port in ["/dev/ttyACM0", "/dev/ttyACM1"]:
-            if os.path.exists(port):
-                motor_port = port
-                break
-
     if os.path.exists("/dev/ttyKPATROL_ENCODER"):
         encoder_port = "/dev/ttyKPATROL_ENCODER"
-    else:
-        for port in ["/dev/ttyUSB0", "/dev/ttyUSB1"]:
-            if os.path.exists(port):
+    if os.path.exists("/dev/kpatrol-periph"):
+        periph_port = "/dev/kpatrol-periph"
+
+    # 2) Content-based discovery for whatever's left. Build a set of port
+    #    real-paths so we don't re-probe a port that a symlink already
+    #    points at.
+    def _real(p):
+        try:
+            return os.path.realpath(p)
+        except OSError:
+            return p
+
+    claimed = {
+        _real(p) for p in (motor_port, encoder_port, periph_port) if p
+    }
+    needs_motor   = motor_port   is None
+    needs_encoder = encoder_port is None
+    needs_periph  = periph_port  is None
+
+    if needs_motor or needs_encoder or needs_periph:
+        candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        for port in candidates:
+            if not (needs_motor or needs_encoder or needs_periph):
+                break
+            if _real(port) in claimed:
+                continue
+            role = _classify_serial_port(port)
+            logger.info(f"[Discover] {port} -> {role}")
+            if role == "motor" and needs_motor:
+                motor_port = port
+                needs_motor = False
+            elif role == "encoder" and needs_encoder:
                 encoder_port = port
-                break
+                needs_encoder = False
+            elif role == "periph" and needs_periph:
+                periph_port = port
+                needs_periph = False
+            claimed.add(_real(port))
 
-    if os.path.exists("/dev/ttyKPATROL_GPS"):
-        gps_port = "/dev/ttyKPATROL_GPS"
-    else:
-        # Pick the first ttyUSB* not already claimed by the encoder.
-        for port in ["/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB0"]:
-            if os.path.exists(port) and port != encoder_port:
-                gps_port = port
-                break
+    # 3) Fallbacks so MotorController.connect() has a path to retry against
+    #    even when nothing was discovered. The reconnect loop will re-run
+    #    _rediscover_port at the next attempt — same approach as before.
+    if motor_port is None:
+        motor_port = "/dev/ttyKPATROL_MOTOR"
+    if encoder_port is None:
+        encoder_port = "/dev/ttyKPATROL_ENCODER"
+    if periph_port is None:
+        periph_port = "/dev/kpatrol-periph"
 
-    return motor_port, encoder_port, gps_port
+    return motor_port, encoder_port, periph_port
 
 
 def _configure_logging() -> None:
@@ -2631,13 +3630,17 @@ def main():
     logger.info("=" * 60)
 
     os.makedirs("data", exist_ok=True)
-    motor_port, encoder_port, gps_port = find_serial_ports()
+    motor_port, encoder_port, periph_port = find_serial_ports()
 
     robot_serial = os.environ.get('ROBOT_SERIAL', 'KPATROL-001')
     logger.info(f"Robot Serial: {robot_serial}")
     mqtt_config = MQTTConfig(robot_serial=robot_serial)
     mqtt_config.validate()
-    serial_config = SerialConfig(motor_port=motor_port, encoder_port=encoder_port)
+    serial_config = SerialConfig(
+        motor_port=motor_port,
+        encoder_port=encoder_port,
+        periph_port=periph_port,
+    )
 
     # GPS toggle via env: KPATROL_GPS_ENABLED=0 to skip outdoor mode entirely.
     gps_enabled = os.environ.get("KPATROL_GPS_ENABLED", "1") not in ("0", "false", "False")
@@ -2647,7 +3650,16 @@ def main():
     if gps_mode not in ("shared", "dedicated"):
         logger.warning(f"[GPS] Unknown KPATROL_GPS_MODE={gps_mode!r}, falling back to 'shared'")
         gps_mode = "shared"
-    gps_config = GPSConfig(port=gps_port, enabled=gps_enabled, mode=gps_mode)
+    # GPS port: in 'shared' mode (default), NMEA is forwarded by the motor
+    # ESP32-S3 over its USB serial — no separate device is opened. In
+    # 'dedicated' mode we honour KPATROL_GPS_PORT or fall back to the udev
+    # symlink. Either way the dataclass needs *some* string so leave it
+    # empty in shared mode rather than reaching into find_serial_ports().
+    if gps_mode == "shared":
+        gps_port_path = ""
+    else:
+        gps_port_path = os.environ.get("KPATROL_GPS_PORT", "/dev/ttyKPATROL_GPS")
+    gps_config = GPSConfig(port=gps_port_path, enabled=gps_enabled, mode=gps_mode)
 
     client = KPatrolMQTTV5(mqtt_config, serial_config, gps_config)
     client.setup_mqtt()
