@@ -76,23 +76,128 @@ class DetectionConfig:
     person_cooldown_sec: float = 3.0
     person_min_area_ratio: float = 0.02  # bbox must cover >=2% of frame
 
-    # Fire detection (HSV-based)
-    # Flame appearance covers three HSV regions: low-red wrap (0-15), high-red
-    # wrap (160-179), and the yellow-orange core (15-35). Earlier config only
-    # included the two red wraps which missed the brightest part of most real
-    # flames — hence "fire chưa tốt" reports. min_area_ratio dropped from 2%
-    # to 0.5% so small/distant flames register; smoothing dropped from 3 to 2
-    # frames to react ~100ms faster.
+    # Fire detection — V10.4 (2026-05-25) tightens V10.3 to reject "tay
+    # người = lửa" while keeping the indoor-neon lighter recall.
+    #
+    # V10.3 relaxed thresholds for tiny indoor flames. New failure mode:
+    # bare human skin under warm neon lights up as fire because skin
+    # HSV (H≈5–20, S≈60–150, V≈150–230) falls inside the old envelopes,
+    # and a hand at arm's length is 6–15k px — well over the 92 px area
+    # floor.
+    #
+    # V10.4 adds two cheap discriminators that genuine flames pass but
+    # skin doesn't:
+    #
+    #   (a) Outer hue REGION split. We separate the outer mask into
+    #       - "flame yellow"  H = 18–38   (real flame core hue)
+    #       - "wrap red"      H = 0–12  + 160–179  (flame edges, ember)
+    #       and require flame_yellow_px >= ratio × wrap_red_px. Skin is
+    #       uniformly orange-pink with NO yellow centre → fails. Real
+    #       flame has a yellow tip → passes.
+    #
+    #   (b) Hot-core SATURATION FLOOR (s_min = 30). Real flame cores
+    #       carry a yellow tinge (S ≥ 30) even when bright. Bright skin
+    #       and white specular highlights tend to S < 30. Combined with
+    #       (a), this is the discriminator.
+    #
+    # Outer envelopes also tightened: S floor 60→80, yellow band V floor
+    # 180→200 — both push skin out without losing real-flame recall.
     fire_enabled: bool = True
     fire_cooldown_sec: float = 5.0
-    fire_min_area_ratio: float = 0.005
-    # HSV ranges for flame: low-red, high-red, and yellow-orange core
-    fire_hsv_low_red1: tuple = (0, 120, 180)
-    fire_hsv_high_red1: tuple = (15, 255, 255)
-    fire_hsv_low_red2: tuple = (160, 120, 180)
+
+    # V11.0 (2026-05-25): pipeline mode switch.
+    #   "hsv"  — DEFAULT. The V10.4 6-stage HSV pipeline with skin gate.
+    #            Tuned for indoor neon + bật lửa demo. Verified during
+    #            thesis preparation.
+    #   "yolo" — Use a dedicated fire/smoke YOLO model. Available models
+    #            on Hugging Face (forest-fire, factory-smoke) generalise
+    #            poorly to indoor demo scenarios — they trigger on
+    #            outdoor wildfire imagery but miss a lighter at 50 cm.
+    #            Keep this mode available for when an indoor-trained
+    #            model becomes available (e.g. HUST `phat-hien-lua` via
+    #            free Roboflow API key — see `tools/download_fire_model.py`).
+    # Operator can switch modes via `KPATROL_FIRE_MODE=yolo|hsv` env var
+    # without redeploying. AnomalyDetector also auto-falls-back to HSV
+    # if YOLO is selected but the model file is missing or fails to load.
+    fire_pipeline: str = "hsv"
+    # Path to a fire/smoke YOLO model. The download script drops .pt here;
+    # ultralytics auto-exports an ONNX sibling on first inference for
+    # ~1.5× speedup on Pi 4B ARM. `_ensure_fire_yolo()` looks for INT8
+    # ONNX → ONNX → .pt in that order, so any of those formats works.
+    fire_yolo_model: str = "models/fire_yolov8n.pt"
+    # Person YOLO runs at 0.55; fire detection is rarer so we use a
+    # lower threshold to catch faint flames, then rely on temporal
+    # smoothing to suppress single-frame noise.
+    fire_yolo_confidence: float = 0.30
+    fire_yolo_imgsz: int = 416
+    # Class index map for the fire model. Defaults match the touati-kamel
+    # YOLOv8s forest-fire model on HuggingFace:
+    #   0: fire-smoke   (combined)
+    #   1: fog          (NOT a target)
+    #   2: sol          (sun glare — NOT a target)
+    #   3: fire         (pure flame)
+    #   4: factory-smoke (industrial)
+    # If your downloaded model uses different indices, edit these here.
+    # Set smoke_class to -1 to ignore smoke alerts (lighter-only demos).
+    fire_yolo_fire_class: int = 3
+    fire_yolo_smoke_class: int = 0
+
+    # 0.0003 ≈ 92 px on 640×480 — about the size of a candle flame at 1 m or
+    # a lighter at 60 cm. Floor still well above sensor speckle (< 20 px).
+    fire_min_area_ratio: float = 0.0003
+    fire_max_area_ratio: float = 0.40
+
+    # Outer flame HSV. V10.4 tightening:
+    #   - Red wrap S floor 60→80 (skin S can dip to 60)
+    #   - Yellow core V floor 180→200 (matches real flame; skin rarely V≥200)
+    #   - Red wrap H upper 15→12 (12-18 is skin tone territory)
+    #   - Yellow H lower 10→18 (10-18 is skin tone too)
+    fire_hsv_low_red1: tuple = (0, 80, 160)
+    fire_hsv_high_red1: tuple = (12, 255, 255)
+    fire_hsv_low_red2: tuple = (160, 80, 160)
     fire_hsv_high_red2: tuple = (179, 255, 255)
-    fire_hsv_low_yellow: tuple = (15, 120, 200)
-    fire_hsv_high_yellow: tuple = (35, 255, 255)
+    fire_hsv_low_yellow: tuple = (18, 80, 200)
+    fire_hsv_high_yellow: tuple = (38, 255, 255)
+
+    # V10.4 skin discriminator: require flame_yellow ≥ ratio × wrap_red.
+    # Real candle: ratio > 1 (mostly yellow). Real wood-fire: ratio ~ 0.5.
+    # Skin: ratio ~ 0 (no yellow centre). 0.4 splits cleanly.
+    fire_min_yellow_over_red_ratio: float = 0.4
+
+    # Hot-core requirement. V10.4 adds S_min = 30 (genuine flame core
+    # carries yellow tinge; specular skin highlight does not).
+    fire_hot_core_v_min: int = 200
+    fire_hot_core_s_min: int = 30
+    fire_hot_core_s_max: int = 220
+    fire_hot_core_min_pixels: int = 4
+    fire_core_dilate_iter: int = 6  # ~12 px tolerance for outer-near-core
+
+    # Shape filter — accept tilted lighters down to ~h/w 0.3. Below that
+    # we're looking at a horizontal strip (banner, marker line) which has
+    # never been a real flame in the test set.
+    fire_aspect_ratio_min: float = 0.3
+
+    # Temporal flicker filter. The threshold semantics: a frame whose mask
+    # has IoU > max_static_iou vs any history frame is treated as "static".
+    # Lower threshold = STRICTER (more things classified static → rejected).
+    #
+    # V10.3 RAISED the threshold 0.92 → 0.97 (more lenient) — the previous
+    # value rejected a steady bật lửa flame whose pixel-level dancing was
+    # below 8% per frame at 10 FPS. Real-world IoU distribution:
+    #   • dead-static poster on wall  → 0.99+ (only sensor noise)
+    #   • steady lighter / candle     → 0.93–0.97 (subtle dancing)
+    #   • dancing campfire flame      → 0.5–0.8
+    # 0.97 lets all genuine flames through while still catching the poster.
+    # min_motion_frames stays 1 so a single dissimilar frame in the buffer
+    # is enough — robot operator doesn't have to wait for 2 frames of
+    # disagreement before the alert fires.
+    fire_flicker_window: int = 5
+    fire_max_static_iou: float = 0.97
+    fire_min_motion_frames: int = 1
+
+    # Diagnostic: log every Nth rejection (avoid spamming at 10 FPS).
+    # Set to 1 for full trace when debugging, default 30 = ~3 s at 10 FPS.
+    fire_reject_log_every_n: int = 30
 
     # Snapshots — V10 spec §5.5: JPEG quality 70, base64-encoded inline payload
     snapshot_dir: str = "snapshots"
@@ -113,8 +218,10 @@ class DetectionConfig:
 
     # Temporal smoothing (N-of-M consensus before emitting an event).
     # Suppresses single-frame flickers from YOLO/HSV noise.
-    # Fire dropped from 3-of-5 to 2-of-5 for faster reaction; broadened HSV
-    # range below compensates for the looser consensus by lifting recall.
+    # V10.3: dropped 3→2 frames because per-frame stages are still strict
+    # (outer hue + core overlap + dilate), so 2-of-5 is enough to suppress
+    # noise without making the operator wait 300 ms (3 frames @ 10 FPS) for
+    # a real flame to register. At 10 FPS, 2 frames = 200 ms reaction.
     smoothing_window: int = 5
     fire_smoothing_required: int = 2
     person_smoothing_required: int = 2
@@ -193,6 +300,14 @@ class AnomalyDetector:
         self._cv2 = None if self.config.dry_run else _lazy_import_cv2()
         self._yolo_cls = None if self.config.dry_run else _lazy_import_yolo()
         self._yolo_model = None  # lazy-loaded on first frame
+        # V11.0: separate YOLO model for fire/smoke detection. Loaded
+        # lazily on first frame; if the file is missing or ONNX runtime
+        # complains, we fall back to the V10.4 HSV pipeline automatically.
+        self._fire_yolo_model = None
+        self._fire_yolo_load_attempted = False
+        # Resolved pipeline mode after a successful load attempt — read by
+        # _detect_fire() each frame to decide which branch to run.
+        self._fire_mode_resolved: Optional[str] = None
 
         self._running = False
         self._frame_queue: Queue = Queue(maxsize=2)
@@ -212,6 +327,14 @@ class AnomalyDetector:
         # Hold the most recent raw bbox per kind so that when the smoother
         # finally fires, we still have a spatial reference for the snapshot.
         self._last_bbox: dict[str, tuple] = {}
+
+        # Rolling buffer of fire masks for the per-pixel flicker filter
+        # (stage 4 in _detect_fire). Stored as raw uint8 masks; lifetime
+        # bound by deque maxlen so memory is fixed.
+        from collections import deque
+        self._fire_mask_history: deque = deque(
+            maxlen=max(1, self.config.fire_flicker_window)
+        )
 
         Path(self.config.snapshot_dir).mkdir(parents=True, exist_ok=True)
 
@@ -473,35 +596,331 @@ class AnomalyDetector:
                 yield (x1, y1, x2 - x1, y2 - y1), conf
 
     def _detect_fire(self, frame):
-        """HSV-based flame segmentation. Returns (bbox, area_ratio) or (None, 0)."""
+        """Fire detection — V11.0 dual-mode (YOLO preferred, HSV fallback).
+
+        Pipeline selection lives in `config.fire_pipeline`:
+          * "yolo" → try to load `config.fire_yolo_model` ONNX. On success,
+            run YOLO inference and return the highest-confidence fire/smoke
+            bbox. On failure (file missing, ONNX load error, classes don't
+            match), log once and fall through to HSV automatically.
+          * "hsv"  → run the V10.4 6-stage HSV pipeline (see `_detect_fire_hsv`).
+            Kept as a backup because it has no model dependency and is well
+            understood after thesis tuning.
+
+        Returns (bbox, area_ratio) on detection, (None, 0.0) on rejection.
+        """
         cv2 = self._cv2
         if cv2 is None:
             return None, 0.0
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        c = self.config
-        mask_red1 = cv2.inRange(hsv, c.fire_hsv_low_red1, c.fire_hsv_high_red1)
-        mask_red2 = cv2.inRange(hsv, c.fire_hsv_low_red2, c.fire_hsv_high_red2)
-        mask_yellow = cv2.inRange(hsv, c.fire_hsv_low_yellow, c.fire_hsv_high_yellow)
-        mask = cv2.bitwise_or(cv2.bitwise_or(mask_red1, mask_red2), mask_yellow)
-        # OPEN removes salt-noise from sensor grain; CLOSE knits the flame
-        # blob back together when motion blur splits it into fragments.
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, None, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, None, iterations=2)
+        mode = self._fire_mode_resolved
+        if mode is None:
+            mode = self._resolve_fire_mode()
+            self._fire_mode_resolved = mode
 
+        if mode == "yolo":
+            bbox, conf = self._detect_fire_yolo(frame)
+            if bbox is not None:
+                return bbox, conf
+            # YOLO didn't fire — return cleanly. We do NOT fall through to
+            # HSV per-frame, because HSV's false-positive rate against
+            # bright skin makes the two pipelines disagree noisily.
+            return None, 0.0
+
+        # HSV branch (config="hsv" or YOLO load failed)
+        return self._detect_fire_hsv(frame)
+
+    def _resolve_fire_mode(self) -> str:
+        """Decide once which pipeline to run for the lifetime of this detector.
+
+        Honors `KPATROL_FIRE_MODE` env override (operator can force a mode
+        without redeploying). If the operator picked YOLO but the model
+        file is missing or ONNX runtime fails to load, falls back to HSV
+        with a single warning line — better than logging once per frame.
+        """
+        want = (os.environ.get("KPATROL_FIRE_MODE") or self.config.fire_pipeline or "hsv").lower()
+        if want == "hsv":
+            log.info("[detector] fire pipeline = HSV (V10.4 6-stage)")
+            return "hsv"
+
+        # want == "yolo" — try to load
+        if not self._ensure_fire_yolo():
+            log.warning(
+                "[detector] fire pipeline = HSV (YOLO model unavailable, "
+                "see tools/download_fire_model.py)"
+            )
+            return "hsv"
+        log.info(
+            "[detector] fire pipeline = YOLO (%s · conf=%.2f · imgsz=%d)",
+            self.config.fire_yolo_model,
+            self.config.fire_yolo_confidence,
+            self.config.fire_yolo_imgsz,
+        )
+        return "yolo"
+
+    def _ensure_fire_yolo(self) -> bool:
+        """Lazy-load the fire YOLO model. Returns True on success."""
+        if self._fire_yolo_model is not None:
+            return True
+        if self._fire_yolo_load_attempted:
+            # Already failed once — don't retry every frame.
+            return False
+        self._fire_yolo_load_attempted = True
+        if self._yolo_cls is None:
+            return False
+        model_path = self.config.fire_yolo_model
+        # Same lookup pattern as person YOLO: try INT8 → ONNX → .pt.
+        candidates = []
+        if model_path.endswith(".pt"):
+            stem = model_path[:-3]
+            candidates = [f"{stem}_int8.onnx", f"{stem}.onnx", model_path]
+        elif model_path.endswith(".onnx"):
+            stem = model_path[:-5]
+            candidates = [f"{stem}_int8.onnx", model_path]
+        else:
+            candidates = [model_path]
+        resolved = next((p for p in candidates if os.path.exists(p)), None)
+        if resolved is None:
+            log.warning(
+                "[detector] fire YOLO model not found at any of: %s — "
+                "run `python -m tools.download_fire_model` to fetch one",
+                candidates,
+            )
+            return False
+        try:
+            log.info("[detector] loading fire YOLO: %s", resolved)
+            self._fire_yolo_model = self._yolo_cls(resolved)
+            return True
+        except Exception as exc:
+            log.error("[detector] fire YOLO load failed (%s): %s", resolved, exc)
+            return False
+
+    def _detect_fire_yolo(self, frame):
+        """Run the fire YOLO model and return the best detection.
+
+        Returns (bbox=(x,y,w,h), confidence) where confidence is the YOLO
+        score normalised to [0, 1]. Returns (None, 0.0) when no class
+        crosses `fire_yolo_confidence`. Smoke detections fire the same
+        "fire" event kind so downstream consumers (actuator, MQTT alert,
+        PWA) don't have to learn a new label.
+        """
+        c = self.config
+        try:
+            results = self._fire_yolo_model.predict(
+                frame,
+                conf=c.fire_yolo_confidence,
+                imgsz=c.fire_yolo_imgsz,
+                verbose=False,
+            )
+        except Exception as exc:
+            log.warning("[detector] fire YOLO inference error: %s", exc)
+            return None, 0.0
+
+        target_classes = {c.fire_yolo_fire_class}
+        if c.fire_yolo_smoke_class >= 0:
+            target_classes.add(c.fire_yolo_smoke_class)
+
+        best_conf = 0.0
+        best_bbox: Optional[tuple] = None
+        for r in results:
+            boxes = getattr(r, "boxes", None)
+            if boxes is None:
+                continue
+            for b in boxes:
+                cls = int(b.cls[0])
+                if cls not in target_classes:
+                    continue
+                conf = float(b.conf[0])
+                if conf <= best_conf:
+                    continue
+                xyxy = b.xyxy[0].tolist()
+                x1, y1, x2, y2 = map(int, xyxy)
+                best_conf = conf
+                best_bbox = (x1, y1, x2 - x1, y2 - y1)
+        if best_bbox is None:
+            return None, 0.0
+        return best_bbox, best_conf
+
+    def _detect_fire_hsv(self, frame):
+        """V10.4 6-stage HSV pipeline — fallback when YOLO unavailable."""
+        cv2 = self._cv2
+        if cv2 is None:
+            return None, 0.0
+        c = self.config
         h, w = frame.shape[:2]
         total = h * w
-        fire_px = int(cv2.countNonZero(mask))
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # ── Stage 1: outer flame mask ─────────────────────────────────────
+        m_red1 = cv2.inRange(hsv, c.fire_hsv_low_red1, c.fire_hsv_high_red1)
+        m_red2 = cv2.inRange(hsv, c.fire_hsv_low_red2, c.fire_hsv_high_red2)
+        m_yel = cv2.inRange(hsv, c.fire_hsv_low_yellow, c.fire_hsv_high_yellow)
+        mask_outer = cv2.bitwise_or(cv2.bitwise_or(m_red1, m_red2), m_yel)
+        # V10.3: OPEN no longer applied here.
+        outer_px = int(cv2.countNonZero(mask_outer))
+
+        # ── Stage 1b: skin discriminator (V10.4) ──────────────────────────
+        # Real flame has a yellow-hue centre; skin under warm light is
+        # uniformly orange-pink in the wrap-red band with no yellow core.
+        # We require flame_yellow_px >= ratio × wrap_red_px. Hand at arm's
+        # length lights up wrap_red only → ratio → 0 → rejected here
+        # before the more expensive stages run.
+        wrap_red_px = int(cv2.countNonZero(cv2.bitwise_or(m_red1, m_red2)))
+        yellow_px = int(cv2.countNonZero(m_yel))
+        if wrap_red_px > 0:
+            # Only enforce the ratio when there's meaningful red — pure
+            # candle flames (almost all yellow, zero red) shouldn't trip
+            # this gate.
+            yr_ratio = yellow_px / float(wrap_red_px)
+            if yr_ratio < c.fire_min_yellow_over_red_ratio:
+                self._push_fire_history(None, h, w)
+                self._log_fire_reject(
+                    "STAGE1B_skin",
+                    outer_px=outer_px, yellow_px=yellow_px,
+                    wrap_red_px=wrap_red_px, ratio=round(yr_ratio, 2),
+                )
+                return None, 0.0
+
+        # ── Stage 2: hot-core requirement ────────────────────────────────
+        # H range left wide (0-180) on purpose — core is defined by
+        # brightness + saturation, not hue.
+        # V10.4 added S_min floor (S ≥ s_min) — kicks out pure-white
+        # specular highlights and very bright skin which carry S < 30.
+        mask_core = cv2.inRange(
+            hsv,
+            (0, c.fire_hot_core_s_min, c.fire_hot_core_v_min),
+            (180, c.fire_hot_core_s_max, 255),
+        )
+        core_px = int(cv2.countNonZero(mask_core))
+        if core_px < c.fire_hot_core_min_pixels:
+            self._push_fire_history(None, h, w)
+            self._log_fire_reject("STAGE2_no_core", outer_px=outer_px, core_px=core_px)
+            return None, 0.0
+
+        # ── Stage 3: outer must be spatially adjacent to core ────────────
+        # Dilating the core by ~8 px and AND-ing with outer keeps only the
+        # red/yellow pixels that wrap the bright center. A red shirt with
+        # no bright spot fails; a white LED with no warm halo fails.
+        core_dilated = cv2.dilate(
+            mask_core,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=c.fire_core_dilate_iter,
+        )
+        mask_fire = cv2.bitwise_and(mask_outer, core_dilated)
+        # Knit the flame back together after dilation morphology splits it.
+        mask_fire = cv2.morphologyEx(
+            mask_fire, cv2.MORPH_CLOSE, None, iterations=2
+        )
+
+        # ── Stage 4: area gate ───────────────────────────────────────────
+        fire_px = int(cv2.countNonZero(mask_fire))
         ratio = fire_px / total
-        if ratio < c.fire_min_area_ratio:
+        if ratio < c.fire_min_area_ratio or ratio > c.fire_max_area_ratio:
+            self._push_fire_history(mask_fire if fire_px else None, h, w)
+            self._log_fire_reject(
+                "STAGE4_area",
+                outer_px=outer_px, core_px=core_px,
+                fire_px=fire_px, ratio=ratio,
+                min_ratio=c.fire_min_area_ratio,
+                max_ratio=c.fire_max_area_ratio,
+            )
             return None, ratio
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # ── Stage 5: temporal flicker check ──────────────────────────────
+        # We push the current mask AFTER the check so the history reflects
+        # observed flame frames only — a static red blob doesn't reset
+        # back to "no fire" history on every rejection.
+        motion_ok = self._fire_motion_ok(mask_fire)
+        self._push_fire_history(mask_fire, h, w)
+        if not motion_ok:
+            self._log_fire_reject("STAGE5_static",
+                                   core_px=core_px, fire_px=fire_px, ratio=ratio)
+            return None, ratio
+
+        # ── Stage 6: shape filter ────────────────────────────────────────
+        contours, _ = cv2.findContours(
+            mask_fire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         if not contours:
             return None, ratio
         biggest = max(contours, key=cv2.contourArea)
         x, y, bw, bh = cv2.boundingRect(biggest)
+        if bw < 4 or bh < 4:
+            self._log_fire_reject("STAGE6_tiny", bw=bw, bh=bh)
+            return None, ratio
+        aspect = bh / max(1, bw)
+        if aspect < c.fire_aspect_ratio_min:
+            self._log_fire_reject(
+                "STAGE6_horizontal",
+                bw=bw, bh=bh, aspect=round(aspect, 2),
+                aspect_min=c.fire_aspect_ratio_min,
+            )
+            return None, ratio
+
         return (x, y, bw, bh), ratio
+
+    def _log_fire_reject(self, stage: str, **fields) -> None:
+        """Diagnostic log when a candidate is rejected by a fire stage.
+
+        Throttled to one line per `fire_reject_log_every_n` frames so it
+        doesn't drown the logs at 10 FPS. Operator can read these to know
+        WHICH stage is dropping their lighter at the demo venue and tune
+        the matching threshold without guessing. Defaults to every 30
+        frames (~3 s) so it stays informative but quiet.
+        """
+        self._fire_reject_tick = getattr(self, "_fire_reject_tick", 0) + 1
+        every = max(1, int(getattr(self.config, "fire_reject_log_every_n", 30)))
+        if self._fire_reject_tick % every != 0:
+            return
+        details = " ".join(f"{k}={v}" for k, v in fields.items())
+        log.info("[detector] fire reject %s %s", stage, details)
+
+    def _fire_motion_ok(self, mask_now) -> bool:
+        """True if mask differs enough from recent history.
+
+        Real flame deforms each frame — IoU vs the previous mask drops
+        well below 0.92. A static red poster produces near-perfect IoU.
+        We require at least `fire_min_motion_frames` of the buffered
+        masks to show motion vs the current one. An empty buffer (first
+        valid frame) returns True; the upstream TemporalSmoother still
+        enforces N-of-M frames before emitting an event, so we don't
+        let single-frame flashes through.
+        """
+        cv2 = self._cv2
+        if cv2 is None or not self._fire_mask_history:
+            return True
+        motion_count = 0
+        seen = 0
+        max_iou = float(self.config.fire_max_static_iou)
+        for prev in self._fire_mask_history:
+            if prev is None or prev.shape != mask_now.shape:
+                continue
+            seen += 1
+            inter = int(cv2.countNonZero(cv2.bitwise_and(prev, mask_now)))
+            union = int(cv2.countNonZero(cv2.bitwise_or(prev, mask_now)))
+            if union == 0:
+                continue
+            if (inter / union) < max_iou:
+                motion_count += 1
+        if seen == 0:
+            return True
+        return motion_count >= int(self.config.fire_min_motion_frames)
+
+    def _push_fire_history(self, mask, h: int, w: int) -> None:
+        """Append a frame's fire mask to the rolling history.
+
+        Passing `mask=None` records a "no fire seen" slot — we still
+        advance the window so flicker comparisons against a returning
+        flame use recent context, not stale frames from minutes ago.
+        We can't allocate numpy zeros without numpy imported, but we
+        also don't need to: None entries are simply skipped by the
+        comparison loop in `_fire_motion_ok`.
+        """
+        if mask is None:
+            self._fire_mask_history.append(None)
+        else:
+            self._fire_mask_history.append(mask.copy())
 
     # ------------------------------------------------------------------
     # Emit event + snapshot
