@@ -222,7 +222,7 @@ ssh khoavd@10.8.0.7 'docker compose -f /home/khoavd/kpatrol/docker-compose.yml l
 
 **Resource budget:**
 - `CPUQuota=80%` + `MemoryMax=512M` để không bóp nghẹt `kpatrol.service`.
-- YOLOv8n INT8 + onnxruntime CPU: ~5–10 FPS trên Pi 4 (đã đo trên Mac, expect tương đương trên Pi 5).
+- YOLOv8n INT8 + onnxruntime CPU: ~5–10 FPS trên Pi 4 (đã đo trên Mac, expect tương đương trên Pi 4B).
 - SQLite WAL drainer cap 10k row, vacuum 24h — không lo disk grow.
 
 **Stop / rollback:**
