@@ -44,6 +44,24 @@ class ActuatorConfig:
     Patterns must match firmware vocabulary (see controller_four_motors_mecanum.ino):
       Light:  OFF | WARN_BLINK | WARN_STROBE | BOTH_BLINK | SOS
       Buzzer: OFF | ON | BEEP | ALARM | SOS
+
+    HARDWARE NOTE (2026-05-25): the warning light on this build is a 12VDC
+    mechanical relay (GPIO 38 → RELAY_WARNING_LIGHT_PIN). Every pattern
+    other than OFF makes the firmware toggle the relay at 1–5 Hz, which
+    wears the relay contacts out — typical electromechanical relays rate
+    ~100k–1M operations. Sustained blinking from a chronic alert (battery
+    low repeats every poll) destroys the relay within hours.
+
+    Two mitigations:
+      1. battery_low/critical default to LIGHT=OFF (buzzer only). Battery
+         status is already shown in the cockpit UI; the operator doesn't
+         need a relay-driven physical lamp to know the pack is at 20%.
+      2. Detection patterns (person/fire) keep WARN_BLINK but the actuator
+         auto-clears them via `auto_clear_seconds` so the relay clicks for
+         a brief alert burst (3 s default) instead of latching for hours.
+    Long-term fix: add a LIGHTP_SOLID_ON pattern to the firmware that
+    latches the relay ON without blinking, then point all light patterns
+    here at it. Skipped for now to avoid a firmware reflash before demo.
     """
 
     person_light: str = "WARN_BLINK"
@@ -52,15 +70,26 @@ class ActuatorConfig:
     fire_buzzer: str = "ALARM"
     tipover_light: str = "SOS"
     tipover_buzzer: str = "SOS"
-    battery_low_light: str = "WARN_BLINK"
+    # V5.15c10: don't run the relay-driven warning light for battery alerts.
+    # Was WARN_BLINK / WARN_STROBE; relay was clicking at 1–5 Hz for hours
+    # whenever pack hovered near the low threshold.
+    battery_low_light: str = "OFF"
     battery_low_buzzer: str = "BEEP"
-    battery_critical_light: str = "WARN_STROBE"
+    battery_critical_light: str = "OFF"
     battery_critical_buzzer: str = "ALARM"
 
     # How long a one-shot buzzer pattern (BEEP) is allowed to remain "active"
     # in our local state before the next event re-arms it. Must roughly match
     # the firmware BEEP duration (~250ms) plus margin.
     beep_repeat_min_sec: float = 1.0
+
+    # V5.15c10: auto-clear a continuous light pattern after this many seconds.
+    # Sends LP:OFF unprompted to make the firmware leave blink mode → relay
+    # stops clicking. Zero/negative disables the timer. 4 s gives ~4 visible
+    # blinks for an alert, then quiet — visible alert without wearing relay.
+    auto_clear_light_after_sec: float = 4.0
+    # Buzzer auto-clear is shorter — ALARM/SOS get distracting fast.
+    auto_clear_buzzer_after_sec: float = 6.0
 
 
 # Continuous patterns latch on the firmware until OFF; one-shots auto-fade.
@@ -102,6 +131,16 @@ class AlertActuator:
             target=self._tx_loop, name="alert_actuator_tx", daemon=True,
         )
         self._tx_thread.start()
+
+        # V5.15c10: auto-clear continuous patterns to spare the relay.
+        # When a continuous pattern (WARN_BLINK/STROBE/SOS) is applied,
+        # a timer is armed; on expiry we send LP:OFF/BUZZ:OFF so the
+        # firmware exits blink mode → relay stops clicking. Re-applying
+        # the same pattern within the window re-arms (operator sees
+        # ongoing alert), but a single trigger plus N seconds of silence
+        # ends with the relay quiet.
+        self._light_clear_timer: Optional[threading.Timer] = None
+        self._buzzer_clear_timer: Optional[threading.Timer] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -156,6 +195,13 @@ class AlertActuator:
         pending: list[str] = []
         with self._lock:
             now = time.monotonic()
+            # Cancel any pending auto-clear timers — we're clearing now.
+            if self._light_clear_timer is not None:
+                self._light_clear_timer.cancel()
+                self._light_clear_timer = None
+            if self._buzzer_clear_timer is not None:
+                self._buzzer_clear_timer.cancel()
+                self._buzzer_clear_timer = None
             if self._light not in (None, "OFF"):
                 self._light = "OFF"
                 self._light_ts = now
@@ -185,6 +231,10 @@ class AlertActuator:
         snapshot and double-emit the same pattern.
         """
         pending: list[str] = []
+        # Continuous patterns that just got applied — schedule auto-clear
+        # for these after we release the lock.
+        arm_light_clear = False
+        arm_buzzer_clear = False
         with self._lock:
             now = time.monotonic()
 
@@ -197,6 +247,11 @@ class AlertActuator:
                 self._light = light
                 self._light_ts = now
                 pending.append(f"LP:{light}")
+            # Re-arm timer even when we coalesced (operator's alert is still
+            # active) so a stable continuous pattern still expires after the
+            # window. Skip when pattern is OFF — nothing to clear.
+            if light in _CONTINUOUS_LIGHT and self.config.auto_clear_light_after_sec > 0:
+                arm_light_clear = True
 
             # Buzzer: same logic, separate state.
             if buzzer != self._buzzer or (
@@ -206,14 +261,75 @@ class AlertActuator:
                 self._buzzer = buzzer
                 self._buzzer_ts = now
                 pending.append(f"BUZZ:{buzzer}")
+            if buzzer in _CONTINUOUS_BUZZER and self.config.auto_clear_buzzer_after_sec > 0:
+                arm_buzzer_clear = True
 
         # Enqueue OUTSIDE the lock — the bounded queue's put_nowait is fast
         # but we don't want to hold the state lock across any I/O primitive.
         for line in pending:
             self._enqueue(line)
 
+        # Arm auto-clear timers AFTER we release the lock + enqueue. The
+        # timer thread will re-acquire the lock when it fires.
+        if arm_light_clear:
+            self._arm_light_clear()
+        if arm_buzzer_clear:
+            self._arm_buzzer_clear()
+
         log.info("[actuator] %s → light=%s buzzer=%s", source, light, buzzer)
         return {"light": light, "buzzer": buzzer}
+
+    def _arm_light_clear(self) -> None:
+        """(Re)schedule LP:OFF after auto_clear_light_after_sec seconds.
+
+        Each call cancels any previously-armed timer so the firmware
+        exit-blink lands at the right moment relative to the LAST trigger,
+        not the first one in a burst.
+        """
+        delay = float(self.config.auto_clear_light_after_sec)
+        with self._lock:
+            if self._light_clear_timer is not None:
+                self._light_clear_timer.cancel()
+            t = threading.Timer(delay, self._auto_clear_light)
+            t.name = "alert_actuator_light_clear"
+            t.daemon = True
+            self._light_clear_timer = t
+        t.start()
+
+    def _arm_buzzer_clear(self) -> None:
+        delay = float(self.config.auto_clear_buzzer_after_sec)
+        with self._lock:
+            if self._buzzer_clear_timer is not None:
+                self._buzzer_clear_timer.cancel()
+            t = threading.Timer(delay, self._auto_clear_buzzer)
+            t.name = "alert_actuator_buzzer_clear"
+            t.daemon = True
+            self._buzzer_clear_timer = t
+        t.start()
+
+    def _auto_clear_light(self) -> None:
+        emit = False
+        with self._lock:
+            if self._light not in (None, "OFF"):
+                self._light = "OFF"
+                self._light_ts = time.monotonic()
+                emit = True
+            self._light_clear_timer = None
+        if emit:
+            self._enqueue("LP:OFF")
+            log.info("[actuator] auto-clear light → LP:OFF (relay rest)")
+
+    def _auto_clear_buzzer(self) -> None:
+        emit = False
+        with self._lock:
+            if self._buzzer not in (None, "OFF"):
+                self._buzzer = "OFF"
+                self._buzzer_ts = time.monotonic()
+                emit = True
+            self._buzzer_clear_timer = None
+        if emit:
+            self._enqueue("BUZZ:OFF")
+            log.info("[actuator] auto-clear buzzer → BUZZ:OFF")
 
     def _enqueue(self, line: str) -> None:
         try:
@@ -264,6 +380,13 @@ class AlertActuator:
         if self._tx_stop.is_set():
             return
         self._tx_stop.set()
+        # Cancel auto-clear timers so they don't fire after shutdown.
+        with self._lock:
+            for attr in ("_light_clear_timer", "_buzzer_clear_timer"):
+                t = getattr(self, attr, None)
+                if t is not None:
+                    t.cancel()
+                    setattr(self, attr, None)
         try:
             self._tx_queue.put_nowait(None)
         except queue.Full:

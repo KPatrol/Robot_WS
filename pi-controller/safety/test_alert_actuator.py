@@ -74,12 +74,19 @@ class TipOverAndBattery(unittest.TestCase):
         self.assertIn("LP:SOS", rec.calls)
         self.assertIn("BUZZ:SOS", rec.calls)
 
-    def test_battery_critical_emits_strobe_alarm(self):
+    def test_battery_critical_alarm_buzzer_only(self):
+        """V5.15c10: battery alerts must NOT drive the relay-backed warning
+        light any more — every blink cycle clicks the relay and wears it.
+        The cockpit UI already shows pack state, so battery_critical fires
+        BUZZ:ALARM only. Light defaults moved to OFF in ActuatorConfig.
+        """
         rec = _Recorder()
         a = AlertActuator(rec)
         a.on_battery("critical", 7.0)
         a._drain_for_tests()
-        self.assertIn("LP:WARN_STROBE", rec.calls)
+        # Light must NOT be applied — relay protection.
+        self.assertNotIn("LP:WARN_STROBE", rec.calls)
+        self.assertNotIn("LP:WARN_BLINK", rec.calls)
         self.assertIn("BUZZ:ALARM", rec.calls)
 
 
