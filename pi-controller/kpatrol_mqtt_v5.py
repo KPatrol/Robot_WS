@@ -2616,9 +2616,20 @@ class KPatrolMQTTV5:
 
     def _on_tipover_recover(self) -> None:
         logger.info("[TIPOVER] Recovered upright")
-        # Note: actuator is intentionally NOT cleared here — operator must
-        # explicitly clear EMERGENCY before lights/buzzer go silent, so the
-        # alert remains visible while crew are inspecting the robot.
+        # V5.15c11 (2026-05-26): we now clear the actuator on recover so
+        # the SOS light + buzzer stop the moment the robot is upright
+        # again. Earlier comment said operators wanted the alert to
+        # persist for inspection — but V5.15c10 had a 4-6 s auto-clear
+        # timer hiding that intent. After we removed the timer (so the
+        # alert could actually be heard while tipped), the lights kept
+        # flashing forever once the robot was put back, which confused
+        # operators on the demo floor. Recover-driven clear gives the
+        # right UX: latch while tipped, silent again immediately after.
+        if self._alert_actuator is not None:
+            try:
+                self._alert_actuator.clear()
+            except Exception as exc:
+                logger.error(f"[TIPOVER→ACT] clear error: {exc}")
         self.publish_log("Tip-over recovered")
 
     def _on_battery_event(self, level: str, pct: float) -> None:
