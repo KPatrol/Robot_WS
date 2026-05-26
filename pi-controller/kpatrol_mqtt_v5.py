@@ -2053,6 +2053,16 @@ class KPatrolMQTTV5:
                 if self._alarm_controller is not None:
                     self._alarm_controller.update_rules(payload)
                     logger.info(f"[ALARM] Updated rules: {len(payload) if isinstance(payload, list) else 1}")
+            elif topic == T.ALERT:
+                # V5.15c14 (2026-05-26): the camera detection pipeline lives in
+                # the standalone `kpatrol-detection.service` (alert_bridge.py)
+                # which publishes person/fire alerts to `kpatrol/<serial>/alert`.
+                # The main controller subscribes wildcard so we already see the
+                # message — wire it into the same actuator + alarm-controller
+                # path that the inline detector would have used. Without this
+                # bridge, operator-configured fire/person rules never fired
+                # because alarm_controller.on_event() was never called.
+                self.handle_alert(payload)
             elif topic == T.PERIPH_CMD:
                 # V5.6: peripheral-hub command (relay / oled / polarity / time).
                 self.handle_periph_command(payload)
@@ -2288,6 +2298,45 @@ class KPatrolMQTTV5:
         self._pub(self.T.GPS_STATUS, {"ok": False, "error": f"unknown action {action}"})
 
     # ── Buzzer / Light pattern (firmware-side state machines) ──────
+
+    def handle_alert(self, payload: Dict[str, Any]) -> None:
+        """V5.15c14 (2026-05-26): Forward detection alerts from the standalone
+        `kpatrol-detection.service` into the in-process actuator + alarm
+        controller so operator rules actually fire.
+
+        Payload shape (from alert_bridge.AlertBridge.publish):
+            {"id":int, "kind":"person"|"fire", "confidence":float,
+             "bbox":[x,y,w,h], "ts":float, ...}
+
+        We ignore our own publishes (the MQTT wildcard echoes them back) by
+        checking whether the alert was minted in this process — alert_bridge
+        marks records with an `id` row from its sqlite database; this code
+        only fires when `id` is present and `kind` is a known label. The
+        same actuator coalescing + alarm-controller dwell logic the inline
+        detector relies on remains unchanged.
+        """
+        kind = str(payload.get("kind", "")).lower().strip()
+        if kind not in ("person", "fire"):
+            return
+        try:
+            conf = float(payload.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        bbox = payload.get("bbox") or []
+
+        if self._alert_actuator is not None:
+            try:
+                self._alert_actuator.on_detection(kind, conf)
+            except Exception as exc:
+                logger.error(f"[ALERT→ACT] on_detection error: {exc}")
+
+        if self._alarm_controller is not None:
+            try:
+                self._alarm_controller.on_event(
+                    kind, {"confidence": conf, "bbox": list(bbox)},
+                )
+            except Exception as exc:
+                logger.error(f"[ALARM] on_alert error: {exc}")
 
     def handle_buzzer(self, payload: Dict[str, Any]):
         """Forward buzzer command to firmware. {"pattern":"OFF|ON|BEEP|ALARM|SOS"}."""
