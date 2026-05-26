@@ -54,7 +54,12 @@ class DetectionConfig:
     camera_index: Union[int, str] = 0
     frame_width: int = 640
     frame_height: int = 480
-    fps: int = 10
+    # V5.15c12 (2026-05-26): bumped 10 → 15 fps so the operator perceives
+    # the alert path as snappy. YOLOv8n INT8 on Pi 4B runs ~24 FPS so 15
+    # is comfortable headroom; the bottleneck is camera capture, not
+    # inference. Tighter loop also shortens the N-of-M smoother window
+    # below.
+    fps: int = 15
 
     # YOLO — V10 spec §5.5: 416×416 input for YOLOv8n int8.
     # Prefer ONNX on Pi (≈2× faster CPU inference vs the PyTorch backend
@@ -69,11 +74,14 @@ class DetectionConfig:
 
     # Person detection
     person_enabled: bool = True
-    # Cooldown gates how fast the web sees a new alert. 8s was conservative
-    # for early field testing; bring it down so the PWA refreshes promptly
-    # while still throttling noise. Per-event cooldown still wins over
-    # smoothing latency (~0.2s at fps=10).
-    person_cooldown_sec: float = 3.0
+    # Cooldown gates how fast the web sees a new alert. V5.15c12
+    # (2026-05-26): tightened 3.0 → 1.0 s after operator demo feedback
+    # — at 3 s the PWA toast felt sluggish, especially when a person
+    # walked across the camera (toast disappeared before they left
+    # the frame). 1 s keeps the broker from being flooded but still
+    # refreshes the alert promptly. Per-event cooldown still wins
+    # over smoothing latency (~0.13 s at fps=15).
+    person_cooldown_sec: float = 1.0
     person_min_area_ratio: float = 0.02  # bbox must cover >=2% of frame
 
     # Fire detection — V10.4 (2026-05-25) tightens V10.3 to reject "tay
@@ -103,7 +111,12 @@ class DetectionConfig:
     # Outer envelopes also tightened: S floor 60→80, yellow band V floor
     # 180→200 — both push skin out without losing real-flame recall.
     fire_enabled: bool = True
-    fire_cooldown_sec: float = 5.0
+    # V5.15c12 (2026-05-26): tightened 5.0 → 1.5 s. Fire is the most
+    # time-critical event we surface — 5 s between PWA / email refreshes
+    # made the operator feel the alert chain was stuck. The temporal
+    # smoother + Stage 1b skin gate already block per-frame noise, so a
+    # 1.5 s cooldown does not unleash spam.
+    fire_cooldown_sec: float = 1.5
 
     # V11.0 (2026-05-25): pipeline mode switch.
     #   "yolo" — DEFAULT (2026-05-26). Dedicated fire YOLO model gives
@@ -222,8 +235,11 @@ class DetectionConfig:
     # V10.3: dropped 3→2 frames because per-frame stages are still strict
     # (outer hue + core overlap + dilate), so 2-of-5 is enough to suppress
     # noise without making the operator wait 300 ms (3 frames @ 10 FPS) for
-    # a real flame to register. At 10 FPS, 2 frames = 200 ms reaction.
-    smoothing_window: int = 5
+    # a real flame to register.
+    # V5.15c12 (2026-05-26): shrank window 5 → 3 because fps bumped to 15.
+    # At 15 FPS, 2-of-3 window = up to 200 ms wait vs 333 ms before, and
+    # two consecutive hits arrive in ~130 ms instead of 200 ms.
+    smoothing_window: int = 3
     fire_smoothing_required: int = 2
     person_smoothing_required: int = 2
 
