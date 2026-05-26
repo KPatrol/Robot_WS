@@ -319,7 +319,23 @@ class AlarmController:
                 self._last_seen[rule.id] = now_m
 
                 dwell = now_m - self._first_seen[rule.id]
-                if dwell < rule.continuous_duration_s:
+                # V5.15c11 (2026-05-26): single-shot safety events fire
+                # immediately. tipover_watcher already enforces its own
+                # min_dwell_sec (default 0.4s) and only fires ONCE per tip;
+                # if we waited for `continuous_duration_s` worth of follow-
+                # ups they would never arrive and the rule never triggered.
+                # Same logic for battery thresholds — those cross hysteresis
+                # exactly once per direction. Streaming detections (person,
+                # fire) still honour the dwell so a one-frame YOLO blip
+                # cannot wake the buzzer.
+                _SINGLE_SHOT_EVENTS = {
+                    EVENT_TIPOVER,
+                    EVENT_BATTERY_LOW,
+                    EVENT_BATTERY_CRITICAL,
+                    EVENT_SYSTEM_ERROR,
+                }
+                if (kind not in _SINGLE_SHOT_EVENTS
+                        and dwell < rule.continuous_duration_s):
                     continue
 
                 last_fire = self._last_fired.get(rule.id, 0.0)

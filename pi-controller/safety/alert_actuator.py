@@ -154,19 +154,23 @@ class AlertActuator:
         """
         kind = (kind or "").lower().strip()
         if kind == "person":
+            # V5.15c11: person/fire/tipover alerts latch until cleared so
+            # the operator actually notices them on the floor. Battery
+            # alerts keep the auto-clear path for relay protection.
             return self._apply(self.config.person_light, self.config.person_buzzer,
-                               source=f"person@{confidence:.2f}")
+                               source=f"person@{confidence:.2f}", auto_clear=False)
         if kind == "fire":
             return self._apply(self.config.fire_light, self.config.fire_buzzer,
-                               source=f"fire@{confidence:.2f}")
+                               source=f"fire@{confidence:.2f}", auto_clear=False)
         log.debug("[actuator] ignoring unknown detection kind=%s", kind)
         return {"light": self._light or "OFF", "buzzer": self._buzzer or "OFF"}
 
     def on_tipover(self, axis: str, angle_deg: float) -> Dict[str, str]:
-        """Tip-over → SOS pattern on both channels."""
+        """Tip-over → SOS pattern on both channels (latches until cleared)."""
         return self._apply(
             self.config.tipover_light, self.config.tipover_buzzer,
             source=f"tipover {axis}={angle_deg:.1f}°",
+            auto_clear=False,
         )
 
     def on_battery(self, level: str, pct: float) -> Dict[str, str]:
@@ -221,7 +225,7 @@ class AlertActuator:
     # Internals
     # ------------------------------------------------------------------
 
-    def _apply(self, light: str, buzzer: str, source: str) -> Dict[str, str]:
+    def _apply(self, light: str, buzzer: str, source: str, *, auto_clear: bool = True) -> Dict[str, str]:
         """Send light + buzzer if they actually differ from current state.
 
         For one-shot buzzer patterns (BEEP) we re-arm if the cooldown has
@@ -229,6 +233,12 @@ class AlertActuator:
         flood the UART. The full decision-and-update path runs under a
         single lock so two concurrent callers cannot both observe a stale
         snapshot and double-emit the same pattern.
+
+        `auto_clear` (V5.15c11 — 2026-05-26): when False, suppress the
+        relay-protection auto-clear timer. Safety alerts that the operator
+        needs to hear/see (tip-over, fire, person under SOS) latch until
+        explicitly cleared; only the noisy/repeating battery alerts opt
+        into the original 4-6 s auto-clear behaviour.
         """
         pending: list[str] = []
         # Continuous patterns that just got applied — schedule auto-clear
@@ -250,7 +260,9 @@ class AlertActuator:
             # Re-arm timer even when we coalesced (operator's alert is still
             # active) so a stable continuous pattern still expires after the
             # window. Skip when pattern is OFF — nothing to clear.
-            if light in _CONTINUOUS_LIGHT and self.config.auto_clear_light_after_sec > 0:
+            if (auto_clear
+                    and light in _CONTINUOUS_LIGHT
+                    and self.config.auto_clear_light_after_sec > 0):
                 arm_light_clear = True
 
             # Buzzer: same logic, separate state.
@@ -261,7 +273,9 @@ class AlertActuator:
                 self._buzzer = buzzer
                 self._buzzer_ts = now
                 pending.append(f"BUZZ:{buzzer}")
-            if buzzer in _CONTINUOUS_BUZZER and self.config.auto_clear_buzzer_after_sec > 0:
+            if (auto_clear
+                    and buzzer in _CONTINUOUS_BUZZER
+                    and self.config.auto_clear_buzzer_after_sec > 0):
                 arm_buzzer_clear = True
 
         # Enqueue OUTSIDE the lock — the bounded queue's put_nowait is fast
