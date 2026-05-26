@@ -39,6 +39,7 @@ import time
 import sys
 import os
 import re
+from datetime import datetime
 import threading
 from typing import Optional, Dict, Any, Tuple, List, Callable, ClassVar, Union
 from dataclasses import dataclass, asdict, field
@@ -278,6 +279,11 @@ class Topics:
         #               down the UART to the D1 R32.
         self.PERIPH_STATE = f"{p}/peripherals/state"
         self.PERIPH_CMD   = f"{p}/peripherals/cmd"
+        # V5.15c15 (2026-05-27): retained schedule payload pushed by the
+        # backend whenever the operator changes the main-lamp auto-on
+        # window. Pi subscribes wildcard so it picks up the retained
+        # value on first connect; subsequent updates arrive in real time.
+        self.LIGHT_SCHEDULE = f"{p}/light_schedule"
         # Wildcard for subscribing all topics of this robot
         self.WILDCARD      = f"{p}/#"
 
@@ -2063,6 +2069,8 @@ class KPatrolMQTTV5:
                 # bridge, operator-configured fire/person rules never fired
                 # because alarm_controller.on_event() was never called.
                 self.handle_alert(payload)
+            elif topic == T.LIGHT_SCHEDULE:
+                self.handle_light_schedule(payload)
             elif topic == T.PERIPH_CMD:
                 # V5.6: peripheral-hub command (relay / oled / polarity / time).
                 self.handle_periph_command(payload)
@@ -2337,6 +2345,92 @@ class KPatrolMQTTV5:
                 )
             except Exception as exc:
                 logger.error(f"[ALARM] on_alert error: {exc}")
+
+    # V5.15c15 (2026-05-27): persisted state for the main-lamp auto-on
+    # schedule. None = no schedule configured (or operator turned it
+    # off). Dict shape: {"enabled":bool, "start":"HH:MM", "end":"HH:MM"}.
+    _light_schedule: Optional[Dict[str, Any]] = None
+    # Tri-state to suppress repeat MAIN_ON / MAIN_OFF UART writes while
+    # the operator is inside / outside the window. We only emit on
+    # transition so manual overrides between ticks stick.
+    _light_schedule_last_emit: Optional[bool] = None
+
+    def handle_light_schedule(self, payload: Dict[str, Any]) -> None:
+        """V5.15c15: retained MQTT payload from backend with the operator's
+        auto-on window for the main 12 V lamp. Empty payload / `enabled=false`
+        clears the in-memory state so the next tick stops asserting it.
+        """
+        try:
+            enabled = bool(payload.get("enabled"))
+            start = payload.get("start")
+            end = payload.get("end")
+        except Exception:
+            logger.warning("[LIGHT_SCHEDULE] bad payload, ignoring")
+            return
+        if not enabled or not start or not end:
+            if self._light_schedule is not None:
+                logger.info("[LIGHT_SCHEDULE] cleared")
+            self._light_schedule = None
+            self._light_schedule_last_emit = None
+            return
+        # Validate "HH:MM"; ignore malformed times.
+        try:
+            sh, sm = (int(x) for x in str(start).split(":"))
+            eh, em = (int(x) for x in str(end).split(":"))
+            if not (0 <= sh < 24 and 0 <= eh < 24 and 0 <= sm < 60 and 0 <= em < 60):
+                raise ValueError("hour/min out of range")
+        except Exception as exc:
+            logger.warning(f"[LIGHT_SCHEDULE] bad HH:MM ({start}/{end}): {exc}")
+            return
+        self._light_schedule = {"enabled": True, "start": start, "end": end}
+        self._light_schedule_last_emit = None  # force re-evaluate on next tick
+        logger.info(f"[LIGHT_SCHEDULE] armed: {start} → {end}")
+
+    def _tick_main_light_schedule(self) -> None:
+        """Called from the 20 Hz run loop every ~10 s. Toggles the main
+        lamp ON/OFF based on whether the wall clock is inside the
+        configured daily window. Wraps past midnight if end < start.
+        """
+        sched = self._light_schedule
+        if sched is None:
+            return
+        try:
+            sh, sm = (int(x) for x in sched["start"].split(":"))
+            eh, em = (int(x) for x in sched["end"].split(":"))
+        except Exception:
+            return
+        now = datetime.now()
+        cur_min = now.hour * 60 + now.minute
+        start_min = sh * 60 + sm
+        end_min = eh * 60 + em
+        if start_min == end_min:
+            return  # zero-length window — disabled in practice
+        if start_min < end_min:
+            inside = start_min <= cur_min < end_min
+        else:
+            # Wraps past midnight, e.g. 18:00 → 06:00.
+            inside = cur_min >= start_min or cur_min < end_min
+        if self._light_schedule_last_emit == inside:
+            return
+        cmd = "MAIN_ON" if inside else "MAIN_OFF"
+        try:
+            if self.motor_controller.send_command(cmd):
+                if cmd == "MAIN_ON":
+                    self.motor_controller.main_light_state = True
+                else:
+                    self.motor_controller.main_light_state = False
+                self._light_schedule_last_emit = inside
+                logger.info(
+                    f"[LIGHT_SCHEDULE] {cur_min // 60:02d}:{cur_min % 60:02d} "
+                    f"window {sched['start']}→{sched['end']} → {cmd}"
+                )
+                # Push immediate STATUS so PWA reflects the new state.
+                try:
+                    self.publish_status()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.error(f"[LIGHT_SCHEDULE] tick error: {exc}")
 
     def handle_buzzer(self, payload: Dict[str, Any]):
         """Forward buzzer command to firmware. {"pattern":"OFF|ON|BEEP|ALARM|SOS"}."""
@@ -3346,6 +3440,15 @@ class KPatrolMQTTV5:
         # horn switch off ~5 s after pressing ON in the web UI.
         periph_keepalive_interval = 2.0
         last_periph_keepalive = 0.0
+        # V5.15c15 (2026-05-27): daily auto-on schedule for the main lamp.
+        # We poll the wall clock every 10 s — the lamp toggles at the start
+        # and end of the configured window. `_last_main_light_schedule_state`
+        # is a tri-state: None (untouched yet), True (we forced it ON), or
+        # False (we forced it OFF). It lets the operator override the
+        # schedule manually (via PWA main-light toggle) without us flipping
+        # it back on the next tick — we only re-emit on transitions.
+        light_schedule_interval = 10.0
+        last_light_schedule_tick = 0.0
 
         logger.info("\n" + "=" * 60)
         logger.info("    K-PATROL MQTT CLIENT V5.0")
@@ -3476,6 +3579,11 @@ class KPatrolMQTTV5:
                     if current_time - last_periph_keepalive >= periph_keepalive_interval:
                         self.periph_hub.keepalive()
                         last_periph_keepalive = current_time
+
+                # V5.15c15: main-light auto-on schedule tick.
+                if current_time - last_light_schedule_tick >= light_schedule_interval:
+                    self._tick_main_light_schedule()
+                    last_light_schedule_tick = current_time
 
                 # Drain everything queued on the motor UART so IMU/BAT
                 # frames don't pile up between 20Hz ticks. Returns the last
