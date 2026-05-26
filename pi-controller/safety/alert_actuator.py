@@ -32,7 +32,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 log = logging.getLogger("kpatrol.safety.actuator")
 
@@ -109,8 +109,22 @@ class AlertActuator:
         self,
         send_cmd: Callable[[str], bool],
         config: Optional[ActuatorConfig] = None,
+        periph_relay: Optional[Callable[[bool], Any]] = None,
     ):
+        """
+        send_cmd: UART writer for the S3 motor controller (LP:/BUZZ: lines).
+            Drives the in-cluster status light pattern + the placeholder
+            BUZZER_PIN echo loop.
+        periph_relay: optional callable that toggles the D1 R32 peripheral
+            hub relay (GPIO26 — drives the 12V automotive lamp + horn in
+            parallel through a 5 A fuse). Passing in `periph_hub.relay_on/
+            relay_off` here lets a tip-over/fire alert actually make
+            audible noise + flash the main warning lamp; without it the
+            actuator only animates the on-board status LED via the S3
+            motor and the operator never hears anything.
+        """
         self.send_cmd = send_cmd
+        self.periph_relay = periph_relay
         self.config = config or ActuatorConfig()
         self._lock = threading.Lock()
         # Last pattern actually written to the firmware (None == unknown / OFF).
@@ -157,16 +171,30 @@ class AlertActuator:
             # V5.15c11: person/fire/tipover alerts latch until cleared so
             # the operator actually notices them on the floor. Battery
             # alerts keep the auto-clear path for relay protection.
+            # Person alerts: skip the peripheral-hub relay — the lamp + horn
+            # would be too loud for routine surveillance.
             return self._apply(self.config.person_light, self.config.person_buzzer,
                                source=f"person@{confidence:.2f}", auto_clear=False)
         if kind == "fire":
+            # Fire is a genuine emergency — pull the lamp + horn through
+            # the D1 R32 relay so the alert is audible across the room.
+            self._fire_periph_relay(True)
             return self._apply(self.config.fire_light, self.config.fire_buzzer,
                                source=f"fire@{confidence:.2f}", auto_clear=False)
         log.debug("[actuator] ignoring unknown detection kind=%s", kind)
         return {"light": self._light or "OFF", "buzzer": self._buzzer or "OFF"}
 
     def on_tipover(self, axis: str, angle_deg: float) -> Dict[str, str]:
-        """Tip-over → SOS pattern on both channels (latches until cleared)."""
+        """Tip-over → SOS pattern on both channels (latches until cleared).
+
+        V5.15c11 (2026-05-26): also fires the D1 R32 peripheral-hub relay
+        (PIN_RELAY = GPIO26 in `peripheral_hub_d1r32.ino`) which drives
+        the actual 12 V automotive lamp + horn in parallel. Without
+        this, the S3 motor's LP:SOS/BUZZ:SOS only animate the on-board
+        status LED — the operator never hears anything because the
+        BUZZER_PIN on the S3 board is a placeholder (no piezo wired).
+        """
+        self._fire_periph_relay(True)
         return self._apply(
             self.config.tipover_light, self.config.tipover_buzzer,
             source=f"tipover {axis}={angle_deg:.1f}°",
@@ -216,6 +244,10 @@ class AlertActuator:
                 pending.append("BUZZ:OFF")
         for line in pending:
             self._enqueue(line)
+        # Release the peripheral-hub relay (12 V lamp + horn). Safe to
+        # call when no relay was ever fired — `_fire_periph_relay` itself
+        # short-circuits when self.periph_relay is None.
+        self._fire_periph_relay(False)
 
     def state(self) -> Dict[str, str]:
         with self._lock:
@@ -224,6 +256,24 @@ class AlertActuator:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _fire_periph_relay(self, on: bool) -> None:
+        """Drive the D1 R32 peripheral-hub relay (12V lamp + horn).
+
+        Wired in parallel through the hub's PIN_RELAY = GPIO26. A single
+        digitalWrite both flashes the warning lamp and sounds the horn,
+        which is exactly what we want for an emergency alert — they share
+        the same fuse and the operator only has one circuit to maintain.
+
+        Safe-no-op when no callable was injected (`periph_relay=None`),
+        so the existing pure-UART tests keep passing.
+        """
+        if self.periph_relay is None:
+            return
+        try:
+            self.periph_relay(bool(on))
+        except Exception as exc:  # pragma: no cover - log only
+            log.warning("[actuator] periph_relay(%s) raised: %s", on, exc)
 
     def _apply(self, light: str, buzzer: str, source: str, *, auto_clear: bool = True) -> Dict[str, str]:
         """Send light + buzzer if they actually differ from current state.

@@ -1852,7 +1852,22 @@ class KPatrolMQTTV5:
         # exists already on the instance.
         self._alarm_controller: Optional["AlarmController"] = None
         if _SAFETY_AVAILABLE:
-            self._alert_actuator = AlertActuator(self.motor_controller.send_command)
+            # V5.15c11 (2026-05-26): inject the D1 R32 peripheral-hub
+            # relay toggle so tip-over/fire alerts actually drive the
+            # 12 V lamp + horn (GPIO26). Without this the buzzer is
+            # silent because the S3 motor's BUZZER_PIN is a placeholder
+            # and the real piezo lives on the peripheral hub.
+            def _periph_relay_drive(on: bool) -> None:
+                if self.periph_hub is None:
+                    return
+                if on:
+                    self.periph_hub.relay_on()
+                else:
+                    self.periph_hub.relay_off()
+            self._alert_actuator = AlertActuator(
+                self.motor_controller.send_command,
+                periph_relay=_periph_relay_drive,
+            )
             self._tipover_watcher = TipOverWatcher(
                 on_tipover=self._on_tipover,
                 on_recover=self._on_tipover_recover,
