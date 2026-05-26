@@ -338,20 +338,22 @@ class FireDetectionConfig(unittest.TestCase):
     the documented defaults so anyone re-tuning sees what to touch."""
 
     def test_defaults_match_documentation(self):
-        """V11.0 defaults — added YOLO pipeline switch alongside V10.4 HSV.
+        """V11.0 defaults — YOLO is primary, HSV is fallback.
 
         V11.0 (2026-05-25 PM): introduces `fire_pipeline` default "yolo" so
-        a properly downloaded fire model is used preferentially. HSV
-        thresholds from V10.4 are kept as fallback when the model file
-        is missing or fails to load.
+        a properly downloaded fire model is used preferentially.
+        2026-05-26 update: HSV thresholds from V10.4 are explicitly kept as
+        the *fallback* path (auto-engaged by `_resolve_fire_mode` when the
+        YOLO model file is missing or ONNX runtime fails to load). On
+        well-lit demo floors HSV produced too many false positives against
+        bright orange skin tones, so HSV is no longer the default.
         """
         cfg = DetectionConfig()
-        # V11.0 pipeline switch — default reverted to "hsv" after the
-        # forest-fire YOLO model on HF was found to generalise poorly to
-        # indoor demo scenarios (lighter @ 50 cm got conf < 0.03).
-        # Keep YOLO infrastructure available for future indoor-trained
-        # models (e.g. HUST Vietnamese via Roboflow API).
-        self.assertEqual(cfg.fire_pipeline, "hsv")
+        # Default = YOLO. The fire model lives at `models/fire_yolov8n.pt`
+        # (auto-exported to ONNX on first inference). If that file is
+        # absent at startup, `_resolve_fire_mode` logs a warning once and
+        # silently falls back to HSV so detection still runs.
+        self.assertEqual(cfg.fire_pipeline, "yolo")
         self.assertEqual(cfg.fire_yolo_model, "models/fire_yolov8n.pt")
         self.assertEqual(cfg.fire_yolo_confidence, 0.30)
         self.assertEqual(cfg.fire_yolo_imgsz, 416)

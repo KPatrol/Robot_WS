@@ -106,20 +106,21 @@ class DetectionConfig:
     fire_cooldown_sec: float = 5.0
 
     # V11.0 (2026-05-25): pipeline mode switch.
-    #   "hsv"  — DEFAULT. The V10.4 6-stage HSV pipeline with skin gate.
-    #            Tuned for indoor neon + bật lửa demo. Verified during
-    #            thesis preparation.
-    #   "yolo" — Use a dedicated fire/smoke YOLO model. Available models
-    #            on Hugging Face (forest-fire, factory-smoke) generalise
-    #            poorly to indoor demo scenarios — they trigger on
-    #            outdoor wildfire imagery but miss a lighter at 50 cm.
-    #            Keep this mode available for when an indoor-trained
-    #            model becomes available (e.g. HUST `phat-hien-lua` via
-    #            free Roboflow API key — see `tools/download_fire_model.py`).
+    #   "yolo" — DEFAULT (2026-05-26). Dedicated fire YOLO model gives
+    #            far fewer false positives than HSV thresholding on
+    #            indoor demo floors. HSV is preserved as automatic
+    #            fallback (see `_resolve_fire_mode`) so the detector
+    #            still runs if the .pt/.onnx file is missing.
+    #   "hsv"  — Manual opt-in. V10.4 6-stage pipeline with skin gate.
+    #            Useful for environments where the YOLO model has not
+    #            been deployed yet or as a smoke test against a
+    #            broken model file. False positive rate is materially
+    #            higher than YOLO under bright neon / orange skin tones,
+    #            which is why we no longer default to it.
     # Operator can switch modes via `KPATROL_FIRE_MODE=yolo|hsv` env var
-    # without redeploying. AnomalyDetector also auto-falls-back to HSV
-    # if YOLO is selected but the model file is missing or fails to load.
-    fire_pipeline: str = "hsv"
+    # without redeploying. AnomalyDetector auto-falls-back to HSV if
+    # YOLO is selected but the model file is missing or fails to load.
+    fire_pipeline: str = "yolo"
     # Path to a fire/smoke YOLO model. The download script drops .pt here;
     # ultralytics auto-exports an ONNX sibling on first inference for
     # ~1.5× speedup on Pi 4B ARM. `_ensure_fire_yolo()` looks for INT8
@@ -638,7 +639,7 @@ class AnomalyDetector:
         file is missing or ONNX runtime fails to load, falls back to HSV
         with a single warning line — better than logging once per frame.
         """
-        want = (os.environ.get("KPATROL_FIRE_MODE") or self.config.fire_pipeline or "hsv").lower()
+        want = (os.environ.get("KPATROL_FIRE_MODE") or self.config.fire_pipeline or "yolo").lower()
         if want == "hsv":
             log.info("[detector] fire pipeline = HSV (V10.4 6-stage)")
             return "hsv"
