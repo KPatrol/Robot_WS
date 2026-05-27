@@ -435,6 +435,13 @@ class PeripheralHub:
             try:
                 ser.write((cmd + "\n").encode("ascii", errors="replace"))
                 ser.flush()
+                # V5.15c16: a successful write through the kernel serial
+                # driver is itself proof of life — if the USB link were
+                # dead, write would raise SerialException with write_timeout
+                # set. Bump last_hb_local_ts so the staleness check stays
+                # happy even when the MCU drops HB transmission.
+                with self._state_lock:
+                    self.state.last_hb_local_ts = time.time()
                 return True
             except (serial.SerialException, OSError) as exc:
                 self.logger.warning(f"[periph] write err: {exc} on {cmd!r}")
