@@ -80,7 +80,13 @@ class PeripheralState:
 
 # Heartbeat is 1 Hz; anything older than this many seconds means the hub is
 # offline (cable yanked, MCU rebooting, etc).
-HB_STALE_S = 5.0
+HB_STALE_S = 30.0  # V5.15c16 (2026-05-27): grace bumped 5→30s (3× = 90s
+                   # window) because field testing showed the D1 R32
+                   # sometimes goes 20-30 s between HB lines under USB
+                   # contention, and the operator could still drive the
+                   # relay/buzzer just fine. Marking it disconnected at
+                   # 15 s made the PWA show "Hub ngoại vi offline" even
+                   # when commands were going through.
 
 
 class PeripheralHub:
@@ -220,6 +226,14 @@ class PeripheralHub:
                     buf = bytearray(rest)
                     line = raw_line.strip(b"\r").decode("utf-8", errors="replace").strip()
                     if line:
+                        # V5.15c16: ANY line from the MCU counts as proof
+                        # of life — including ERR: lines and STATUS echoes
+                        # — not just HB. Operators were seeing the hub
+                        # flagged offline while the firmware was clearly
+                        # alive (it was still answering commands), just
+                        # not emitting the 1 Hz HB ping on time.
+                        with self._state_lock:
+                            self.state.last_hb_local_ts = time.time()
                         try:
                             self._parse_line(line)
                         except Exception as exc:
