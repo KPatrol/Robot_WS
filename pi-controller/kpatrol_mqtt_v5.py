@@ -2914,10 +2914,20 @@ class KPatrolMQTTV5:
         isn't configured. The payload schema lines up with the backend's
         MqttIngestService expectation on `kpatrol/<serial>/peripherals/state`."""
         if self.periph_hub is None:
+            logger.debug("[PERIPH_PUB] hub None, skip")
             return
         snap = self.periph_hub.to_dict()
         snap["timestamp"] = int(time.time() * 1000)
         snap["serial"] = self.mqtt_config.robot_serial
+        # V5.15c16 (2026-05-27): emit a heartbeat log line every publish so
+        # the operator can confirm in `journalctl -u kpatrol -f` that the
+        # state is leaving the Pi (vs being stuck because the hub object
+        # raised silently).
+        logger.info(
+            f"[PERIPH_PUB] connected={snap.get('connected')} "
+            f"relay={snap.get('relay')} "
+            f"temp={snap.get('temperature_c')} hum={snap.get('humidity_pct')}"
+        )
         self._pub(self.T.PERIPH_STATE, snap, qos=1, retain=True)
 
     def publish_encoders(self):
