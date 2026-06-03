@@ -7,7 +7,7 @@ Hệ thống MQTT cho phép điều khiển robot K-Patrol từ web app qua inte
 ```
 ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
 │   Mobile/Web    │  MQTT   │   VPS Broker    │  MQTT   │  Raspberry Pi   │
-│     App         │ ──────▶ │  103.81.84.43   │ ──────▶ │   + ESP32-S3    │
+│     App         │ ──────▶ │  <MQTT_BROKER_HOST>   │ ──────▶ │   + ESP32-S3    │
 │  (Next.js)      │ ◀────── │    :1883        │ ◀────── │                 │
 └─────────────────┘         └─────────────────┘         └─────────────────┘
 ```
@@ -15,10 +15,10 @@ Hệ thống MQTT cho phép điều khiển robot K-Patrol từ web app qua inte
 ## Cấu hình MQTT
 
 ### Broker
-- **Host**: 103.81.84.43
+- **Host**: <MQTT_BROKER_HOST>
 - **Port**: 1883 (TCP), 8083 (WebSocket)
-- **Username**: alphaasimov2024
-- **Password**: gvB3DtGfus6U
+- **Username**: <MQTT_USERNAME>
+- **Password**: <MQTT_PASSWORD>
 
 ### Topics
 
@@ -139,10 +139,10 @@ kp-mqtt
 
 ```bash
 # Kiểm tra mạng
-ping 103.81.84.43
+ping <MQTT_BROKER_HOST>
 
 # Test với mosquitto client
-mosquitto_sub -h 103.81.84.43 -p 1883 -u alphaasimov2024 -P gvB3DtGfus6U -t "kpatrol/#"
+mosquitto_sub -h <MQTT_BROKER_HOST> -p 1883 -u <MQTT_USERNAME> -P <MQTT_PASSWORD> -t "kpatrol/#"
 ```
 
 ### Serial không hoạt động

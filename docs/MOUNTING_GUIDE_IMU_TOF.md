@@ -586,8 +586,8 @@ cat /dev/ttyUSB0
 
 ```bash
 # Subscribe để xem data
-mosquitto_sub -h 103.81.84.43 \
-  -u alphaasimov2024 -P gvB3DtGfus6U \
+mosquitto_sub -h <MQTT_BROKER_HOST> \
+  -u <MQTT_USERNAME> -P <MQTT_PASSWORD> \
   -t 'kpatrol/sensors' -t 'kpatrol/imu'
 
 # Kết quả mong đợi:

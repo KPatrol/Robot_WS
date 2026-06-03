@@ -676,7 +676,15 @@ class AnomalyDetector:
         return "yolo"
 
     def _ensure_fire_yolo(self) -> bool:
-        """Lazy-load the fire YOLO model. Returns True on success."""
+        """Lazy-load the fire YOLO model. Returns True on success.
+
+        V5.15c12 (2026-05-26): mirror `_ensure_yolo` — if only the `.pt`
+        is on disk, auto-export an `.onnx` sibling once so subsequent
+        inferences run on ONNX Runtime (~2× faster than the PyTorch
+        backend on Pi 4B ARM). INT8 quantisation is still a separate
+        offline step (`tools/quantize_yolo.py`); when an `_int8.onnx`
+        file is present we use it preferentially.
+        """
         if self._fire_yolo_model is not None:
             return True
         if self._fire_yolo_load_attempted:
@@ -688,8 +696,10 @@ class AnomalyDetector:
         model_path = self.config.fire_yolo_model
         # Same lookup pattern as person YOLO: try INT8 → ONNX → .pt.
         candidates = []
+        pt_path = None
         if model_path.endswith(".pt"):
             stem = model_path[:-3]
+            pt_path = model_path
             candidates = [f"{stem}_int8.onnx", f"{stem}.onnx", model_path]
         elif model_path.endswith(".onnx"):
             stem = model_path[:-5]
@@ -697,6 +707,32 @@ class AnomalyDetector:
         else:
             candidates = [model_path]
         resolved = next((p for p in candidates if os.path.exists(p)), None)
+
+        # Auto-export .pt → .onnx (one-time) if no faster sibling exists.
+        # We only do this when the .pt is the *only* file present —
+        # operator can always pre-export + INT8-quantise offline for
+        # maximum speed.
+        if resolved is not None and resolved == pt_path and pt_path is not None:
+            stem = pt_path[:-3]
+            onnx_path = f"{stem}.onnx"
+            try:
+                log.info("[detector] exporting fire %s → ONNX (one-time)", pt_path)
+                tmp_model = self._yolo_cls(pt_path)
+                exported = tmp_model.export(
+                    format="onnx",
+                    imgsz=self.config.fire_yolo_imgsz,
+                    opset=12,
+                    simplify=True,
+                )
+                exported_path = str(exported) if exported else onnx_path
+                if os.path.exists(exported_path):
+                    log.info("[detector] fire ONNX export ready: %s", exported_path)
+                    resolved = exported_path
+                else:
+                    log.warning("[detector] fire ONNX export reported success but file missing; using .pt")
+            except Exception as exc:
+                log.warning("[detector] fire ONNX export failed (%s); falling back to .pt", exc)
+
         if resolved is None:
             log.warning(
                 "[detector] fire YOLO model not found at any of: %s — "
