@@ -19,9 +19,9 @@
 
 set -e
 
-BROKER="103.81.84.43"
-USER="alphaasimov2024"
-PASS="gvB3DtGfus6U"
+BROKER="<MQTT_BROKER_HOST>"
+USER="<MQTT_USERNAME>"
+PASS="<MQTT_PASSWORD>"
 TOPIC_NAV="kpatrol/nav_command"
 TOPIC_STATUS="kpatrol/nav_status"
 TOPIC_MARKERS="kpatrol/markers"

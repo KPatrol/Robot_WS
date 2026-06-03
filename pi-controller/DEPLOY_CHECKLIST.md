@@ -86,7 +86,7 @@ sudo journalctl -u kpatrol.service -f -o cat
 
 **Look for:**
 - `[serial] Encoder connected on /dev/ttyUSB0`
-- `[mqtt] Connected to 103.81.84.43:1883`
+- `[mqtt] Connected to <MQTT_BROKER_HOST>:1883`
 - TOF / ENC / HB messages publishing
 - KHÔNG được thấy: `record_feed`, `script_dir`, `BAT:0,*` (3 fix đã apply trước đó).
 
@@ -96,8 +96,8 @@ Trên Mac hoặc máy khác:
 
 ```bash
 # Subscribe robot alert + telemetry
-mosquitto_sub -h 103.81.84.43 -p 1883 \
-  -u alphaasimov2024 -P gvB3DtGfus6U \
+mosquitto_sub -h <MQTT_BROKER_HOST> -p 1883 \
+  -u <MQTT_USERNAME> -P <MQTT_PASSWORD> \
   -t "kpatrol/KPATROL-001/#" -v
 ```
 
@@ -197,14 +197,14 @@ sudo journalctl -u kpatrol-detection.service -f -o cat
 ```
 
 **Expected logs:**
-- `[bridge] connecting to 103.81.84.43:1883`
+- `[bridge] connecting to <MQTT_BROKER_HOST>:1883`
 - `[bridge] mqtt connected`
 - `[bridge] kpatrol/KPATROL-001/alert -> {…}` mỗi khi detect
 
 **End-to-end smoke (từ Mac):**
 ```bash
-mosquitto_sub -h 103.81.84.43 -p 1883 \
-  -u alphaasimov2024 -P gvB3DtGfus6U \
+mosquitto_sub -h <MQTT_BROKER_HOST> -p 1883 \
+  -u <MQTT_USERNAME> -P <MQTT_PASSWORD> \
   -t "kpatrol/+/alert" -v
 ```
 → Bật một vật thể người/lửa trước camera Pi → tin nhắn JSON với `kind=person|fire`, `confidence`, `bbox`, `snapshot_b64` xuất hiện.
